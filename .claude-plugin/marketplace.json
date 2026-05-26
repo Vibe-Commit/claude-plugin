@@ -1,0 +1,22 @@
+{
+  "name": "vibecommit-capture",
+  "owner": {
+    "name": "VibeCommit",
+    "email": "hello@vibecommit.ai"
+  },
+  "description": "VibeCommit session-capture plugin for Claude Code. Installs the cooperation-rate rules files (AGENTS.md + CLAUDE.md) so Claude calls commit_transcript after every commit.",
+  "plugins": [
+    {
+      "name": "vibecommit-capture",
+      "source": "./",
+      "description": "Install the VibeCommit MCP rules files (AGENTS.md + CLAUDE.md + SKILL.md) and MCP server config for one-command session capture.",
+      "version": "1.0.0",
+      "author": {
+        "name": "VibeCommit"
+      },
+      "homepage": "https://www.vibecommit.ai/install",
+      "repository": "https://github.com/Vibe-Commit/claude-plugin",
+      "license": "MIT"
+    }
+  ]
+}

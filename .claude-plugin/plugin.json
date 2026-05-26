@@ -1,0 +1,14 @@
+{
+  "name": "vibecommit-capture",
+  "displayName": "VibeCommit Capture",
+  "description": "Capture every coding session into VibeCommit: install the AGENTS.md + CLAUDE.md rules files so your AI agent calls commit_transcript after each commit and setup at session start.",
+  "version": "1.0.0",
+  "author": {
+    "name": "VibeCommit",
+    "url": "https://www.vibecommit.ai"
+  },
+  "homepage": "https://www.vibecommit.ai/install",
+  "repository": "https://github.com/Vibe-Commit/claude-plugin",
+  "license": "MIT",
+  "keywords": ["vibecommit", "capture", "transcript", "mcp", "session"]
+}
