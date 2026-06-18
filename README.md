@@ -63,3 +63,5 @@ receive updates when this field is bumped — no surprise rebuilds on every comm
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+This MIT license covers the plugin bundle in this repository (the rules files and `.mcp.json` configuration) only; the hosted VibeCommit MCP server it connects to at `https://api.vibecommit.ai/mcp` is a separate work licensed under the Business Source License 1.1, not MIT.
