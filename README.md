@@ -1,7 +1,8 @@
 # VibeCommit — Claude Code Plugin
 
-One-command install for session capture in Claude Code.
-VibeCommit records what your AI agent did and why — every commit, every session.
+Git for AI-agent conversations: capture, search, and diff your agent sessions.
+One-command install wires the VibeCommit MCP server into Claude Code so your
+coding sessions become a queryable, tamper-evident history.
 
 ## Install
 
@@ -14,6 +15,9 @@ That's it. Claude Code now automatically:
 - Calls `setup` once per session to load the capture rules
 - Calls `commit_transcript` after every commit and shares the provenance URL with you
 
+The full tool surface (below) is then available for Claude to capture the live
+conversation, search your history, and diff sessions on request.
+
 ## What gets installed
 
 The plugin delivers three rules files to your project and configures the MCP server:
@@ -25,9 +29,9 @@ The plugin delivers three rules files to your project and configures the MCP ser
 | `.claude/skills/vibecommit/SKILL.md` | Claude Code skill for explicit `/vibecommit` invocation |
 | `.mcp.json` | MCP server config pointing at `https://api.vibecommit.ai/mcp` |
 
-All rules files carry the cooperation-rate-load-bearing capture protocol: call
-`setup` at session start, call `commit_transcript` after every commit, surface the
-`provenance_url` to the user.
+All rules files carry the capture protocol: call `setup` at session start, call
+`commit_transcript` after every commit, and surface the `provenance_url` to the
+user.
 
 ## Cross-vendor users
 
@@ -43,17 +47,41 @@ content either way.
 
 ## How it works
 
-VibeCommit is an MCP server at `https://api.vibecommit.ai/mcp`. It exposes three
-tools:
+VibeCommit is an MCP server at `https://api.vibecommit.ai/mcp`. It turns your
+agent sessions into version control: an append-only, tamper-evident substrate you
+can capture into, then search and diff. It exposes these tools:
 
-- **`setup`** — returns the rules files for your agent (idempotent; skip-if-current
-  on the common path)
-- **`commit_transcript`** — uploads the session transcript + commit SHA; returns
-  `{ trace_id, hash, provenance_url }`
-- **`attach_to_existing_commit`** — retroactively links a transcript to a commit
+**Capture**
 
-First call triggers OAuth in your browser (GitHub login). After that, every
-`commit_transcript` call is silent.
+- **`commit_conversation`** — capture the current coding conversation, no commit
+  required. Pass the transcript file path or the parsed records inline; the server
+  deduplicates against prior captures, links continuations into one conversation,
+  and returns a `provenance_url`. Re-capturing the same conversation is a free no-op.
+- **`commit_transcript`** — record a captured session for a specific commit. Pass
+  the transcript file path or raw narration plus the commit SHA; returns a
+  `provenance_url` the agent can show you.
+- **`attach_to_existing_commit`** — recovery path: attach transcript provenance to
+  a commit made outside the normal `commit_transcript` flow.
+
+**Search & read**
+
+- **`search_history`** — full-text search over your captured commit history by
+  free-text query, with optional repo/org filters.
+- **`query_history`** — list your prior commit captures, most-recent-first, with
+  optional repo and time-window filters and keyset pagination.
+- **`get_conversation`** — read one captured conversation in full: its captures
+  and, for each, the ordered turns with reconstructed content.
+- **`diff_conversation`** — compare two branches or runs of the same captured
+  conversation and see where they diverge. Pure read — nothing is written.
+
+**Setup**
+
+- **`setup`** — install or refresh the per-agent rules files that wire your session
+  into the capture flow. Re-runnable and idempotent; content-hash skip-if-current
+  on the common path.
+
+First call triggers OAuth in your browser (GitHub login). After that, capture is
+silent.
 
 ## Version
 
