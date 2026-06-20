@@ -9,37 +9,26 @@ across setup re-runs. Edits inside the managed section will be overwritten.
 
 ## VibeCommit capture protocol
 
-You have access to a VibeCommit MCP server. Follow this protocol on every
-coding task:
+You have a VibeCommit MCP server. On every coding task:
 
-1. **At session start (once per session, once per hour):** call the `setup`
-   MCP tool to refresh these instructions. The tool returns idempotently —
-   on the common path you only get back a list of already-current files and
-   no payload, costing one round-trip.
+1. Once per session (and once per hour): call the `setup` MCP tool to refresh
+   these instructions.
 
-2. **After every commit you make:** call the `commit_transcript` MCP tool
-   with:
-   - `commit_sha`: the SHA you just produced (output of `git rev-parse HEAD`),
-   - `repo_id`: the repository identifier (typically `owner/name`),
-   - `agent`: your own name (e.g. `claude-code`, `cursor`, `windsurf`),
-   - `model`: your underlying model identifier when known (e.g.
-     `claude-sonnet-4-5`, `gpt-5`), or `null` when unknown,
-   - exactly one of:
-     - `transcript_file_location`: the absolute path to your session's
-       JSONL transcript if you have one available, OR
-     - `transcript_text`: a narration of the conversation so far (verbatim
-       where possible; faithful summary where not).
+2. Capture your work with `commit_conversation`. Call it after each meaningful
+   chunk of work, and ALWAYS right after you make a git commit.
+   - Send `transcript_records`: your session transcript (Claude Code JSONL)
+     parsed into an array of record objects, INLINE. Do NOT send
+     `transcript_file_location` to the hosted server — it cannot read your disk.
+   - Add `repo_id` (`owner/name` or `null`) and `model`.
+   - When you just committed, also send `commit_sha` (`git rev-parse HEAD`),
+     `branch` (`git rev-parse --abbrev-ref HEAD`), and `recent_git_log` (the
+     last 20 commits from `git log -n 20 --format=%H%x09%s%x09%aI`).
 
-   The tool returns `{ trace_id, hash, provenance_url }`. Mention the
-   `provenance_url` to the user in your next response so they know the
-   session was captured.
+   Re-capturing the same conversation is a FREE no-op. The response includes a
+   `provenance_url` — mention it to the user. If it reports `uncaptured_commits`,
+   capture those too.
 
-3. **If `commit_transcript` returns an error:** report it to the user and
-   continue working. Do NOT retry silently — the user may need to
-   re-authenticate (the agent's browser will be redirected to the OAuth
-   flow on first call) or grant access to the right workspace.
+3. If a capture call errors: tell the user and continue. Do NOT retry silently.
 
-These instructions are managed by the VibeCommit setup tool. Do not edit
-them locally — your edits will be overwritten on the next `setup` call.
-Custom rules go in a separate file alongside this one.
+(The older `commit_transcript` tool is deprecated; use `commit_conversation`.)
 <!-- vibecommit:managed:end -->
