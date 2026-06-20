@@ -84,7 +84,7 @@ trap 'rm -rf "$TMPDIR_PARITY"' EXIT
 if [ -n "$NODE_RUNNER" ]; then
   # Write a small extractor script that imports T7 modules and prints the values
   cat > "$TMPDIR_PARITY/extract.ts" <<'EXTRACTOR'
-import { claudeCodeBundle } from "./src/vendors/claude_code.js";
+import { claudeCodeBundle } from "__T7_REPO__/src/vendors/claude_code.ts";
 const bundle = claudeCodeBundle();
 for (const f of bundle.files) {
   const marker = `===FILE:${f.path}===`;
@@ -93,7 +93,11 @@ for (const f of bundle.files) {
 }
 EXTRACTOR
 
-  # Run from T7 repo so imports resolve
+  # Resolve the import to an absolute path so it works regardless of where the
+  # extractor file lives (a relative ./src import breaks when run from a tempdir).
+  sed -i.bak "s#__T7_REPO__#${T7_REPO}#" "$TMPDIR_PARITY/extract.ts" && rm -f "$TMPDIR_PARITY/extract.ts.bak"
+
+  # Run from T7 repo so node_modules + tsconfig resolve
   if (cd "$T7_REPO" && $NODE_RUNNER "$TMPDIR_PARITY/extract.ts" > "$TMPDIR_PARITY/output.txt" 2>/dev/null); then
     EXTRACTION_MODE="node"
     echo "Extraction mode: tsx/node (runtime import of T7 modules)"
@@ -118,7 +122,7 @@ if [ "$EXTRACTION_MODE" = "node" ]; then
       $0 == marker { inside=1; next }
       inside && /^===FILE:/ { inside=0 }
       inside { print }
-    ' "$TMPDIR_PARITY/output.txt" | head -c -1  # strip trailing newline added by print
+    ' "$TMPDIR_PARITY/output.txt"  # trailing newline is stripped by the $(...) capture below
   }
 
   CANONICAL_AGENTS_MD="$(get_file_content "AGENTS.md")"
@@ -207,7 +211,7 @@ ${MANAGED_SECTION_END}"
   # SKILL.md = frontmatter + "\n" + MANAGED_HEADER + "\n\n" + RULES_BODY
   SKILL_FRONTMATTER='---
 name: vibecommit
-description: Capture this session into VibeCommit by calling the commit_transcript MCP tool after each commit. Refresh instructions by calling the setup tool.
+description: Capture this session into VibeCommit by calling the commit_conversation MCP tool after each meaningful chunk of work (and right after each commit). Refresh instructions by calling the setup tool.
 ---'
   CANONICAL_SKILL_MD="${SKILL_FRONTMATTER}
 ${MANAGED_HEADER}
