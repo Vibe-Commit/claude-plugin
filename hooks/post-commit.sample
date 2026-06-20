@@ -1,0 +1,38 @@
+#!/usr/bin/env sh
+# VibeCommit git post-commit breadcrumb — OPT-IN, SECONDARY to the PostToolUse
+# capture hook (see hooks/post-tool-use-capture.md).
+#
+# WHAT THIS IS
+#   A vendor-agnostic git hook. After every commit, it writes the last 20
+#   commits to a small local file that the agent reads on its next capture and
+#   passes as commit_conversation(recent_git_log). That keeps recent_git_log
+#   "warm" so a later cooperative capture can attribute the commit even if the
+#   agent did not snapshot git log itself.
+#
+# WHAT THIS IS NOT
+#   This breadcrumb does NOT authenticate and does NOT capture anything on its
+#   own. It only drops a file on disk. Guaranteed capture requires the
+#   PostToolUse enforcement hook (hooks/post-tool-use-capture.md), which reuses
+#   the M6-T4 SessionEnd driver and the stored OAuth token. Use this breadcrumb
+#   as a lightweight aid for editors/agents that cannot run a PostToolUse hook,
+#   or alongside the cooperative MCP path.
+#
+# INSTALL (opt-in — the VibeCommit plugin does NOT install this for you)
+#   cp hooks/post-commit.sample .git/hooks/post-commit
+#   chmod +x .git/hooks/post-commit
+#   # or point core.hooksPath at a directory containing this file.
+#
+# The format is TSV: <sha>\t<subject>\t<author-date-iso>, one commit per line —
+# the same shape commit_conversation expects for recent_git_log.
+
+set -eu
+
+# Where the breadcrumb is written. Kept inside .git so it is never committed.
+out=".git/vibecommit/recent_git_log.tsv"
+mkdir -p "$(dirname "$out")"
+
+git log -n 20 --format=%H%x09%s%x09%aI > "$out"
+
+# Intentionally silent on success. The agent reads "$out" and feeds it to
+# commit_conversation(recent_git_log) on its next capture.
+exit 0
