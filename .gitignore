@@ -1,3 +1,10 @@
 node_modules/
 .DS_Store
 *.log
+
+# bin/ is VENDORED, COMMITTED content — the capture binary the hooks invoke at
+# ${CLAUDE_PLUGIN_ROOT}/bin. Nothing here may ignore it. What is ignored is the
+# rest of a `tsc` emit, so a careless re-vendor cannot stage it (CR-028):
+bin/**/*.js.map
+bin/**/*.d.ts
+bin/**/*.d.ts.map
