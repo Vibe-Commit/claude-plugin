@@ -58,6 +58,9 @@
  * `trim(p_source_repo_full_name)` — the raw value sent here. Preserving the
  * remote's own case therefore gives a correctly-cased display name for free,
  * and lowercasing would throw that away for no gain.
+ *
+ * @provenance vibecommit-mcp src/conversation/ingest_session.ts — parseIngestHeaders, read
+ * @provenance vibecommit-schema org_access_model.sql — readable_repository_ids, read
  */
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";

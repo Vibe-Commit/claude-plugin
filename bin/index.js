@@ -21,7 +21,7 @@ import { homedir } from "node:os";
 import { createInterface } from "node:readline/promises";
 import { connect } from "./commands/connect.js";
 import { off, status } from "./commands/status.js";
-import { HELP, INTERNAL } from "./copy/index.js";
+import { HELP, INTERNAL, USAGE } from "./copy/index.js";
 import { EXIT } from "./exit.js";
 import { runHook } from "./hooks/entry.js";
 import { LABEL_GUTTER, renderErrorBlock, resolveColour, wrap } from "./term.js";
@@ -65,9 +65,9 @@ export function renderHelp() {
     const lines = [
         ...wrap(HELP.tagline, 2),
         "",
-        ...wrap(`Usage: ${HELP.usage}`, 2),
+        ...wrap(`${USAGE.usageLabel} ${HELP.usage}`, 2),
         "",
-        ...wrap("Commands:", 2),
+        ...wrap(USAGE.commandsLabel, 2),
     ];
     for (const verb of VERBS) {
         // The description is wrapped on its own and the verb column is written over
@@ -78,7 +78,7 @@ export function renderHelp() {
         const body = wrap(HELP.commands[verb], head.length);
         lines.push(head + body[0].slice(head.length), ...body.slice(1));
     }
-    lines.push("", ...wrap(`Docs: ${HELP.docsUrl}`, 2));
+    lines.push("", ...wrap(`${USAGE.docsLabel} ${HELP.docsUrl}`, 2));
     return lines.join("\n");
 }
 function interactiveContext(argv) {
@@ -121,6 +121,7 @@ function interactiveContext(argv) {
             }
         },
         now: () => new Date(),
+        selfPath: process.argv[1] ?? "",
     };
 }
 async function main(argv) {
@@ -134,7 +135,7 @@ async function main(argv) {
         return EXIT.ok;
     }
     if (!isVerb(verb)) {
-        process.stderr.write(`Unknown command: ${verb}\n\n${renderHelp()}\n`);
+        process.stderr.write(`${USAGE.unknownCommand(verb)}\n\n${renderHelp()}\n`);
         return EXIT.usage;
     }
     const ctx = interactiveContext(argv);
@@ -150,7 +151,7 @@ async function main(argv) {
             // CR-086 and CR-108. Left explicit so an unimplemented verb exits 1 rather
             // than falling into the usage branch, which would tell a user they typed
             // something wrong when they did not.
-            process.stderr.write(`\`${verb}\` is not implemented yet.\n`);
+            process.stderr.write(`${USAGE.notImplemented(verb)}\n`);
             return EXIT.failure;
     }
 }

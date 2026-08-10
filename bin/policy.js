@@ -107,6 +107,7 @@ export const EMPTY_FILE_STATE = {
     backlog: [],
     gapBytes: 0,
     gapCount: 0,
+    lastSentAt: 0,
 };
 /**
  * The caps.
@@ -165,9 +166,15 @@ export function nextSpan(state, eof) {
     const from = state.sentOffset > eof ? 0 : state.sentOffset;
     return eof > from ? { from, to: eof } : null;
 }
-/** Everything up to `to` arrived. The backlog clears. */
-export function markDelivered(state, to) {
-    return { ...state, sentOffset: to, backlog: [] };
+/**
+ * Everything up to `to` arrived. The backlog clears, and the success is STAMPED.
+ *
+ * `nowMs` is a parameter rather than a `Date.now()` call because this module is
+ * pure — that is what lets both backlog caps be tested at their boundaries
+ * without waiting a day, and the same property now covers the `last sent` row.
+ */
+export function markDelivered(state, to, nowMs) {
+    return { ...state, sentOffset: to, backlog: [], lastSentAt: nowMs };
 }
 /**
  * `never` — advance PAST the attempted span exactly once, stamping a gap.
@@ -179,6 +186,9 @@ export function markDelivered(state, to) {
 export function markSkipped(state, from, to) {
     const skipped = Math.max(0, to - from);
     return {
+        // `lastSentAt` is carried, not cleared: skipping past bytes that could never
+        // be delivered does not un-deliver what already was.
+        lastSentAt: state.lastSentAt,
         sentOffset: to,
         backlog: [],
         gapBytes: state.gapBytes + skipped,
@@ -229,6 +239,6 @@ export function enforceCaps(state, nowMs, caps) {
         gapCount += 1;
         backlog = backlog.slice(1);
     }
-    return { sentOffset, backlog, gapBytes, gapCount };
+    return { sentOffset, backlog, gapBytes, gapCount, lastSentAt: state.lastSentAt };
 }
 //# sourceMappingURL=policy.js.map

@@ -31,6 +31,8 @@
  * Wire contract retyped from `vibecommit-mcp/src/oauth/ingest_credential.ts`
  * (prefix, opacity, no rotation). Nothing is imported from that package and
  * nothing may be: it is closed source and this package is MIT (D60 §D1a).
+ *
+ * @provenance vibecommit-mcp src/oauth/ingest_credential.ts — wire contract, retyped
  */
 import { lstatSync, readFileSync, statSync } from "node:fs";
 import { inspect } from "node:util";

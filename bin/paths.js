@@ -9,6 +9,9 @@
  *
  * `CR-017d` added the repo to the binding key and hangs per-repo send state off
  * `stateDir` — see `sessionStatePath` and `SessionKey` below.
+ *
+ * @provenance vibecommit-schema 20260809150000_cr017a_repo_binding_key.sql — PK shape, mirrored
+ * @provenance vibecommit-schema ingest_sessions.file_key — CHECK bound 1..128, retyped
  */
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
@@ -91,9 +94,27 @@ export function repoDayNoticePath(home, repoKey, day, state) {
  * splitting the store would split the counter that has to stay single.
  */
 export function sessionStatePath(home, key) {
-    if (key.repoKey === "")
+    const dir = repoSessionsDir(home, key.repoKey);
+    if (dir === null)
         return null;
-    return join(stateDir(home), "sessions", repoDigest(key.repoKey), `${sanitise(key.sessionId)}.json`);
+    return join(dir, `${sanitise(key.sessionId)}.json`);
+}
+/**
+ * Every session file for ONE repo — the directory `sessionStatePath` writes into.
+ *
+ * `status` needs this and a hook does not: a hook is handed a `session_id` on
+ * stdin, but `vibecommit status` is interactive and has none, so the only way it
+ * can answer "when did this repo last send?" is to look at every session under
+ * the repo (`CR-021`). Exposed rather than duplicated so there is still exactly
+ * one place that knows the layout, and the digest stays private.
+ *
+ * Null on no repo, for the same reason `sessionStatePath` is: there is no
+ * repo-less bucket, and a caller with no repo has nothing to scan.
+ */
+export function repoSessionsDir(home, repoKey) {
+    if (repoKey === "")
+        return null;
+    return join(stateDir(home), "sessions", repoDigest(repoKey));
 }
 /** A fixed-length, collision-free filename component for a work-tree path. */
 function repoDigest(repoKey) {
@@ -111,6 +132,48 @@ export function transcriptRoot(home, env) {
         ? configured.trim()
         : join(home, ".claude");
     return join(root, "projects");
+}
+/**
+ * Where Claude Code writes DELEGATED work — `CR-124`, D76.
+ *
+ * `<dir>/<session-id>/subagents/`, beside `<dir>/<session-id>.jsonl`. Derived
+ * from `transcript_path` because there is no environment variable for it and
+ * the hook is never handed one: the session id is the transcript's own basename.
+ *
+ * Measured on this machine rather than read from documentation — and the
+ * measurement carries a trap. The directory holds an `agent-<id>.meta.json`
+ * sidecar beside every `agent-<id>.jsonl`, **636 of each**, exactly 1:1. A
+ * `agent-*` glob would therefore double every upload and send metadata as if it
+ * were transcript content. The caller globs `agent-*.jsonl`.
+ *
+ * Returns null for a path that is not a `.jsonl`, rather than inventing a
+ * directory next to something that was never a transcript.
+ */
+export function subagentsDir(transcriptPath) {
+    if (!transcriptPath.endsWith(TRANSCRIPT_SUFFIX))
+        return null;
+    return join(transcriptPath.slice(0, -TRANSCRIPT_SUFFIX.length), "subagents");
+}
+const TRANSCRIPT_SUFFIX = ".jsonl";
+/**
+ * The `file_key` a sub-agent transcript travels under: its basename, minus
+ * `.jsonl`.
+ *
+ * From the FILENAME, deliberately. Every record inside also carries `agentId`,
+ * but reading a value out of a file to name that file is analysis this client is
+ * not licensed to do (D60 §D6 / §D1a) and does not need.
+ *
+ * Null when the key would breach the server's 1..128 bound
+ * (`ingest_sessions.file_key`'s CHECK, `CR-008`): a delta the server 400s is
+ * classed `never` and would advance the offset past bytes it never stored.
+ * Longest key measured on this machine is 49 characters, so this is a bound
+ * being respected rather than one being hit.
+ */
+export function subagentFileKey(fileName) {
+    if (!fileName.startsWith("agent-") || !fileName.endsWith(TRANSCRIPT_SUFFIX))
+        return null;
+    const key = fileName.slice(0, -TRANSCRIPT_SUFFIX.length);
+    return key.length >= 1 && key.length <= 128 ? key : null;
 }
 /**
  * Is `candidate` really inside `root`?

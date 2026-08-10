@@ -15,13 +15,20 @@
  * revocable, ingest-audience credential). Until it lands, `VIBECOMMIT_TOKEN` is
  * the supported path — which is what it was added for.
  */
-import { CONNECT, COMMANDS, ERRORS, HELP, RUNTIME, STATUS } from "../copy/index.js";
+import { readdirSync, statSync } from "node:fs";
+import { basename, join } from "node:path";
+import { CONNECT, COMMANDS, ERRORS, HELP, PATH_CLASH, RUNTIME, URLS } from "../copy/index.js";
 import { grantProject, isAffirmative, isProjectAllowed } from "../consent.js";
 import { loadCredential } from "../credential.js";
 import { EXIT } from "../exit.js";
+import { resolveRepoSlug } from "../git.js";
+import { readSpan, DEFAULT_HOOK_BUDGET_MS } from "../hooks/entry.js";
+import { classifyInstall } from "../install.js";
+import { isInside, transcriptRoot } from "../paths.js";
+import { deliver, ingestUrl } from "../post.js";
 import { resolveProjectKey } from "../project.js";
 import { meetsNodeFloor, NODE_FLOOR_TEXT } from "../runtime.js";
-import { paint, renderErrorBlock, wrap } from "../term.js";
+import { paint, renderErrorBlock, truncatePath, wrap } from "../term.js";
 import { writeLines } from "./context.js";
 export async function connect(ctx) {
     // (1) The runtime floor refuses LOUDLY here, unlike in the hook: the user is
@@ -48,7 +55,7 @@ export async function connect(ctx) {
     }
     if (isProjectAllowed(ctx.home, projectKey)) {
         writeLines(ctx.stdout, wrap(CONNECT.alreadyConnected, 2));
-        return credentialBeat(ctx);
+        return await credentialBeat(ctx, projectKey);
     }
     // (3) The disclosure, then the gate.
     writeLines(ctx.stdout, disclosure(ctx));
@@ -73,8 +80,7 @@ export async function connect(ctx) {
         return EXIT.ok;
     }
     grantProject(ctx.home, projectKey, ctx.now());
-    writeLines(ctx.stdout, ["", ...wrap(STATUS.onForRepo, 2)]);
-    return credentialBeat(ctx);
+    return await credentialBeat(ctx, projectKey);
 }
 /**
  * The disclosure block.
@@ -106,11 +112,10 @@ function disclosure(ctx) {
  * name, and on npm >= 7 the clash surfaces as EEXIST during the first install of
  * exactly the population that installs commit tooling.
  */
-function credentialBeat(ctx) {
+async function credentialBeat(ctx, projectKey) {
     const load = loadCredential({ env: ctx.env, home: ctx.home });
     if (load.kind === "ok") {
-        writeLines(ctx.stdout, ["", ...wrap(`${STATUS.fixCommandLabel}: ${COMMANDS.off}`, 2)]);
-        return EXIT.ok;
+        return await captureBeat(ctx, projectKey, load.credential);
     }
     writeLines(ctx.stderr, renderErrorBlock({
         kind: "warn",
@@ -120,5 +125,155 @@ function credentialBeat(ctx) {
         fixes: [CONNECT.credentialNeededCommand, COMMANDS.connect],
     }, ctx.colour));
     return EXIT.notConnected;
+}
+/**
+ * The ending — D57 §DX5's Sentry-wizard test-event pattern.
+ *
+ * The install does not end on "configured", it ends on EVIDENCE: record this
+ * session, then hand over a URL that resolves. §10.2 draws it.
+ *
+ * Two things §10.2 draws that are deliberately NOT here:
+ *   - **`4 turns · 1 commit`.** Counting turns means parsing the transcript, and
+ *     the client may render but may not analyze (D60 §D6). It is not obtainable
+ *     from the server either: `send()` returns a status and discards the body,
+ *     so no id, sha or count exists on this side of the wire.
+ *   - **`Opening your browser to sign in...`.** That beat is the oauth lane's.
+ *     Until PKCE lands, `VIBECOMMIT_TOKEN` is the supported path.
+ */
+async function captureBeat(ctx, projectKey, credential) {
+    const found = findCurrentTranscript(ctx, projectKey);
+    if (found === null) {
+        writeLines(ctx.stderr, renderErrorBlock({
+            kind: "warn",
+            what: CONNECT.noTranscriptWhat,
+            why: [CONNECT.noTranscriptWhy],
+            fixLabel: CONNECT.noTranscriptFix,
+            fixes: [COMMANDS.status],
+        }, ctx.colour));
+        return EXIT.failure;
+    }
+    const url = ingestUrl(ctx.env);
+    if (url !== null) {
+        // Through `deliver()`, so the offset ledger, the failure policy and
+        // `CR-024d`'s redaction all apply exactly as they do for a hook. A second
+        // upload path here would bypass all three.
+        await deliver({
+            home: ctx.home,
+            env: ctx.env,
+            url,
+            credential,
+            repoKey: projectKey,
+            repoSlug: resolveRepoSlug(projectKey),
+            sessionId: found.sessionId,
+            fileKey: "main",
+            timeoutMs: DEFAULT_HOOK_BUDGET_MS,
+            nowMs: ctx.now().getTime(),
+        }, found.size, (from, to) => readSpan(found.path, from, to, projectKey));
+    }
+    // The beat, then the URL on its own line, then what-now. The outcome of the
+    // send is deliberately not branched on: `later` and `never` are transient or
+    // per-payload (D58) and the offset holds, so telling a user their install
+    // failed because one POST 503'd would be false.
+    writeLines(ctx.stdout, [
+        "",
+        ...wrap(`${CONNECT.capturing} ${CONNECT.doneHeading}`, 2),
+        "",
+        `  ${paint(ctx.colour, "accent", URLS.commits)}`,
+        "",
+        ...wrap(CONNECT.doneForRepo(truncatePath(projectKey, 52)), 2),
+        ...wrap(`${CONNECT.stopLabel}: ${COMMANDS.off}`, 2),
+    ]);
+    return pathClash(ctx);
+}
+/**
+ * The transcript for the session running right now.
+ *
+ * A hook is HANDED `transcript_path` on stdin. `connect` is typed by a human and
+ * gets nothing, so it has to find one: Claude Code stores transcripts at
+ * `<transcriptRoot>/<encoded-project-path>/<session-id>.jsonl`, where the
+ * encoding replaces `/` and `.` with `-`. That was derived by comparing every
+ * directory on this machine against the `cwd` its transcripts record — 15 of 17
+ * matched exactly, and both misses were sessions whose `cwd` MOVED mid-session,
+ * not a different encoding.
+ *
+ * Which is also why this looks up the directory for THIS project rather than
+ * taking the newest transcript anywhere: a session that started in another
+ * project and `cd`'d here lives under that project's directory, and uploading it
+ * would attach one project's session to another's repo — the same confusion
+ * `CR-017d`'s key exists to prevent.
+ *
+ * **Confined.** `isInside(transcriptRoot(...))` gates the result, because this is
+ * a NEW reader of transcript bytes and `/cso` finding 1 is about exactly this
+ * class of read. A candidate that resolves outside the root is not returned.
+ */
+function findCurrentTranscript(ctx, projectKey) {
+    const root = transcriptRoot(ctx.home, ctx.env);
+    const dir = join(root, projectKey.replace(/[/.]/g, "-"));
+    let entries;
+    try {
+        entries = readdirSync(dir);
+    }
+    catch {
+        return null;
+    }
+    let best = null;
+    for (const entry of entries) {
+        if (!entry.endsWith(".jsonl"))
+            continue;
+        const path = join(dir, entry);
+        if (!isInside(root, path))
+            continue;
+        let stat;
+        try {
+            stat = statSync(path);
+        }
+        catch {
+            continue;
+        }
+        if (!stat.isFile() || stat.size === 0)
+            continue;
+        if (best === null || stat.mtimeMs > best.mtime) {
+            best = {
+                path,
+                sessionId: basename(entry, ".jsonl"),
+                size: stat.size,
+                mtime: stat.mtimeMs,
+            };
+        }
+    }
+    return best === null ? null : { path: best.path, sessionId: best.sessionId, size: best.size };
+}
+/**
+ * Does the `vibecommit` a user types belong to us? — `DESIGN.md` §13.6's worked
+ * example, which was drawn for this check.
+ *
+ * **Runs LAST, deliberately.** The clash is about the verbs a human types, not
+ * about whether capture works; running it first would refuse to connect a user
+ * whose install is otherwise fine, and hook capture is unaffected either way
+ * because the plugin invokes the binary by path.
+ *
+ * Exit 1, not 2 and not 3: the user typed nothing wrong (2 is usage) and may be
+ * perfectly well connected (3 is not-connected). §13.7.
+ */
+function pathClash(ctx) {
+    const verdict = classifyInstall(ctx.env, ctx.selfPath);
+    if (verdict.kind === "ours")
+        return EXIT.ok;
+    writeLines(ctx.stderr, renderErrorBlock({
+        kind: "bad",
+        what: verdict.kind === "foreign" ? PATH_CLASH.foreignWhat : PATH_CLASH.absentWhat,
+        why: [
+            verdict.kind === "foreign"
+                ? PATH_CLASH.foreignWhy(truncatePath(verdict.resolved, 52))
+                : PATH_CLASH.absentWhy,
+        ],
+        fixLabel: PATH_CLASH.fixLabel,
+        fixes: [
+            verdict.kind === "foreign" ? PATH_CLASH.fixReplace : PATH_CLASH.fixInstall,
+            PATH_CLASH.fixDirectLabel,
+            PATH_CLASH.fixDirect,
+        ],
+    }, ctx.colour));
+    return EXIT.failure;
 }
 //# sourceMappingURL=connect.js.map

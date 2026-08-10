@@ -86,6 +86,21 @@ All notable changes to this plugin will be documented here.
 
 ### Changed
 
+- **`bin/` re-vendored — the public bundle was shipping an older, less careful
+  client (`CR-029e`).** It held **23** emitted `.js` against the client's **26**
+  modules, and **15 of the 26 were absent or wrong**: three missing outright
+  (`copy/time.js`, `install.js`, `redact.js`) and twelve differing in content.
+  Now 26 files, 195,057 bytes, at the commit in `capture-bundle.json`.
+  - **`redact.js` was not in the bundle at all**, and `hooks/entry.js` carried
+    one incidental mention of the word against nine in the client. The
+    out-of-tree redaction that keeps a **third party's file content** off the
+    wire is a control the current client applies and the vendored one did not.
+  - `index.js` still carried five inline user-facing literals the client had
+    already moved into `copy/` — invisible to the claims gate for six waves,
+    and still invisible in the copy a plugin user installs.
+  - ⚠ **This pin goes stale again by design**: capture's `main` advances four
+    more times this wave. That is the point — the gates above make the next
+    drift a red check instead of an unmeasured fact.
 - **Explicit `timeout` on every registered hook event**, in **seconds**:
   `Stop` 8, `PreCompact` 8, `SessionEnd` 10. Claude Code otherwise gives
   `SessionEnd` hooks a shared 1.5 s budget, which is not enough to settle,
