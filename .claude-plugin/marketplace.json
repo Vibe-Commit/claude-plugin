@@ -7,7 +7,7 @@
   "description": "VibeCommit session-capture plugin for Claude Code. Installs the cooperation-rate rules files (AGENTS.md + CLAUDE.md) so Claude calls commit_conversation after each chunk of work and right after every commit.",
   "plugins": [
     {
-      "name": "vibecommit-capture",
+      "name": "vibecommit",
       "source": "./",
       "description": "Install the VibeCommit MCP rules files (AGENTS.md + CLAUDE.md + SKILL.md) and MCP server config for one-command session capture.",
       "version": "1.0.0",

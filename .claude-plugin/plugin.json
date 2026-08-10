@@ -1,6 +1,6 @@
 {
-  "name": "vibecommit-capture",
-  "displayName": "VibeCommit Capture",
+  "name": "vibecommit",
+  "displayName": "VibeCommit",
   "description": "Capture every coding session into VibeCommit: install the AGENTS.md + CLAUDE.md rules files so your AI agent calls commit_conversation after each chunk of work and right after every commit, and setup at session start.",
   "version": "1.0.0",
   "author": {
