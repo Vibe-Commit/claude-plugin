@@ -1,0 +1,36 @@
+{
+  "description": "VibeCommit deterministic capture hooks. Registers the three events DESIGN.md 13.7 names -- Stop, PreCompact, SessionEnd -- each invoking the capture client with `hook` as its first argument. That argument is what selects the hook exit contract (exit 0 on every path, empty stderr, at most one systemMessage on stdout) over ordinary interactive CLI semantics; a command that drops it runs the hook in interactive mode and feeds a non-zero exit and stderr back into the user's live agent turn. SessionEnd carries an explicit timeout because Claude Code gives SessionEnd hooks a shared 1.5s budget unless one is set, and SessionEnd is the only one of the three with no next invocation -- transcript_path is written asynchronously and may lag, so the client settles and re-reads before sending, and bytes missed here are missed permanently (D57 DX7). Timeouts are in SECONDS, and every one must stay strictly above the client's own 5s watchdog (DEFAULT_HOOK_BUDGET_MS in the capture client), or Claude Code kills the process before the client can exit 0 quietly. OWNERSHIP: CR-020e created this file and owns which events are registered plus SessionEnd's timeout. CR-028 owns every command string -- repointing them at the binary bundled under ${CLAUDE_PLUGIN_ROOT}/bin -- and sets an explicit timeout on every remaining event; it may raise SessionEnd's timeout but may not remove it or drop an event. INTERIM: the commands below require the @vibe-commit/capture npm package to be installed. `--no-install` keeps npx from cold-fetching on every turn, and the scoped package name cannot resolve to the unrelated package that owns the bare `vibecommit` name on npm. CR-028 replaces them with the bundled binary.",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npx --no-install @vibe-commit/capture hook"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npx --no-install @vibe-commit/capture hook"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npx --no-install @vibe-commit/capture hook",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
