@@ -7,7 +7,7 @@ VibeCommit records what your AI agent did and why — every commit, every sessio
 
 ```
 /plugin marketplace add Vibe-Commit/claude-plugin
-/plugin install vibecommit-capture@vibecommit-capture
+/plugin install vibecommit@vibecommit-capture
 ```
 
 That's it. Claude Code now automatically:
