@@ -1,0 +1,101 @@
+name: capture-release
+
+# The receiving half of capture's release dispatch (CR-029e).
+#
+# `vibecommit-capture`'s `ci.yml` has a `vendor-bundle` job that POSTs
+#   {"event_type":"capture-release","client_payload":{"version":"…"}}
+# to `repos/Vibe-Commit/claude-plugin/dispatches` on every tag build. Until this
+# file existed nothing here listened, so that POST returned 204 and did nothing
+# — a wire with a sender, no receiver, and no way to tell from either end.
+#
+# ⚠ THE EVENT NAME AND PAYLOAD SHAPE ARE THE CONTRACT. `capture-release` and
+# `client_payload.version` are what capture actually sends; a receiver listening
+# for a different name is a workflow that never runs and looks correct forever.
+#
+# Note the direction is safe: the PRIVATE side pushes into the PUBLIC one. That
+# does not invert the licensing boundary, which is what forbids the reverse
+# (this repo reaching into the closed source) — D64 / D20.
+#
+# ⚠ `repository_dispatch` only ever triggers the workflow file on the DEFAULT
+# branch. This cannot be observed running from a pull request; it goes live when
+# it merges.
+
+on:
+  repository_dispatch:
+    types: [capture-release]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  refresh-bundle:
+    name: is bin/ still the client?
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.15.0"
+
+      # WHAT THIS CANNOT DO, AND WHY IT DOES NOT PRETEND OTHERWISE. It cannot
+      # rebuild the bundle: that needs the private capture source, and giving
+      # this public repo's CI a credential for the closed core is the one thing
+      # the bundle's gates exist to prevent (D64 / D20). It can only ask the
+      # public registry whether the released version matches what we ship.
+      - name: Compare bin/ against the released client
+        id: compare
+        env:
+          RELEASE_VERSION: ${{ github.event.client_payload.version }}
+        run: |
+          set +e
+          node scripts/check_npm_bundle.mjs --version "$RELEASE_VERSION" > result.txt 2>&1
+          code=$?
+          set -e
+          cat result.txt
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          {
+            echo "outcome<<__EOF__"
+            cat result.txt
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      # ⚠ NEVER A SILENT SKIP. On the PR gate, "not published" is a truthful
+      # pass — nothing changed and nobody promised anything. Here a release just
+      # happened and the bundle we ship to every plugin user is now, by default,
+      # the OLD client. So every outcome except a clean match files an issue and
+      # fails the run: an unactioned notification is the same as no receiver.
+      - name: File the drift issue
+        if: steps.compare.outputs.code != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ github.event.client_payload.version }}
+          OUTCOME: ${{ steps.compare.outputs.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        # The body is built with printf into a file rather than an inline
+        # heredoc: the check output it quotes is arbitrary text, and one stray
+        # backtick in a shell string is the difference between an issue and a
+        # step that dies before filing one.
+        run: |
+          {
+            printf '%s\n' "\`vibecommit-capture\` published **${RELEASE_VERSION}**, and this repo"
+            printf '%s\n' "ships \`bin/\` as committed, vendored output — so it is now behind."
+            printf '\n%s\n' "**This cannot be automated from here.** Rebuilding needs the private"
+            printf '%s\n' "capture source, and a cross-org read credential in a public MIT repo's"
+            printf '%s\n' "CI would invert the licensing boundary (D64 / D20). Re-vendor from a"
+            printf '%s\n' "checkout where that source is legitimately in reach:"
+            printf '\n%s\n' '```'
+            printf '%s\n' "VC_COMMIT=<the sha tagged v${RELEASE_VERSION}> scripts/vendor_capture_bin.sh"
+            printf '%s\n' '```'
+            printf '\n%s\n' "That rewrites \`bin/\` **and** \`capture-bundle.json\` together;"
+            printf '%s\n' "\`check_bundle_pin.mjs\` fails a PR that moves one without the other."
+            printf '\n%s\n' "<details><summary>What the corroboration check said</summary>"
+            printf '\n%s\n' '```'
+            printf '%s\n' "$OUTCOME"
+            printf '%s\n' '```'
+            printf '%s\n' "</details>"
+            printf '\n%s\n' "[workflow run](${RUN_URL})"
+          } > issue.md
+          gh issue create --title "capture ${RELEASE_VERSION} released — re-vendor bin/" --body-file issue.md
+          echo "::error title=bin/ is stale::capture ${RELEASE_VERSION} released and the vendored bundle was not corroborated. See the issue filed by this run."
+          exit 1
