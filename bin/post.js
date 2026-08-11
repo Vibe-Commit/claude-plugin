@@ -76,6 +76,66 @@ export function buildIngestHeaders(credential, delta) {
     };
 }
 /**
+ * The wire's error code for org-approval-pending — `CR-128`, D81.
+ *
+ * ⚠ A CROSS-REPO CONTRACT, not a local string. The server emits it as
+ * `403 { error: "capture_not_approved", owners_notified }` and pins the body
+ * shape in its own suite. **`repository_forbidden` is ALSO a 403** and carries
+ * no `owners_notified` at all — deliberately, because it is a different
+ * condition where no owner was or could have been notified. That is why every
+ * consumer here branches on THIS CODE and never on the status.
+ */
+export const CAPTURE_NOT_APPROVED = "capture_not_approved";
+/**
+ * An error body is a handful of bytes by contract. Anything larger is not one
+ * this client parses — a cap so a misconfigured or hostile endpoint cannot make
+ * a hook buffer an arbitrary response into memory.
+ */
+const MAX_ERROR_BODY_BYTES = 64 * 1024;
+/**
+ * Parse an error body, or return null. **NEVER THROWS, on any input.**
+ *
+ * That is a hard requirement rather than defensive habit: `deliver()` is the
+ * HOOK's path, `post.ts` states that an exception there is the contract
+ * breaking, and `JSON.parse` on a response body is an exception waiting for a
+ * bad day. Every failure — a non-JSON body, an empty body, an array, a body
+ * whose `error` is not a string — resolves to `null`, and `null` sends the
+ * caller to the branch that asserts nothing. That is the honest default,
+ * because `null` already means *not determinable*.
+ *
+ * ⚠ Read ONLY on a non-2xx. A 2xx body is not read, not awaited, and not
+ * parsed, so the hook's hot path is untouched.
+ */
+async function readErrorDetail(res) {
+    if (res.ok)
+        return null;
+    // The declared length, when there is one. The abort signal already bounds the
+    // read in TIME; this bounds it in BYTES for a fast, huge response.
+    const declared = Number(res.headers.get("content-length"));
+    if (Number.isFinite(declared) && declared > MAX_ERROR_BODY_BYTES)
+        return null;
+    let body;
+    try {
+        const text = await res.text();
+        if (text.length > MAX_ERROR_BODY_BYTES)
+            return null;
+        body = JSON.parse(text);
+    }
+    catch {
+        return null;
+    }
+    if (body === null || typeof body !== "object" || Array.isArray(body))
+        return null;
+    const { error, owners_notified: owners } = body;
+    if (typeof error !== "string" || error === "")
+        return null;
+    // The key is absent (`undefined`) on bodies that do not carry it, `null` when
+    // it is present and not determinable. Both are preserved; neither is coerced
+    // into a number, because a count invented here is a claim invented here.
+    const ownersNotified = owners === null ? null : typeof owners === "number" && Number.isFinite(owners) ? owners : undefined;
+    return { code: error, ownersNotified };
+}
+/**
  * One attempt. No retry, no backoff, no classification — `CR-018` owns all three.
  *
  * The timeout is mandatory rather than optional: a hook has a wall-clock budget
@@ -101,7 +161,10 @@ export async function send(url, headers, body, timeoutMs) {
             // configure, and an ingest endpoint has no reason to issue one.
             redirect: "error",
         });
-        return { kind: "response", status: res.status };
+        // The body read happens INSIDE the try and BEFORE the timer is cleared, so
+        // the same `AbortController` that bounds the request also bounds the read.
+        // A slow body cannot outlive the hook's wall-clock budget.
+        return { kind: "response", status: res.status, detail: await readErrorDetail(res) };
     }
     catch {
         return { kind: "unreachable" };
@@ -196,6 +259,12 @@ export async function deliver(ctx, eof, readBody) {
             break;
     }
     saveSessionState(ctx.home, key, next);
-    return { kind: "attempted", disposition };
+    // `outcome.detail` is null on every path except a non-2xx with a parseable
+    // error body, so this is a pass-through and not a second decision.
+    return {
+        kind: "attempted",
+        disposition,
+        detail: outcome.kind === "response" ? outcome.detail : null,
+    };
 }
 //# sourceMappingURL=post.js.map

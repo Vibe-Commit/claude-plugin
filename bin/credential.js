@@ -78,6 +78,45 @@ export class IngestCredential {
     }
 }
 /**
+ * Read a file under `~/.vibecommit/` that holds a secret, refusing an insecure
+ * one — **the two checks the human lane INHERITS rather than copies**.
+ *
+ * It was inline in `loadCredential` while the ingest credential was the only
+ * secret on disk. `CR-084d` adds a second (the refresh token), and a second copy
+ * of a security check is a second thing to forget when the first one changes —
+ * so it is one function with two callers instead.
+ *
+ * `/cso` finding 3 (2026-08-09), MEDIUM, is the DIRECTORY half. The FILE's mode
+ * was checked and the directory's was not, and the directory is the one that
+ * matters for the interesting attack: a second local account cannot read a 0600
+ * credentials.json, but with a writable `~/.vibecommit` it can unlink it and
+ * drop in its own 0600 file. The victim's next hook then uploads their whole
+ * transcript stream into the attacker's org. `grantProject` chmods the directory
+ * to 0700 on first write, so a clean install is fine — this covers the directory
+ * that already existed.
+ */
+export function readSecretFile(home, path) {
+    try {
+        const dir = rootDir(home);
+        const dirMode = statSync(dir).mode & 0o777;
+        if ((dirMode & 0o077) !== 0) {
+            return { kind: "insecure-file", path: dir, mode: dirMode.toString(8).padStart(3, "0") };
+        }
+        // `lstat`, not `stat`: `stat` follows a symlink and would report the
+        // TARGET's mode, so a link to an attacker-owned 0600 file would pass a
+        // check that exists to establish who can read this one.
+        const mode = lstatSync(path).mode & 0o777;
+        if ((mode & 0o077) !== 0) {
+            return { kind: "insecure-file", path, mode: mode.toString(8).padStart(3, "0") };
+        }
+        return { kind: "ok", raw: readFileSync(path, "utf8") };
+    }
+    catch {
+        // ENOENT is the overwhelmingly common case — not connected yet.
+        return { kind: "absent" };
+    }
+}
+/**
  * Load the ingest credential. `VIBECOMMIT_TOKEN` first, then the credentials
  * file.
  *
@@ -94,35 +133,11 @@ export function loadCredential(ctx) {
         }
         return { kind: "ok", credential: new IngestCredential(secret, "env") };
     }
-    const dir = rootDir(ctx.home);
     const path = credentialsPath(ctx.home);
-    let raw;
-    try {
-        // `/cso` finding 3 (2026-08-09), MEDIUM. The FILE's mode was checked and the
-        // DIRECTORY's was not, and the directory is the one that matters for the
-        // interesting attack: a second local account cannot read a 0600
-        // credentials.json, but with a writable ~/.vibecommit it can unlink it and
-        // drop in its own 0600 file. The victim's next hook then uploads their whole
-        // transcript stream into the attacker's org. `grantProject` chmods the
-        // directory to 0700 on first write, so a clean install is fine — this covers
-        // the directory that already existed.
-        const dirMode = statSync(dir).mode & 0o777;
-        if ((dirMode & 0o077) !== 0) {
-            return { kind: "insecure-file", path: dir, mode: dirMode.toString(8).padStart(3, "0") };
-        }
-        // `lstat`, not `stat`: `stat` follows a symlink and would report the
-        // TARGET's mode, so a link to an attacker-owned 0600 file would pass a
-        // check that exists to establish who can read this one.
-        const mode = lstatSync(path).mode & 0o777;
-        if ((mode & 0o077) !== 0) {
-            return { kind: "insecure-file", path, mode: mode.toString(8).padStart(3, "0") };
-        }
-        raw = readFileSync(path, "utf8");
-    }
-    catch {
-        // ENOENT is the overwhelmingly common case — not connected yet.
-        return { kind: "absent" };
-    }
+    const read = readSecretFile(ctx.home, path);
+    if (read.kind !== "ok")
+        return read;
+    const raw = read.raw;
     let token;
     try {
         // Parsing the FILE is not parsing the CREDENTIAL. The file is our own JSON
@@ -150,5 +165,134 @@ export function loadCredential(ctx) {
  */
 export function describeCredential(value) {
     return inspect(value, { depth: 3 });
+}
+// ---------------------------------------------------------------------------
+// CR-084d — THE SECOND SLOT: the human lane's user-principal tokens.
+//
+// One sign-in, two token classes, and they are kept apart on purpose:
+//
+//   * the OPAQUE ingest credential above (`vcik_`), long-lived, no rotation,
+//     machine-scoped, for the hook lane;
+//   * a REFRESH TOKEN and a short-lived ACCESS TOKEN below, user-scoped, for the
+//     read lane's `tools/call` against `/mcp`.
+//
+// ⚠ `loadCredential`'s `wrong-class` refusal above is NOT widened, and widening
+// it is the obvious wrong move a later reader will make. `credential.ts:96-102`
+// says why: a control-plane token on the data plane is a privilege class
+// crossing a lane, and the server's audience wall rejecting it too is defence in
+// depth rather than a reason to try. The refusal is now mirrored in BOTH
+// directions — a `vcik_` put in the refresh slot is refused just as a JWT put in
+// the ingest slot is — so neither lane can be fed the other's secret by a
+// copy-paste into the wrong file.
+//
+// ⚠ AND THE REDACTION DISCIPLINE IS NOT CEREMONY HERE EITHER — it matters MORE.
+// The module note at the top of this file lists the four leak paths a bare
+// `string` has (template interpolation, `JSON.stringify`, `console.error(obj)`,
+// an unhandled rejection whose message embedded it). A user-principal token has
+// MORE authority than an ingest credential: it reads a user's history rather
+// than appending to one org's. Shipping it as a bare string would reopen that
+// whole leak class on the more dangerous secret, so both classes below carry the
+// same four renderers and the same deliberately-ugly `expose()`.
+//
+// @provenance vibecommit-mcp src/oauth/refresh.ts — 32-byte base64url opaque refresh token, retyped
+// @provenance vibecommit-mcp src/oauth/token.ts — RFC 6749 §5.1 token response shape, retyped
+// ---------------------------------------------------------------------------
+/** What a redacted refresh token renders as. Contains no bytes of the secret. */
+export const REDACTED_REFRESH = "refresh…redacted";
+/** What a redacted access token renders as. Contains no bytes of the secret. */
+export const REDACTED_ACCESS = "access…redacted";
+/**
+ * The base of both user-principal token types.
+ *
+ * A shared base rather than two copies: every redaction path is defined once, so
+ * a fifth rendering path discovered later is closed for both at once. The marker
+ * is per-subclass because a redacted string that could not say WHICH token it
+ * stood for would make a log line ambiguous exactly when someone is debugging an
+ * auth failure.
+ */
+class OpaqueToken {
+    #secret;
+    constructor(secret) {
+        this.#secret = secret;
+    }
+    /** The plaintext. The ONLY exit. Call this at the request boundary, nowhere else. */
+    expose() {
+        return this.#secret;
+    }
+    toString() {
+        return this.marker();
+    }
+    toJSON() {
+        return this.marker();
+    }
+    [Symbol.for("nodejs.util.inspect.custom")]() {
+        return this.marker();
+    }
+    get [Symbol.toStringTag]() {
+        return this.marker();
+    }
+}
+/**
+ * The long-lived half of the human lane: rotated on every use, 90-day family cap.
+ *
+ * ⚠ Presenting one twice is a REPLAY to the server and revokes the whole family
+ * (`refresh.ts`'s `reuse_detected`). That is why `oauth/lock.ts` exists — see
+ * its module note, which is the single most consequential comment in this task.
+ */
+export class RefreshToken extends OpaqueToken {
+    constructor(secret) {
+        super(secret);
+    }
+    marker() {
+        return REDACTED_REFRESH;
+    }
+}
+/**
+ * The short-lived half: an RS256 JWT, `aud` = the `/mcp` audience, ~900 seconds.
+ *
+ * Held as an opaque token DESPITE being a JWT, and the distinction is worth
+ * stating: a JWT's payload is readable by anyone holding it, so "opaque" here is
+ * about not LOGGING it, not about not parsing it. Nothing in this client parses
+ * it — the expiry travels beside it as data from the token response, because
+ * trusting a claim inside a token to decide whether to refresh that token is
+ * asking the thing being validated to validate itself.
+ */
+export class AccessToken extends OpaqueToken {
+    constructor(secret) {
+        super(secret);
+    }
+    marker() {
+        return REDACTED_ACCESS;
+    }
+}
+/**
+ * Is this string a refresh token rather than something else in the wrong slot?
+ *
+ * The server mints it as 32 random bytes, base64url-encoded and unpadded
+ * (`refresh.ts`'s `mintRefreshToken`). It therefore has NO dots — so a JWT is
+ * refused — and it does not carry the ingest prefix, so a `vcik_` is refused.
+ *
+ * ⚠ This is a CLASS check, not a validity check. It answers "is this the right
+ * KIND of secret for this slot", which is a question the client can answer
+ * locally; whether the token is live is the server's answer and is never guessed
+ * here. Same discipline as the ingest credential: never parse the secret.
+ */
+export function isRefreshTokenShape(value) {
+    if (value === "" || value.startsWith(INGEST_TOKEN_PREFIX))
+        return false;
+    return /^[A-Za-z0-9_-]+$/.test(value);
+}
+/**
+ * Is this string an access token rather than something else in the wrong slot?
+ *
+ * Three non-empty dot-separated base64url segments — the JWS Compact
+ * Serialization shape (RFC 7515 §3.1). This is the mirror of the trap recorded
+ * at the top of this file: a `vcik_` is base64url with NO dots, so it fails here
+ * for the same structural reason it fails the server's JWT verifier, and it
+ * cannot be smuggled into the bearer position of a read.
+ */
+export function isAccessTokenShape(value) {
+    const parts = value.split(".");
+    return parts.length === 3 && parts.every((p) => /^[A-Za-z0-9_-]+$/.test(p));
 }
 //# sourceMappingURL=credential.js.map

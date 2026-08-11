@@ -29,6 +29,21 @@ export function projectsPath(home) {
     return join(rootDir(home), "projects.json");
 }
 /**
+ * The HUMAN lane's signed-in session — `CR-084d`. Mode 0600, enforced on read by
+ * the same `readSecretFile` the ingest credential goes through.
+ *
+ * A SECOND FILE and not a second field in `credentials.json`, deliberately. The
+ * two hold different privilege classes on different lanes: `credentials.json`
+ * holds the machine's opaque ingest credential and is read by every hook, and
+ * this holds a user-principal refresh token read only by interactive verbs. One
+ * file would mean the hook path opens the more powerful secret on every turn for
+ * no reason, and `VIBECOMMIT_TOKEN` (which overrides the ingest credential and
+ * nothing else) would acquire a meaning it does not have.
+ */
+export function sessionPath(home) {
+    return join(rootDir(home), "session.json");
+}
+/**
  * Client state. `CR-023`'s capture-confirmed key lives here under `(repo, day)`;
  * the three negative `systemMessage` states use a per-session file.
  */
