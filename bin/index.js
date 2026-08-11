@@ -141,7 +141,10 @@ async function main(argv) {
     const ctx = interactiveContext(argv);
     switch (verb) {
         case "connect":
-            return await connect(ctx);
+            // `--sign-in` (CR-084d) is a FLAG, not a verb: `VERBS` is what `renderHelp`
+            // iterates, so a sixth verb would move `test/help.golden.txt`, and the
+            // brief for this task is explicit that the golden file must not move.
+            return await connect(ctx, { signIn: argv.includes("--sign-in") });
         case "status":
             return status(ctx);
         case "off":
