@@ -35,9 +35,9 @@
  * resync — so this is left unlocked rather than paying for a lockfile on the
  * hook's wall-clock budget.
  */
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
-import { sessionStatePath } from "./paths.js";
+import { chmodSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { repoSessionsDir, sessionStatePath } from "./paths.js";
 import { EMPTY_FILE_STATE } from "./policy.js";
 export const EMPTY_SESSION_STATE = { seq: 0, stop: null, files: {} };
 export function loadSessionState(home, key) {
@@ -46,6 +46,10 @@ export function loadSessionState(home, key) {
     // whole of D58: it is the one path on which two repos share an offset ledger.
     if (path === null)
         return EMPTY_SESSION_STATE;
+    return readStateAt(path);
+}
+/** One state file, or the empty state. Every failure yields empty — a RESYNC. */
+function readStateAt(path) {
     let raw;
     try {
         raw = readFileSync(path, "utf8");
@@ -59,6 +63,50 @@ export function loadSessionState(home, key) {
     catch {
         return EMPTY_SESSION_STATE;
     }
+}
+/**
+ * When did this REPO last deliver anything, and at what `seq` — `CR-021`.
+ *
+ * A scan, deliberately, and not a second index. `status` is interactive and has
+ * no `session_id`, so it cannot address a session file the way a hook can; it
+ * knows only the repo. The alternative — a per-repo "latest" pointer written on
+ * every successful send — is a second source of truth for a fact the session
+ * files already hold, and it would be the one that goes stale.
+ *
+ * The directory holds one small JSON per session for one repo, read once per
+ * `status` invocation on a human's keypress. There is no budget here worth
+ * trading correctness for.
+ *
+ * Null means nothing has ever been delivered for this repo. That is distinct
+ * from `at: 0`, which a pre-`CR-021` file parses to — both render as "nothing
+ * recorded yet" rather than as a date.
+ */
+export function lastSendForRepo(home, repoKey) {
+    const dir = repoSessionsDir(home, repoKey);
+    if (dir === null)
+        return null;
+    let entries;
+    try {
+        entries = readdirSync(dir);
+    }
+    catch {
+        // No directory means nothing was ever written for this repo.
+        return null;
+    }
+    let best = null;
+    for (const entry of entries) {
+        if (!entry.endsWith(".json"))
+            continue;
+        const session = readStateAt(join(dir, entry));
+        for (const file of Object.values(session.files)) {
+            if (file.lastSentAt <= 0)
+                continue;
+            if (best === null || file.lastSentAt > best.at) {
+                best = { at: file.lastSentAt, seq: session.seq };
+            }
+        }
+    }
+    return best;
 }
 /** Persist. Returns false on any failure — the caller must not throw from a hook. */
 export function saveSessionState(home, key, next) {
@@ -156,6 +204,9 @@ function parseFileState(value) {
         backlog,
         gapBytes: nonNegative(o.gapBytes),
         gapCount: nonNegative(o.gapCount),
+        // Absent in any file written before `CR-021`. `nonNegative` yields 0, which
+        // this codebase reads as "never sent" rather than as 1 January 1970.
+        lastSentAt: nonNegative(o.lastSentAt),
     };
 }
 function nonNegative(value) {

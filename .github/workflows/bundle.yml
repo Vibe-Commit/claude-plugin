@@ -1,0 +1,99 @@
+name: bundle
+
+# The vendored capture bundle, gated (CR-029e).
+#
+# `bin/` is committed output, not source: the emitted JavaScript of the capture
+# client at one named commit, shipped so the Stop hook does not pay an `npx`
+# cold-fetch on every turn (D57 §DX2). Committed output rots, and it did — the
+# bundle sat NINE capture commits behind `main`, missing `redact.js` entirely,
+# and nothing here could have said so. Until this file, the only workflow in the
+# repo was `license-check.yml`, whose single step is `test -f LICENSE` (D85).
+#
+# ⚠ WHAT THESE JOBS CANNOT DO. They cannot rebuild the bundle from source.
+# `vibecommit-capture` is private (D64); this repo is public, non-negotiably,
+# because `/plugin marketplace add` pulls the catalog from a public git remote
+# (D20). A cross-org PAT here would hand a public MIT repo's CI a read
+# credential for the closed core — inverting the very boundary the bundle's
+# gates exist to protect. So the strong check (byte-identity against a fresh
+# build) stays in `scripts/vendor_capture_bin.sh`, run by hand where the source
+# is legitimately in reach, and CI takes the two properties it CAN prove:
+# the bundle is internally consistent, and it cannot move without its pin.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  self-consistency:
+    name: bundle is self-consistent
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.15.0"
+      # Reads the checkout and nothing else — no source tree, no registry, no
+      # credential — which is why it can run on every pull request for free.
+      # Gates: only `.js` in bin/, the entry present, the import closure (every
+      # specifier resolves to `node:` or to a file inside bin/), the entry
+      # actually running a `hook` invocation under a hard timeout, the tree
+      # matching capture-bundle.json file-by-file, and the pinned commit
+      # appearing in exactly one place in the repo.
+      - name: check:bundle
+        run: node scripts/check_bundle.mjs
+
+  pin-coupling:
+    name: bin/ and its pin move together
+    # Needs a base to compare against, so it is a pull-request property. The
+    # drift it catches is the half no single snapshot can see: a pin that moves
+    # while bin/ stands still is perfectly self-consistent and completely wrong.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The comparison needs history. A shallow checkout would make the
+          # merge base unresolvable, and this check exits 2 rather than 0 when
+          # it cannot run — a comparison that never happened must not read green.
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.15.0"
+      - name: check:bundle-pin
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: node scripts/check_bundle_pin.mjs --base "$BASE_SHA"
+
+  corroboration:
+    name: bundle vs the published client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.15.0"
+      # ⚠ THIS ONE SKIPS TODAY, AND THE SKIP IS THE POINT. `@vibe-commit/capture`
+      # has never been published (D64: "do not publish to npm: the scope is
+      # unclaimed and the package is a stub"), so there is no tarball to compare
+      # `bin/` against. The check is wired anyway and turns itself on the day of
+      # the first publish, with no edit here.
+      #
+      # The three outcomes are kept distinct on purpose, because "the subject is
+      # absent" and "the check did not run" are the same shade of green to a
+      # careless gate: 0 corroborated, 1 published-and-different, 3 not published,
+      # anything else (registry unreachable, bad tarball) an error that FAILS.
+      - name: check:npm-bundle
+        run: |
+          set +e
+          node scripts/check_npm_bundle.mjs
+          code=$?
+          set -e
+          case "$code" in
+            0) echo "bundle corroborated against the published client" ;;
+            3) echo "::warning title=Bundle not corroborated::@vibe-commit/capture is not published (D64), so byte-identity between bin/ and the capture client is UNVERIFIED. The self-consistency gates still hold." ;;
+            *) echo "::error title=Bundle corroboration failed::check_npm_bundle.mjs exited $code"; exit "$code" ;;
+          esac

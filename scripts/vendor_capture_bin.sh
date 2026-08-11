@@ -24,9 +24,14 @@
 # it inside an MIT package. `CR-030` is the CI gate for that; until it lands, the
 # check at the end of this script is the only thing standing there.
 #
-# ⚠ THIS IS A MANUAL, ONE-SHOT VENDOR. CI automation, the X-Client-Version header
-# and the client/plugin skew check are `CR-029e` and are deliberately NOT built
-# here. The seam is left visible on purpose.
+# ⚠ RUNNING THIS IS STILL MANUAL — it needs the capture source, which this repo
+# may not read (D64/D20) — but the DRIFT IS NO LONGER INVISIBLE. `CR-029e` made
+# the pin data (`capture-bundle.json`), moved the source-free gates into
+# `scripts/check_bundle.mjs` so CI runs them on every PR, and added
+# `scripts/check_bundle_pin.mjs` so bin/ and its pin cannot move apart. What
+# stays here is the one gate that genuinely needs the source: byte-identity.
+# (The `X-Client-Version` half of CR-029 is the client's own — `bin/post.js`
+# sends it — so there is nothing for the plugin to add.)
 #
 # Usage:
 #   scripts/vendor_capture_bin.sh                      # default source + pinned commit
@@ -37,12 +42,17 @@
 
 set -euo pipefail
 
-# The commit bin/ was last vendored from. Bump this, re-run, and commit the diff.
-VC_COMMIT="${VC_COMMIT:-8e772f181194e94a14fad412482f4a123acef135}"
-VC_REPO="${VC_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/vibecommit-capture}"
-
 PLUGIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN_DIR="$PLUGIN_ROOT/bin"
+PIN_FILE="$PLUGIN_ROOT/capture-bundle.json"
+
+# The commit bin/ was vendored from is DATA, and this reads it rather than
+# repeating it. It used to be a shell default here and a paste in CHANGELOG.md
+# prose -- two editable copies of one fact, which is how the bundle came to sit
+# nine capture commits behind `main` with nothing in the repo able to say so.
+# `check_bundle.mjs` fails if a second copy of the live sha reappears anywhere.
+VC_COMMIT="${VC_COMMIT:-$(node -p "require('$PIN_FILE').capture.commit")}"
+VC_REPO="${VC_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/vibecommit-capture}"
 
 if [ ! -d "$VC_REPO/.git" ]; then
   echo "error: no capture repo at $VC_REPO (set VC_REPO)" >&2
@@ -71,19 +81,22 @@ mkdir -p "$BIN_DIR"
         cp "$f" "$BIN_DIR/$f"
       done )
 
+echo "==> recording the pin"
+# Written from the tree that was just produced, never typed. The digest and the
+# per-file hashes in capture-bundle.json are what let CI catch a hand-edit of
+# bin/ with no source tree in reach.
+VC_VERSION="$(node -p "require('$WORK/src/package.json').version")"
+node "$PLUGIN_ROOT/scripts/check_bundle.mjs" \
+  --update-pin --capture-commit "$VC_COMMIT" --capture-version "$VC_VERSION" >/dev/null
+
 echo "==> verifying the vendored tree"
 fail=0
 
-# Nothing but .js may be present.
-if find "$BIN_DIR" -type f ! -name '*.js' | grep -q .; then
-  echo "FAIL: non-.js files in bin/:" >&2
-  find "$BIN_DIR" -type f ! -name '*.js' >&2
-  fail=1
-fi
-
-# The entry must exist and must be the emitted CLI, shebang intact.
-if [ ! -f "$BIN_DIR/index.js" ]; then
-  echo "FAIL: bin/index.js missing" >&2
+# Everything that needs no source tree lives in check_bundle.mjs, because CI has
+# no source tree and must be able to run them on every PR: nothing but .js in
+# bin/, the entry present, the import closure, the entry actually running, and
+# the tree agreeing with the pin just written above.
+if ! node "$PLUGIN_ROOT/scripts/check_bundle.mjs"; then
   fail=1
 fi
 
@@ -105,44 +118,13 @@ if ! diff -q \
   fail=1
 fi
 
-# D1a, gate 2 of 2: the bundle must be import-CLOSED. Every import resolves to a
-# `node:` builtin or to a file that exists inside bin/. Nothing reaches outside
-# this tree at runtime -- from the closed repo or from anywhere else. That is the
-# property D1a actually cares about, stated as something a machine can check.
-python3 - "$BIN_DIR" <<'PY' || fail=1
-import os, re, sys
-root = sys.argv[1]
-spec_re = re.compile(r'\bfrom\s*"([^"]+)"|\bimport\s*\(\s*"([^"]+)"\s*\)')
-bad = []
-for dirpath, _, names in os.walk(root):
-    for n in names:
-        if not n.endswith(".js"):
-            continue
-        path = os.path.join(dirpath, n)
-        rel = os.path.relpath(path, root)
-        for m in spec_re.finditer(open(path, encoding="utf-8").read()):
-            spec = m.group(1) or m.group(2)
-            if spec.startswith("node:"):
-                continue
-            if not spec.startswith("."):
-                bad.append(f"bare (external) import {spec!r} in {rel} -- bundle is not self-contained")
-                continue
-            target = os.path.normpath(os.path.join(dirpath, spec))
-            if not os.path.isfile(target):
-                bad.append(f"unresolved relative import {spec!r} in {rel}")
-if bad:
-    print("FAIL: " + "\nFAIL: ".join(bad), file=sys.stderr)
-    sys.exit(1)
-PY
-
-# It must resolve its own imports. A dist/index.js copied without its siblings
-# dies here with a module-resolution error -- which is the whole reason the tree
-# is vendored rather than the single entry file.
-if ! printf '%s' '{"session_id":"vendor-check","transcript_path":"/nonexistent.jsonl","cwd":"/tmp","hook_event_name":"Stop"}' \
-     | node "$BIN_DIR/index.js" hook >/dev/null 2>&1; then
-  echo "FAIL: vendored entry did not run cleanly (module resolution?)" >&2
-  fail=1
-fi
+# D1a, gate 2 of 2 -- the import closure: every specifier resolves to a `node:`
+# builtin or to a file INSIDE bin/, so nothing reaches outside this tree at run
+# time, from the closed repo or anywhere else. That is the property D1a actually
+# cares about, stated as something a machine can check. It moved into
+# `check_bundle.mjs` (run above) because unlike byte-identity it needs no source
+# tree, which is what lets CI run it on every pull request rather than only when
+# somebody remembers to run this script.
 
 [ "$fail" -eq 0 ] || exit 1
 
@@ -151,4 +133,5 @@ echo "    commit : $VC_COMMIT"
 echo "    files  : $(find "$BIN_DIR" -name '*.js' -type f | wc -l | tr -d ' ') .js"
 echo "    bytes  : $(find "$BIN_DIR" -name '*.js' -type f -exec cat {} + | wc -c | tr -d ' ')"
 echo
-echo "Record the commit above in CHANGELOG.md before committing bin/."
+echo "capture-bundle.json now records that commit. Commit it TOGETHER with bin/:"
+echo "check_bundle_pin.mjs fails a pull request that moves one without the other."

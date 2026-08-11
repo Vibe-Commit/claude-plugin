@@ -14,6 +14,8 @@
  * Wire shape retyped from the plan and from reading the closed-source server. No
  * code is imported or copied from `vibecommit-mcp` (D60 §D1a): this package is
  * MIT, and lifting closed code into it relicenses that code by accident.
+ *
+ * @provenance vibecommit-mcp src/conversation/ingest_session.ts — wire shape, retyped
  */
 import { createHash } from "node:crypto";
 import { classify, markDelivered, markHeld, markSkipped, nextSpan, resolveCaps, } from "./policy.js";
@@ -173,7 +175,7 @@ export async function deliver(ctx, eof, readBody) {
     let next = { ...session, seq };
     switch (disposition) {
         case "ok":
-            next = withFileState(next, ctx.fileKey, markDelivered(current, span.to));
+            next = withFileState(next, ctx.fileKey, markDelivered(current, span.to, ctx.nowMs));
             break;
         case "later":
             next = withFileState(next, ctx.fileKey, markHeld(current, span, ctx.nowMs, caps));

@@ -1,0 +1,60 @@
+{
+  "_readme": [
+    "THE PIN. bin/ is committed, vendored output — the emitted JavaScript of the",
+    "capture client at capture.commit (D57 §DX2: npx on every Stop is a per-turn",
+    "cold-fetch tax, so the tree ships instead of resolving). This file is the ONE",
+    "place that commit is recorded; scripts/vendor_capture_bin.sh and CHANGELOG.md",
+    "both derive from it, and scripts/check_bundle.mjs fails if a second copy of",
+    "the live sha appears anywhere else in the repo.",
+    "",
+    "DO NOT HAND-EDIT EITHER HALF. bundle.digest and bundle.files are measured",
+    "from bin/, so a hand-edit of one without the other is exactly the drift the",
+    "gates catch. Re-vendor instead: scripts/vendor_capture_bin.sh rewrites bin/",
+    "and this file together from a named capture commit.",
+    "",
+    "capture.npmVersion is the client version this bundle corresponds to. It is",
+    "what scripts/check_npm_bundle.mjs would compare bin/ against — which it",
+    "cannot do yet, because @vibe-commit/capture has never been published (D64)."
+  ],
+  "capture": {
+    "repo": "Vibe-Commit/vibecommit-capture",
+    "commit": "9fcf19756372e7d1eed348638c1b0b1cdeb187a4",
+    "npmPackage": "@vibe-commit/capture",
+    "npmVersion": "0.1.0"
+  },
+  "bundle": {
+    "root": "bin",
+    "algorithm": "sha256",
+    "digest": "7f521b2230553fa1f8a8fe8097fd54923fb699b8c4011df6f3c1f4c8766483aa",
+    "fileCount": 26,
+    "byteCount": 195057,
+    "files": {
+      "commands/connect.js": "0447f1e89740f2a316dd89506b338bb991eb50d1874fd872ed5089458af3a4e1",
+      "commands/context.js": "3c31e216fdef1b9539e6906153482532ca5b22587dae3107ca789be5f88129a7",
+      "commands/status.js": "cb76096bde993a8fee2ec35bd39a4f8a54c84b837b9f295aec341efa48eeb494",
+      "consent.js": "0e2e05702336641be35412cec731d1ffdb138ad0e52e63d970e8216ce1881cbe",
+      "copy/claims.js": "e6aeb537798f0a5a7d29b4ff20257e4c24a3d017463396808e61d4b5b5987ebf",
+      "copy/grades.js": "14255c50e7bd12cc5f2cacc244ca20db35201aae8c96ff6b18115b8955ac39fa",
+      "copy/index.js": "45083e144f89466f799c9c84831e5ef8d92c0288c629f76f7caaf08f8a41b4c6",
+      "copy/strings.js": "625bee7ffc22220c825f9c5dea7889f1f30288002e5e6e43f553e147905ab8ef",
+      "copy/time.js": "d98b0535faaa10d6ae7d823c20725535ac1950c1b00ccc7f40d26f830ee3d36a",
+      "credential.js": "785f70566626f4bf0a7a75e5778886579dc776d4c76db5773b87750853d1d568",
+      "exit.js": "4e98e795822dd7e40bdd7bea33e95fd8afe57bbbaa655485bd5abec33c516bbf",
+      "git.js": "502a18e1e032d59141346cf11e7d514caceb059ec52421ee36604451fdc6256e",
+      "hooks/entry.js": "b3bf8bea4994efa1637232eca98777e4ac7a9392151068e8618611d5cc3cb5de",
+      "hooks/session_end.js": "433f7f6201689c53d2ef82822bca3eebab008ba7731a13589592985318f47580",
+      "index.js": "579edd10ca365fd3e3bbb923647dcd8075cf328471aafdf53fdef7c870cad18c",
+      "install.js": "a93758dc61680647384054383b6f21bf239cdbd190ab21cc1d980ebb8dc17050",
+      "paths.js": "c4f4ed7f0695362807c90ef96ac4b0af2d4375f9d9f398788bc0f921b21e01d7",
+      "policy.js": "e3bf07f2b5b467cddce2f339cbaf85e24bed2c6d997ce2659780519965cb4143",
+      "post.js": "b6c33784674f2cf7253e65d0a6f2849a9222b1dd8a8131c5a5ecae431aa7f90c",
+      "project.js": "c835d41c352ce43a4eae2d859b9d128a4b0c325b70ae76c3c6a168b7c79d8f9a",
+      "redact.js": "aef4cb002cdead9260e4794656e80e13010164986bee673c4ef09a769d7b28e5",
+      "runtime.js": "b9b3b798b0736564843907658248f47638eec419e6ff7cd6ff6af55dad4859f9",
+      "state.js": "241f31c9648b2c049bf966d5f8a31f888a46115bd5c5b26b40020a064c79b67a",
+      "system_message.js": "dcd68a1c39cf30f9454d4d077ae392eab1af4e835d2d92c045fa79fdba9705c9",
+      "term.js": "8bb85f817be882524e6403779ffc05ada06c933afedca4b2a187fed955bbf51b",
+      "version.js": "a1d4e4773729f6c395d189dc452434bb13f1967c1af571237157446766e33ed7"
+    }
+  }
+}
