@@ -106,6 +106,22 @@ All notable changes to this plugin will be documented here.
     RPC seam (D109 §1), and `CR-076a` flips its raise rather than removing it.
     Its one-word widening from "commit history" to "captured history" is true
     before and after that flip.
+- **`commit_coverage` is documented with the argument an agent can actually
+  produce (`CR-079e` follow-up, after mcp's `CR-142`).** The rules files said
+  to pass `repository_id`, which was accurate against the server and still
+  unusable: it is a uuid an agent has no route to — `blame_commit` does not
+  return the id it resolves, so there was no path, direct or indirect. The
+  line sat one bullet below `blame_commit`, which correctly takes a slug.
+  `CR-142` made the tool accept `repo`, the same slug, resolved the same way;
+  the rules files now say so and the two read verbs match on the page.
+  - The alternative spelling is **deliberately not mentioned**. The server
+    accepts either identifier but **exactly one** — supplying both is refused
+    rather than resolved by precedence, because when they disagree there is no
+    safe guess at intent. Naming an argument the reader cannot obtain would
+    add only that hazard.
+  - `ref` is called out as **required and not defaulted**, which is the
+    server's own rule: a coverage number is ref-relative, so a guessed ref
+    would put a wrong word in a true sentence.
 - **The rules files teach the read lane's two verbs (`CR-079e`).**
   `blame_commit` and `commit_coverage` have shipped since `CR-085` and
   `docs/architecture.md` §3 names them as *the* read verbs of the MCP
