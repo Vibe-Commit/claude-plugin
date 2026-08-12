@@ -55,14 +55,11 @@ capture flow relies on:
   `provenance_url`. Re-capturing the same conversation is a free no-op.
 
 The server also exposes read tools to search, read, and diff your captured
-history (`search_history`, `query_history`, `get_conversation`,
-`diff_conversation`).
+history (`search_history`, `blame_commit`, `commit_coverage`,
+`get_conversation`, `diff_conversation`).
 
 First call triggers OAuth in your browser (GitHub login). After that, every
 `commit_conversation` call is silent.
-
-(The older `commit_transcript` tool is deprecated in favor of
-`commit_conversation`.)
 
 ## Optional: deterministic capture (compliance tier)
 
