@@ -58,10 +58,11 @@ Read/search tools:
   is accepted but does not narrow the result.
 - `commit_coverage` — how many commits in a repository have a capture
   recorded against them, broken down by edge grade, with the recorded
-  successor mapping. Pass `repository_id` and `ref`. It returns the shas we
-  hold an edge for and NOT a percentage: reachability from a ref is a local
-  git question the server cannot answer, so compute any rate in the user's
-  own clone.
+  successor mapping. Pass `repo` (the same slug `blame_commit` takes) and
+  `ref`, which is required and not defaulted. It returns the shas we hold
+  an edge for and NOT a percentage: reachability from a ref is a local git
+  question the server cannot answer, so compute any rate in the user's own
+  clone.
 - `get_conversation` — open ONE captured conversation by
   `conversation_id`: its captures and, per capture, the ordered turns
   with reconstructed `content`.
