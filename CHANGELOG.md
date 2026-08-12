@@ -86,6 +86,36 @@ All notable changes to this plugin will be documented here.
 
 ### Changed
 
+- **The three rules files no longer teach retired tools (`CR-079e`).**
+  `AGENTS.md`, `CLAUDE.md` and `.claude/skills/vibecommit/SKILL.md` are
+  delivered into a user's project on install and read by their agent on every
+  task, so a tool name here is an instruction, not a note. The capture-history
+  listing tool and the deprecation line for the superseded single-shot capture
+  tool are both gone — `CR-076` drops the `traces` table they read, and a rules
+  file naming a tool the server no longer registers spends a tool call to find
+  that out.
+  - **No retired name is left behind to explain itself, and that is
+    deliberate.** Spelling the dead tools out in the text that replaces them
+    would re-teach the exact strings this change removes, and would trip
+    `CR-080`'s cross-repo grep gate from inside the file documenting the
+    removal. The successor is named where the agent actually meets the
+    problem: `CR-081` makes a retired tool return a structured migration
+    error, and step 3 of the capture protocol now tells the agent to call the
+    tool that error names instead of retrying the one that failed.
+  - **`search_history` survives and was deliberately not swept** — it is the
+    RPC seam (D109 §1), and `CR-076a` flips its raise rather than removing it.
+    Its one-word widening from "commit history" to "captured history" is true
+    before and after that flip.
+- **The rules files teach the read lane's two verbs (`CR-079e`).**
+  `blame_commit` and `commit_coverage` have shipped since `CR-085` and
+  `docs/architecture.md` §3 names them as *the* read verbs of the MCP
+  surface, but no rules file mentioned either — so every installed agent knew
+  the read lane only through the tool that was about to be retired.
+  `commit_coverage`'s description carries the server's own caveat: it returns
+  the shas an edge is held for, never a percentage, because reachability from
+  a ref is a local git question.
+- **`README.md`** — the same two changes in the tool list under *How it
+  works*, and the trailing deprecation parenthetical removed with them.
 - **`bin/` re-vendored — the public bundle was shipping an older, less careful
   client (`CR-029e`).** It held **23** emitted `.js` against the client's **26**
   modules, and **15 of the 26 were absent or wrong**: three missing outright

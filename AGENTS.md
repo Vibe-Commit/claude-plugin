@@ -33,8 +33,9 @@ You have a VibeCommit MCP server. On every coding task:
 
 3. **If a capture call errors:** tell the user and continue. Do NOT retry
    silently — they may need to re-authenticate or pick the right workspace.
-
-(The older `commit_transcript` tool is deprecated; use `commit_conversation`.)
+   If the error names a replacement tool, call the one it names rather than
+   retrying the old one: the tool surface has moved on and this file is stale
+   until your next `setup` call.
 
 ## VibeCommit review & search
 
@@ -43,13 +44,22 @@ history. Use them when the user asks to find, review, summarize, compare,
 or replay past work. Reach for them yourself — do not make the user dig.
 
 Read/search tools:
-- `search_history` — full-text search of YOUR commit history. Pass
+- `search_history` — full-text search of YOUR captured history. Pass
   `query` (+ optional `filters.repo` / `filters.org`). Returns
   `{ items:[{ kind, id, repo_id, agent, model, created_at, snippet }],
   page, total_pages, total }`, most-recent-first.
-- `query_history` — list/window prior commit captures. Optional
-  `repo_id` and a `start`/`end` (ISO 8601) time window — the
-  "traces in range" view. Paginate with the returned `next_cursor`.
+- `blame_commit` — show the conversation turns recorded against ONE commit,
+  the way `git blame` names a commit for a line. Pass `repo` (the repository
+  slug) and `commit_sha`. If a squash, rebase or amend rewrote the sha, the
+  response reports the commit the capture is actually recorded against, so
+  the two are never confused. Resolution is at the COMMIT grain — `file_path`
+  is accepted but does not narrow the result.
+- `commit_coverage` — how many commits in a repository have a capture
+  recorded against them, broken down by edge grade, with the recorded
+  successor mapping. Pass `repository_id` and `ref`. It returns the shas we
+  hold an edge for and NOT a percentage: reachability from a ref is a local
+  git question the server cannot answer, so compute any rate in the user's
+  own clone.
 - `get_conversation` — open ONE captured conversation by
   `conversation_id`: its captures and, per capture, the ordered turns
   with reconstructed `content`.
@@ -61,11 +71,15 @@ Read/search tools:
   partial; say so).
 
 Typical flow: `search_history` → `get_conversation` →
-`diff_conversation`.
+`diff_conversation`, or `blame_commit` when the user starts from a commit.
 
 Render results in chat:
 - **Search:** a ranked list — each result's SHA/id in `monospace` with a
   one-line context (the `snippet` or repo/agent/date).
+- **Blame:** name the commit the capture is recorded against, and say so
+  explicitly when it differs from the sha the user asked about.
+- **Coverage:** always give the ref alongside the count — a coverage number
+  without its ref does not mean anything.
 - **Diff:** report the shared prefix, the divergence point, then each
   side's delta; if `truncated`, flag that the comparison is partial.
 
