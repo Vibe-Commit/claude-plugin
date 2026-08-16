@@ -24,6 +24,17 @@ You have a VibeCommit MCP server. On every coding task:
      last 20 commits from `git log -n 20 --format=%H%x09%s%x09%aI`). The server
      links the capture to that commit and tells you if any recent commits still
      lack a capture.
+   - If a squash, rebase or amend rewrote a sha you already captured, add
+     `commit_sha_successor`: `{ ancestor_sha, successor_sha, match_kind }` —
+     the old sha, the one that replaced it, and `"exact"` if you can name the
+     rewrite or `"probable"` if you matched it by patch id. Send it ONLY when
+     a rewrite happened; the two shas must differ. It is what lets
+     `blame_commit` still resolve the old sha.
+     Its optional `patch_id` MUST be computed with `--stable`, exactly:
+     `git diff-tree -p --root --no-color --no-ext-diff <sha> | git patch-id --stable`
+     Bare `git patch-id` is `--unstable` and gives a DIFFERENT id on any commit
+     touching more than one file, so it will NOT match. Send `null` for a
+     merge, an empty commit, or a sha your clone does not have.
 
    Re-capturing the same conversation is a FREE no-op, so call it freely. The
    response includes a `provenance_url` — mention it to the user. If it reports
