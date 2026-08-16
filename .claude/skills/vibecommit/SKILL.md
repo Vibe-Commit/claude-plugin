@@ -48,7 +48,7 @@ or replay past work. Reach for them yourself — do not make the user dig.
 Read/search tools:
 - `search_history` — full-text search of YOUR captured history. Pass
   `query` (+ optional `filters.repo` / `filters.org`). Returns
-  `{ items:[{ kind, id, repo_id, agent, model, created_at, snippet }],
+  `{ items:[{ kind, id, repo_id, created_at, snippet }],
   page, total_pages, total }`, most-recent-first.
 - `blame_commit` — show the conversation turns recorded against ONE commit,
   the way `git blame` names a commit for a line. Pass `repo` (the repository
@@ -78,7 +78,7 @@ Typical flow: `search_history` → `get_conversation` →
 
 Render results in chat:
 - **Search:** a ranked list — each result's SHA/id in `monospace` with a
-  one-line context (the `snippet` or repo/agent/date).
+  one-line context (the `snippet` or repo/date).
 - **Blame:** name the commit the capture is recorded against, and say so
   explicitly when it differs from the sha the user asked about.
 - **Coverage:** always give the ref alongside the count — a coverage number
