@@ -21,9 +21,12 @@ import { homedir } from "node:os";
 import { createInterface } from "node:readline/promises";
 import { connect } from "./commands/connect.js";
 import { off, status } from "./commands/status.js";
+import { report } from "./commands/report.js";
+import { why } from "./commands/why.js";
 import { HELP, INTERNAL, USAGE } from "./copy/index.js";
 import { EXIT } from "./exit.js";
 import { runHook } from "./hooks/entry.js";
+import { runPostCommit } from "./hooks/post_commit.js";
 import { LABEL_GUTTER, renderErrorBlock, resolveColour, wrap } from "./term.js";
 import { CLIENT_VERSION } from "./version.js";
 const VERBS = ["connect", "status", "off", "why", "report"];
@@ -146,16 +149,23 @@ async function main(argv) {
             // brief for this task is explicit that the golden file must not move.
             return await connect(ctx, { signIn: argv.includes("--sign-in") });
         case "status":
-            return status(ctx);
+            // `argv.slice(1)` for the same reason `why` and `report` take it: `status`
+            // reads its own `--json` flag rather than this package acquiring an
+            // argument parser it has deliberately never had (DESIGN.md §13.3).
+            return status(ctx, argv.slice(1));
         case "off":
             return off(ctx);
         case "why":
+            // CR-086. `argv.slice(1)` is everything after the verb — there is no
+            // argument parser in this package and `why` does not add one; it reads
+            // `<file>:<line>` and refuses `--json`, which is the smallest shape that
+            // satisfies the verbatim-approved `--help` sentence.
+            return await why(ctx, argv.slice(1));
         case "report":
-            // CR-086 and CR-108. Left explicit so an unimplemented verb exits 1 rather
-            // than falling into the usage branch, which would tell a user they typed
-            // something wrong when they did not.
-            process.stderr.write(`${USAGE.notImplemented(verb)}\n`);
-            return EXIT.failure;
+            // CR-108, W10. Same shape as `why`: `argv.slice(1)` is everything after
+            // the verb, and the verb reads its own two flags rather than adding an
+            // argument parser this package deliberately does not have.
+            return await report(ctx, argv.slice(1));
     }
 }
 function readStdin() {
@@ -267,6 +277,16 @@ function installPipeGuards() {
 if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
     installPipeGuards();
     const argv = process.argv.slice(2);
+    if (argv[0] === "post-commit") {
+        // ⛔ A HIDDEN VERB, dispatched here rather than through `main`, and NOT in
+        // `VERBS` — `renderHelp` iterates that list, so adding it would move
+        // `test/help.golden.txt` for a verb no human ever types. `hook` is dispatched
+        // the same way, for the same reason.
+        //
+        // It runs inside the user's `git commit`, so it exits 0 unconditionally and
+        // writes nothing to either stream (`hooks/post_commit.ts`).
+        process.exit(runPostCommit({ home: homedir(), cwd: process.cwd() }));
+    }
     if (invocationMode(process.env, argv) === "hook") {
         // `runHook` installs the contract guards before it does any work and always
         // calls `process.exit(0)`. It never returns, so nothing follows it.

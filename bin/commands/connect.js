@@ -24,13 +24,13 @@
  */
 import { readdirSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
-import { CONNECT, COMMANDS, ERRORS, HELP, PATH_CLASH, RUNTIME, SIGNIN, URLS, } from "../copy/index.js";
+import { CONNECT, COMMANDS, COMMIT_HOOK, ERRORS, HELP, PATH_CLASH, RUNTIME, SIGNIN, URLS, } from "../copy/index.js";
 import { grantProject, isAffirmative, isProjectAllowed } from "../consent.js";
 import { loadCredential } from "../credential.js";
 import { EXIT } from "../exit.js";
 import { resolveRepoSlug } from "../git.js";
 import { readSpan, DEFAULT_HOOK_BUDGET_MS } from "../hooks/entry.js";
-import { classifyInstall } from "../install.js";
+import { classifyInstall, installPostCommitHook } from "../install.js";
 import { mcpUrl } from "../oauth/discovery.js";
 import { loadSession } from "../oauth/session.js";
 import { openBrowser, signIn } from "../oauth/signin.js";
@@ -305,7 +305,48 @@ async function captureBeat(ctx, projectKey, credential) {
         ...wrap(CONNECT.doneForRepo(truncatePath(projectKey, 52)), 2),
         ...wrap(`${CONNECT.stopLabel}: ${COMMANDS.off}`, 2),
     ]);
+    // ⛔ COMMIT CAPTURE IS INSTALLED AND REPORTED HERE (`CR-170`, D154). Three of
+    // its failure modes are silent no-ops, so every outcome prints — including
+    // success, which is the only place the PER-CLONE cost can be stated at a
+    // moment the user can act on it.
+    commitHookBeat(ctx, projectKey);
     return pathClash(ctx);
+}
+/**
+ * Install the `post-commit` hook for this clone and SAY WHAT HAPPENED.
+ *
+ * ⚠ **Never changes the exit code.** Commit observation is an addition to
+ * transcript capture, not a precondition for it: a repository whose
+ * `core.hooksPath` points elsewhere still captures transcripts perfectly, and
+ * exiting non-zero would tell the user their connection failed when it did not.
+ * The report is the whole response.
+ */
+function commitHookBeat(ctx, projectKey) {
+    const outcome = installPostCommitHook(projectKey, ctx.selfPath);
+    const repo = truncatePath(projectKey, 52);
+    if (outcome.kind === "hooks-path" || outcome.kind === "failed") {
+        writeLines(ctx.stdout, [
+            "",
+            ...renderErrorBlock({
+                kind: "warn",
+                what: outcome.kind === "hooks-path" ? COMMIT_HOOK.hooksPathWhat : COMMIT_HOOK.failedWhat,
+                why: [
+                    outcome.kind === "hooks-path"
+                        ? COMMIT_HOOK.hooksPathWhy(outcome.configured)
+                        : COMMIT_HOOK.failedWhy(outcome.why),
+                ],
+                fixLabel: COMMIT_HOOK.hooksPathFixLabel,
+                fixes: [COMMIT_HOOK.hooksPathFixUnset, COMMIT_HOOK.hooksPathFixManual],
+            }, ctx.colour),
+        ]);
+        return;
+    }
+    const line = outcome.kind === "installed"
+        ? COMMIT_HOOK.installed(repo)
+        : outcome.kind === "chained"
+            ? COMMIT_HOOK.chained(repo)
+            : COMMIT_HOOK.already;
+    writeLines(ctx.stdout, ["", ...wrap(line, 2), ...wrap(COMMIT_HOOK.perClone, 2)]);
 }
 /**
  * Is this delivery the org-approval-pending outcome, and nothing else?

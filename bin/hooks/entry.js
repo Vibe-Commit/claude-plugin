@@ -39,7 +39,7 @@ import { zstdCompressSync } from "node:zlib";
 import { isProjectAllowed } from "../consent.js";
 import { loadCredential } from "../credential.js";
 import { EXIT } from "../exit.js";
-import { resolveRepoSlug } from "../git.js";
+import { headRef, resolveRepoSlug } from "../git.js";
 import { redactSpan } from "../redact.js";
 import { deliver, ingestUrl } from "../post.js";
 import { markSkipped } from "../policy.js";
@@ -47,6 +47,8 @@ import { fileState, loadSessionState, saveSessionState, withFileState } from "..
 import { SESSION_END_EVENT, settleDelayMs, settledSize, } from "./session_end.js";
 import { isInside, subagentFileKey, subagentsDir, transcriptRoot } from "../paths.js";
 import { resolveProjectKey } from "../project.js";
+import { startSpawnBudget } from "../spawn_budget.js";
+import { capSpool, readSpool } from "../spool.js";
 import { meetsNodeFloor } from "../runtime.js";
 import { renderNotice } from "../system_message.js";
 /**
@@ -191,10 +193,16 @@ export async function runHook(ctx) {
     silenceStderr();
     const budgetMs = hookBudgetMs(ctx.env);
     // The watchdog covers the wall-clock clause on paths no `await` can reach: a
-    // synchronous spin, a socket that never settles, a promise that never
-    // resolves. `unref` so it never itself keeps the process alive.
+    // socket that never settles, a promise that never resolves. `unref` so it
+    // never itself keeps the process alive.
     const watchdog = setTimeout(() => finish(null), budgetMs);
     watchdog.unref();
+    // ⛔ AND THE HALF THE WATCHDOG CANNOT COVER (`TODOS[87]`). A timer cannot fire
+    // while the event loop is BLOCKED, and `execFileSync` blocks it by definition
+    // — so a git binary that never returns is an unbounded hang, not a slow hook,
+    // and no amount of watchdog fixes it. Armed HERE, from the same `budgetMs`, so
+    // the two halves of one bound cannot drift apart.
+    startSpawnBudget(budgetMs);
     process.on("uncaughtException", () => finish(null));
     process.on("unhandledRejection", () => finish(null));
     for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
@@ -309,6 +317,30 @@ async function hookBody(ctx, budgetMs) {
     // MEASURED, not assumed to be `settleFor`: the wait can overshoot under load,
     // and the budget cares about the time actually spent.
     const consumedMs = settleFor > 0 ? Date.now() - settleStart : 0;
+    // The WIRE identity — `owner/repo` when `origin` is GitHub, `host/owner/repo`
+    // for any other host, else `local:<hash>`. Required by the merged server
+    // (`CR-019b`), which 400s a delta without it rather than writing a row nobody
+    // can read (D57 §OV1).
+    //
+    // ⛔ RESOLVED EXACTLY ONCE PER HOOK (`TODOS[87]`). It spawns
+    // `git remote get-url origin`, and it used to be called here AND once per
+    // sub-agent file — up to nine spawns for a value that cannot change within an
+    // invocation, since `projectKey` is fixed by the consent gate above. Passing
+    // it down rather than re-deriving it is also what keeps the two paths from
+    // ever disagreeing about which repository this is.
+    const repoSlug = resolveRepoSlug(projectKey);
+    // ⛔ THE ONE NEW SPAWN `CR-170` ADDS TO THIS PATH, and it is for REF MOVES,
+    // not commits. `post-commit` observes commits; it cannot see a `pull`, a
+    // `checkout` or a `reset --hard`, because those move a ref WITHOUT creating a
+    // commit and no commit hook fires. A direct look at `HEAD` is the only record.
+    //
+    // ⚠ It shares `CR-169`'s spawn budget like every other probe, so a hung git
+    // here is bounded and cannot defeat the watchdog. Null on an empty repository
+    // (`rev-parse HEAD` exits 128 there) — a state, not an error.
+    const head = headRef(projectKey);
+    // Commits OBSERVED since the last delivery. Capped, with the remainder left in
+    // the spool for the next hook rather than dropped.
+    const spooled = capSpool(readSpool(ctx.home, { repoKey: projectKey, sessionId: input.sessionId }));
     const delivery = await deliver({
         home: ctx.home,
         env: ctx.env,
@@ -317,15 +349,18 @@ async function hookBody(ctx, budgetMs) {
         // The consent gate's key, reused rather than re-resolved: a second
         // `git rev-parse` could disagree with the one consent was checked against.
         repoKey: projectKey,
-        // The WIRE identity, resolved once per invocation and off the same
-        // toplevel — `owner/repo` when `origin` is GitHub, else `local:<hash>`.
-        // Required by the merged server (`CR-019b`), which 400s a delta without
-        // it rather than writing a row nobody can read (D57 §OV1).
-        repoSlug: resolveRepoSlug(projectKey),
+        repoSlug,
         sessionId: input.sessionId,
         fileKey: "main",
         timeoutMs: sendTimeoutMs(budgetMs, consumedMs),
         nowMs: Date.now(),
+        // ⛔ THE MAIN DELIVERY ONLY. Sub-agent deliveries below leave both unset:
+        // each is its own `capture_id`, and `capture_commits`' PK is
+        // `(org_id, capture_id, commit_sha)`, so attaching these to all nine
+        // deliveries would admit nine legal, permanent rows for one commit — the
+        // objection that killed the polling design (D154).
+        head,
+        commits: spooled.shas,
     }, eof, 
     // `projectKey` is the consented git toplevel — the boundary redaction is
     // measured against, and the same value the consent gate approved.
@@ -341,6 +376,7 @@ async function hookBody(ctx, budgetMs) {
         url,
         credential: load.credential,
         projectKey,
+        repoSlug,
         startedAt: settleStart,
         budgetMs,
     });
@@ -391,7 +427,7 @@ async function hookBody(ctx, budgetMs) {
  * updates to each other and the server would read a replay.
  */
 async function deliverSubagents(opts) {
-    const { ctx, input, url, credential, projectKey, startedAt, budgetMs } = opts;
+    const { ctx, input, url, credential, projectKey, repoSlug, startedAt, budgetMs } = opts;
     const files = findSubagentFiles(ctx, input.transcriptPath);
     if (files.length === 0)
         return;
@@ -421,7 +457,7 @@ async function deliverSubagents(opts) {
             url,
             credential,
             repoKey: projectKey,
-            repoSlug: resolveRepoSlug(projectKey),
+            repoSlug,
             sessionId: input.sessionId,
             fileKey: file.fileKey,
             // The remainder, MEASURED. This is what keeps N files inside one budget.

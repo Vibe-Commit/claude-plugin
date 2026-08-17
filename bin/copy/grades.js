@@ -10,6 +10,11 @@
  *
  * Do not add a second header renderer. Do not inline a header string in a
  * command body. Both defeat the mechanism.
+ *
+ * ⚠ `renderCommitIdentity` is NOT a second one — see its own note. It renders
+ * §R3's identity line and CANNOT render an evidence sentence, because it takes
+ * no grade. That is the point: the absence screens must be able to say which
+ * commit they hold no record for, without acquiring a way to claim evidence.
  */
 /**
  * Confidence ordering, weakest first. Used to compute the floor on a
@@ -37,29 +42,51 @@ export function gradeFloor(grades) {
 }
 const GRADE_COPY = {
     derived: {
-        lead: "Conversation turns recorded against the commit that last changed this file.",
-        qualifier: "The commit command appears in the recorded transcript.",
+        qualifier: "The commit command is recorded in this session's transcript.",
     },
     observed: {
-        lead: "Conversation turns recorded against the commit that last changed this file.",
-        // D61 §PS6 makes this clause mandatory: `observed` also covers a human
-        // committing in a second terminal, so timing is all it establishes.
-        qualifier: "The commit command was not in the transcript, so it may include work from outside this session.",
+        // ⚠ TWO SENTENCES, AND THE FIRST ONE WAS MISSING. D61 §PS6 makes the second
+        // mandatory — `observed` also covers a human committing in a second
+        // terminal — but the first is the one that says what `observed` MEANS, and
+        // §R3 approves both.
+        qualifier: "This commit appeared while the session was running. The commit command was not in the transcript, so it may include work from outside this session.",
     },
     declared: {
-        lead: "Conversation turns recorded against the commit that last changed this file.",
-        qualifier: "The agent reported this link; it is not corroborated by the transcript.",
+        qualifier: "The agent reported this commit. It is not in the transcript record.",
     },
 };
 /**
+ * §R3 row 1. The `→` and `·` are U+2192 and U+00B7 — one column, several bytes
+ * each, which is why every width check in this package counts COLUMNS.
+ */
+function identityLine(commit) {
+    return `Line ${commit.line} → ${commit.sha} · ${commit.date} (git blame)`;
+}
+/**
  * THE header renderer. One function, takes the grade, no other path renders a
- * commit header.
+ * commit header — and it now returns §R3's TWO LINES rather than one, because
+ * the identity line and the evidence sentence are one unit: rendering either
+ * without the other is what the structural rule exists to prevent.
  *
  * @param grades every edge grade held for the commit. The floor governs.
  */
-export function renderCommitHeader(grades) {
-    const copy = GRADE_COPY[gradeFloor(grades)];
-    return `${copy.lead} ${copy.qualifier}`;
+export function renderCommitHeader(grades, commit) {
+    return [identityLine(commit), GRADE_COPY[gradeFloor(grades)].qualifier];
+}
+/**
+ * The identity line ALONE — for the screens that hold no edge and therefore
+ * have no grade to render beside it (cold start, no-edge, squash-resolved,
+ * and every read-lane failure).
+ *
+ * ⚠ This is NOT a second header renderer and must not become one: it takes no
+ * grade and it cannot produce an evidence sentence. The rule it protects is the
+ * inverse of the one `renderCommitHeader` protects — a screen may not claim
+ * evidence without a grade, and `gradeFloor` throws on an empty set, so without
+ * this the absence screens would have no way to say WHICH commit they are
+ * silent about. §10.6 draws the identity line on states A and E.
+ */
+export function renderCommitIdentity(commit) {
+    return identityLine(commit);
 }
 /** Exposed for the table-driven test; not for command bodies. */
 export function gradeCopyFor(grade) {

@@ -37,7 +37,30 @@
  *
  * @provenance vibecommit-mcp src/handshake/router.ts — JSON-RPC methods, retyped
  * @provenance vibecommit-mcp src/handshake/tools.ts — `tools/call` params, retyped
- * @provenance vibecommit-mcp src/tools/query_history.ts — `content[0].text` envelope, retyped
+ * @provenance vibecommit-mcp src/read/envelope.ts — `content[0].text` envelope, retyped
+ *
+ * ⚠ THAT THIRD CITATION WAS RE-POINTED, NOT ADDED (`CR-163`, D136 §2). It named
+ * `src/tools/query_history.ts`, and **no such file exists**: `query_history` was
+ * retired by `CR-076b` and now has an entry in `vibecommit-mcp/src/tools/
+ * retired.ts` that returns a migration error. A dangling citation is worse than
+ * none (D54) — it points a reader at a file they cannot open and stops them
+ * looking further.
+ *
+ * ⚠ AND THE TAG NAME IS NOT SPELLED OUT IN PROSE ANYWHERE BELOW THIS LINE.
+ * `test/provenance.test.ts` counts the tags in this file by scanning for the
+ * literal token, so writing it inside a sentence adds a fourth "tag" that cannot
+ * parse and turns the gate RED against correct prose. It did, on the first
+ * wording of this note. Same species as the linkage wall reading `from` plus a
+ * quoted phrase as an import — see `src/json.ts` and `src/commands/why.ts`.
+ *
+ * The envelope is still real and still has a source: `readEnvelope()` in
+ * `vibecommit-mcp/src/read/envelope.ts` is the single function that builds
+ * `{ content: [{ type: "text", text: JSON.stringify(payload) }] }`, and
+ * `readErrorEnvelope()` beside it builds the `isError` form. Both live read
+ * tools return them — verified 2026-08-16 against `vibecommit-mcp` `main`:
+ * `src/tools/blame_commit.ts` and `src/tools/commit_coverage.ts` each import
+ * from that module and return it. The citation is MUTUAL: that file names this
+ * client as the envelope's external consumer by name.
  */
 /** JSON-RPC 2.0. The server rejects anything else at `validateRequest`. */
 const JSONRPC_VERSION = "2.0";

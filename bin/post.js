@@ -20,6 +20,7 @@
 import { createHash } from "node:crypto";
 import { classify, markDelivered, markHeld, markSkipped, nextSpan, resolveCaps, } from "./policy.js";
 import { fileState, isStopped, loadSessionState, saveSessionState, withFileState, } from "./state.js";
+import { dropSpooled } from "./spool.js";
 import { CLIENT_VERSION, CLIENT_VERSION_HEADER } from "./version.js";
 /** Production data plane. Overridable for tests and for a self-hosted server. */
 export const DEFAULT_INGEST_URL = "https://api.vibecommit.ai/ingest/v1/session";
@@ -61,9 +62,18 @@ export function ingestUrl(env) {
  * `expose()` is called here and in no other module. That is the point of the
  * opaque wrapper: the single call site is greppable, reviewable, and sits at the
  * boundary where the secret has to be plaintext anyway.
+ *
+ * ## ⛔ SHAs ON THE WIRE, NEVER COMMIT METADATA (`CR-170` §4)
+ *
+ * No message, no author, no dates. MEASURED over the last 20 commits per repo:
+ * **9/20 schema, 8/20 web and 5/20 capture exceed 4096 bytes, largest 12,112** —
+ * so a quarter of real commits would land PERMANENTLY TRUNCATED in a header, and
+ * `capture_commits` rows cannot be retracted. Metadata is backfillable from a
+ * sha by anyone holding the repository; the observation that a commit happened
+ * at all is not. So the wire carries the irreplaceable half.
  */
 export function buildIngestHeaders(credential, delta) {
-    return {
+    const headers = {
         authorization: `Bearer ${credential.expose()}`,
         "content-type": "application/x-ndjson",
         "content-encoding": "zstd",
@@ -74,6 +84,18 @@ export function buildIngestHeaders(credential, delta) {
         "x-repo-slug": delta.repoSlug,
         [CLIENT_VERSION_HEADER.toLowerCase()]: CLIENT_VERSION,
     };
+    // ⚠ OMITTED, never sent empty. A blank header is a value the server has to
+    // have an opinion about; an absent one is unambiguously "nothing to say", and
+    // an empty repository genuinely has nothing to say here.
+    if (delta.head != null) {
+        headers["x-head-sha"] = delta.head.sha;
+        if (delta.head.branch !== null)
+            headers["x-head-branch"] = delta.head.branch;
+    }
+    if (delta.commits !== undefined && delta.commits.length > 0) {
+        headers["x-commits"] = delta.commits.join(",");
+    }
+    return headers;
 }
 /**
  * The wire's error code for org-approval-pending — `CR-128`, D81.
@@ -232,6 +254,8 @@ export async function deliver(ctx, eof, readBody) {
         byteOffset: span.from,
         fileKey: ctx.fileKey,
         repoSlug: ctx.repoSlug,
+        head: ctx.head,
+        commits: ctx.commits,
     }), body, ctx.timeoutMs);
     const disposition = classify(outcome);
     const caps = resolveCaps(ctx.env);
@@ -239,6 +263,13 @@ export async function deliver(ctx, eof, readBody) {
     switch (disposition) {
         case "ok":
             next = withFileState(next, ctx.fileKey, markDelivered(current, span.to, ctx.nowMs));
+            // ⛔ TRUNCATE HERE AND NOWHERE ELSE. The spool is append-then-drop-on-2xx,
+            // so a commit survives a 500, a timeout and a `later` and is retried by
+            // the next hook. Dropping on READ would lose it permanently to one bad
+            // response, and `capture_commits` rows can never be retracted (D105/D108).
+            if (ctx.commits !== undefined && ctx.commits.length > 0) {
+                dropSpooled(ctx.home, key, ctx.commits.length);
+            }
             break;
         case "later":
             next = withFileState(next, ctx.fileKey, markHeld(current, span, ctx.nowMs, caps));
