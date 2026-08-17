@@ -15,6 +15,30 @@
  * mean "claims clean". The register records three misses in one file in one day
  * that a four-pattern regex walked straight past, because a claim is a
  * proposition and propositions have no fixed vocabulary.
+ *
+ * MATCH SEMANTICS (D113 §2, register §"Match semantics"): a phrase matches at a
+ * LEADING WORD BOUNDARY and NOT a trailing one — `\b` before, nothing after.
+ *
+ *   - The LEADING boundary is what makes `proves` registerable at all. Under a
+ *     bare substring rule it fires on the shipped, D81-approved disclosure
+ *     "...once an owner approves." (`strings.ts` `CONNECT.pendingBuffered`) —
+ *     measured, not argued: adding the row to a `.includes()` matcher turns
+ *     `copy-claims.test.ts`'s "no shipped copy contains a phrase blocked on its
+ *     surface" RED against correct copy. A boundary kills that by construction;
+ *     an EXEMPT row would have to be re-added every time the sentence is
+ *     reworded.
+ *   - There is deliberately NO TRAILING boundary. The register depends on ROOTS:
+ *     `attest` must go on matching `attested` and `attestation`, and the bare
+ *     `signed receipt` must go on matching `signed receipts`. Anchoring both
+ *     ends would silently narrow those rows to close one.
+ *
+ * The rule is strictly NARROWING against the substring rule it replaced, so it
+ * can only ever remove matches. WHAT FALSIFIES IT: `findClaimViolations`
+ * reporting a hit whose match begins mid-word. The executable statement of that
+ * is `copy-claims.test.ts` — the `approves` and `cannot aim` negatives, and the
+ * root-matching positives for `attest*` and `signed receipt(s)`. If the matcher
+ * ever reverts to `.includes()`, those negatives go RED; if the leading `\b`
+ * grows a trailing one, the root positives go RED. Neither can rot silently.
  */
 export const BLOCKED_PHRASES = [
     // --- `why`-as-assertion. Never lifts: file-scoped by design, not by maturity.
@@ -133,6 +157,75 @@ export const BLOCKED_PHRASES = [
         reason: "D51 dropped submission_receipts; the export collapsed to a pure hash-chain bundle.",
         gate: "Never lifts unless something is actually signed.",
     },
+    // --- CR-132d (D113 §4, D123 §1): the rows the register carries and this
+    //     projection did not. Derived by EVALUATING this array against the
+    //     register's machine-readable block under the block's own leading-`\b`
+    //     rule — never by comparing the two lists by eye, which is how the
+    //     singular/plural `signed receipt` gap survived an author pass (D101:
+    //     write the predicate, never the tally).
+    //
+    //     ⚠ TWO OF THESE PREFIX-SUPERSEDE ROWS ABOVE, and that is the point of
+    //     omitting the trailing boundary. `signed receipt` (singular) matches
+    //     inside `signed receipts`, and bare `prompt produced` matches inside
+    //     `see what prompt produced a given line`. The long forms are KEPT, not
+    //     deleted: their `reason` fields carry register history the short rows
+    //     cannot ("D51 dropped submission_receipts"; the four-pattern-regex
+    //     miss), and this task is additive-only so a reviewer can see that no
+    //     live protection was traded away. They are now redundant, not wrong.
+    {
+        phrase: "proves",
+        surfaces: ["why", "report", "help", "status", "connect", "off"],
+        reason: "Register: same proposition as `provable`, no banned root — the form a rewrite reaches for.",
+        gate: "attestation witness GA",
+    },
+    {
+        phrase: "signed receipt",
+        surfaces: ["why", "report", "help", "status", "connect", "off"],
+        reason: "Register: claims a component DELETED by D51. Singular, so it also binds the plural above.",
+        gate: "Never lifts unless something is actually signed.",
+    },
+    {
+        phrase: "signed bundle",
+        surfaces: ["why", "report", "help", "status", "connect", "off"],
+        reason: "Register: same as `signed receipt` — the export is a hash-chain bundle, unsigned.",
+        gate: "Never lifts unless something is actually signed.",
+    },
+    {
+        phrase: "prompt produced",
+        surfaces: ["why", "report", "help", "status", "connect", "off"],
+        reason: "Register: concept blocked, no banned word appears. Bare form — a reworded paraphrase walks past the long row above (D113 §4).",
+        gate: "NEVER LIFTS — file-scoped by design (D61 §PS6).",
+    },
+    {
+        phrase: "source-available",
+        surfaces: ["why", "report", "help", "status", "connect", "off"],
+        reason: "Register: licensing REVERSED by D60/D1 — the phrase is retired and was never a description of us.",
+        gate: "NEVER LIFTS — the term is retired, not gated.",
+    },
+    {
+        phrase: "seen during the session",
+        surfaces: ["why"],
+        reason: "Register: no git probe exists to have seen anything — the producer is ABSENT, not immature.",
+        gate: "A producer for the `observed` edge. None exists (D111 §2).",
+    },
+    {
+        phrase: "we observed",
+        surfaces: ["why"],
+        reason: "Register: the same claim in the first person; the form a rewrite reaches for.",
+        gate: "A producer for the `observed` edge. None exists (D111 §2).",
+    },
+    {
+        phrase: "watched",
+        surfaces: ["why"],
+        reason: "Register: same proposition, no registered root.",
+        gate: "A producer for the `observed` edge. None exists (D111 §2).",
+    },
+    {
+        phrase: "not agent-authored",
+        surfaces: ["why", "report", "help", "status"],
+        reason: "Register: the 4th member of the absence-inversion row — an uncaptured session leaves no edge. Prose-only in BOTH directions until now.",
+        gate: "BLOCKED PERMANENTLY.",
+    },
     // --- D64: this repo is PRIVATE with MIT intact. The licence is the invariant;
     //     the visibility is not. Register row 2026-08-09. Same failure mode as
     //     "signed receipts" — copy describing a mechanism that does not exist,
@@ -179,20 +272,43 @@ export const BLOCKED_PHRASES = [
         gate: "NEVER LIFTS — the disclosure states what is uploaded; it does not reassure.",
     })),
 ];
+/** Escape a phrase for literal use in a RegExp — rows carry `-` today and could carry `.` or `+`. */
+function escapeForRegExp(literal) {
+    return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+const MATCHERS = new Map();
+/**
+ * The compiled form of one row: `\b` before the phrase, nothing after.
+ *
+ * ⚠ NO `g` FLAG, deliberately. A global RegExp carries `lastIndex` across
+ * `.test()` calls, so a cached one would alternate true/false on the same
+ * input — a gate that fires on every other string, which reads as flake.
+ */
+function matcherFor(phrase) {
+    let matcher = MATCHERS.get(phrase);
+    if (matcher === undefined) {
+        matcher = new RegExp(`\\b${escapeForRegExp(phrase)}`, "i");
+        MATCHERS.set(phrase, matcher);
+    }
+    return matcher;
+}
 /**
  * Scan one rendered string for phrases blocked on its surface.
+ *
+ * Matching is leading-word-boundary, case-insensitive, no trailing boundary —
+ * see MATCH SEMANTICS in the file header for why each half of that is load-
+ * bearing.
  *
  * A clean result means "no known banned phrase found" — never "claims clean".
  * Report it that way; anything stronger reports the strength of the wordlist
  * rather than the state of the copy.
  */
 export function findClaimViolations(text, surface) {
-    const haystack = text.toLowerCase();
     const out = [];
     for (const entry of BLOCKED_PHRASES) {
         if (!entry.surfaces.includes(surface))
             continue;
-        if (haystack.includes(entry.phrase.toLowerCase())) {
+        if (matcherFor(entry.phrase).test(text)) {
             out.push({ phrase: entry.phrase, surface, reason: entry.reason, gate: entry.gate });
         }
     }

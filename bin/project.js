@@ -13,19 +13,33 @@
  */
 import { execFileSync } from "node:child_process";
 import { resolve } from "node:path";
+import { spawnTimeoutMs } from "./spawn_budget.js";
+/** This spawn's own ceiling, used when no hook budget is armed. */
+const TOPLEVEL_TIMEOUT_MS = 5_000;
 /**
  * The git toplevel for `dir`, or null when it is not inside a work tree.
  *
  * `execFileSync` with an argument array, never a shell string: a repository path
  * containing a space or a `;` is ordinary on a developer's machine and would be
  * a command-injection sink through `execSync`.
+ *
+ * ⚠ **The timeout DERIVES from the hook's remaining budget** (`TODOS[87]`).
+ * `execFileSync` blocks the event loop, so the watchdog cannot fire while this
+ * call is outstanding — a fixed 5s ceiling here is 5s the watchdog provably
+ * cannot cover, and it is one of four such ceilings that summed to 20s against a
+ * 5s budget. `null` means the budget is spent, and the answer is the one this
+ * function already gives when git cannot tell us: no toplevel, so no consent,
+ * so the hook does nothing. Silent by contract and correct by default.
  */
 export function gitToplevel(dir) {
+    const timeout = spawnTimeoutMs(TOPLEVEL_TIMEOUT_MS);
+    if (timeout === null)
+        return null;
     try {
         const out = execFileSync("git", ["-C", dir, "rev-parse", "--show-toplevel"], {
             encoding: "utf8",
             stdio: ["ignore", "pipe", "ignore"],
-            timeout: 5_000,
+            timeout,
         });
         const top = out.trim();
         return top === "" ? null : resolve(top);

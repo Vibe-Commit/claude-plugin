@@ -29,13 +29,14 @@ import { isProjectAllowed, revokeProject } from "../consent.js";
 import { loadCredential } from "../credential.js";
 import { EXIT } from "../exit.js";
 import { resolveRepoSlug } from "../git.js";
+import { emitJson } from "../json.js";
 import { resolveProjectKey } from "../project.js";
 import { lastSendForRepo } from "../state.js";
 import { LABEL_GUTTER, WRAP_COLUMNS, glyph, labelled, paint, renderErrorBlock, truncatePath, wrap, } from "../term.js";
 import { writeLines } from "./context.js";
 /** §10.3 indents the gutter rows four columns under the state line. */
 const ROW_INDENT = 4;
-export function status(ctx) {
+export function status(ctx, argv = []) {
     const projectKey = resolveProjectKey(ctx.cwd);
     if (projectKey === null) {
         writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", what: ERRORS.notAGitRepo, why: [] }, ctx.colour));
@@ -56,6 +57,31 @@ export function status(ctx) {
     }
     lines.push(labelled(ROW_INDENT, STATUS.dashboardLabel, paint(ctx.colour, "accent", URLS.dashboard)));
     const load = loadCredential({ env: ctx.env, home: ctx.home });
+    // §13.3 — `--json` emits NOTHING BUT the JSON document on stdout, so the
+    // screen assembled above is DISCARDED rather than printed beside it.
+    //
+    // The credential fault below still refuses, and it refuses the same way it
+    // does in prose: §13.6's block to stderr, nothing on stdout, exit 1. A failure
+    // is not an answer, so it gets no document — `src/json.ts`'s docblock states
+    // that split and why it is a builder's reading of §13.3 rather than a ruling.
+    //
+    // ⚠ `last_send` is `null` when nothing has been delivered, never a zeroed
+    // object: absence here is *nothing has been sent*, and a `{ at_ms: 0 }` would
+    // be a timestamp claim. §13.2's glyph rule has no glyph on this surface, so
+    // `outcome` carries the on/off distinction the glyph carries on screen.
+    if (argv.includes("--json")) {
+        if (load.kind !== "ok" && load.kind !== "absent") {
+            writeLines(ctx.stderr, credentialProblem(load, ctx.colour));
+            return EXIT.failure;
+        }
+        emitJson(ctx.stdout, "status", on ? "on" : "off", {
+            repo: resolveRepoSlug(projectKey),
+            toplevel: projectKey,
+            last_send: lastSend === null ? null : { at_ms: lastSend.at, seq: lastSend.seq },
+            dashboard: URLS.dashboard,
+        });
+        return on ? EXIT.ok : EXIT.notConnected;
+    }
     if (load.kind !== "ok" && load.kind !== "absent") {
         writeLines(ctx.stdout, lines);
         writeLines(ctx.stderr, credentialProblem(load, ctx.colour));

@@ -13,6 +13,7 @@
  *
  * @provenance vibecommit-mcp src/scrubber/index.ts — [REDACTED:<kind>] marker shape, borrowed
  * @provenance vibecommit-web app/app/commits/page.tsx — route existence, verified
+ * @provenance vibecommit-schema capture_turns column list — MEASURED ABSENCE, cited (CR-086)
  */
 import { EXIT } from "../exit.js";
 /** `--help` copy. The `why` line is verbatim-approved (D61 §PS6) — do not reword. */
@@ -41,9 +42,14 @@ export const HELP = {
  * `HELP` is the help SCREEN's content — the tagline, the usage line, the per-verb
  * descriptions, the docs URL — and the claims corpus tags the whole object with
  * one surface, `help`. Only three of these five render there. `unknownCommand` is
- * the usage-error path and `notImplemented` is what `why` and `report` print
- * today, so folding them into `HELP` would tag two §13.6 error messages as help
- * copy and check them against the wrong surface. The surface map is only as
+ * the usage-error path, so folding it into `HELP` would tag a §13.6 error
+ * message as help copy and check it against the wrong surface.
+ *
+ * ⚠ `notImplemented` LIVED HERE AND IS GONE, REMOVED BY `CR-108`. It was what
+ * `why` and `report` printed while unbuilt, and `report` was its last caller —
+ * **every verb in `VERBS` is now implemented**, so the string had no route to a
+ * screen. Copy that cannot be reached is copy no gate can check, and leaving it
+ * would have invited the next reader to wire a sixth verb to it silently. The surface map is only as
  * honest as the objects it keys on, so the entry point gets its own.
  *
  * ⚠ The three labels are LABELS, not sentences: `renderHelp()` composes each with
@@ -57,12 +63,6 @@ export const USAGE = {
     docsLabel: "Docs:",
     /** The unknown-verb line. Help follows it, so this says only what went wrong. */
     unknownCommand: (verb) => `Unknown command: ${verb}`,
-    /**
-     * `why` and `report` until `CR-086` / `CR-108` land. Deliberately states the
-     * state and claims nothing about when it changes — a date here would be a
-     * promise the register would have to carry.
-     */
-    notImplemented: (verb) => `\`${verb}\` is not implemented yet.`,
 };
 /** `vibecommit status` (CR-021). */
 export const STATUS = {
@@ -257,6 +257,32 @@ export const CONNECT = {
  * in `claude-plugin`, both another builder's. Written as §13.6 draws it rather
  * than softened to dodge the dependency.
  */
+/**
+ * The `post-commit` install report — `CR-170`, D154.
+ *
+ * ⛔ **EVERY OUTCOME SAYS SOMETHING, INCLUDING THE GOOD ONE.** Three of this
+ * path's failure modes are silent no-ops (D98's class): `core.hooksPath` makes
+ * `.git/hooks` dead, an existing hook must not be clobbered, and neither is
+ * visible without a line of output. A user who is told nothing cannot tell a
+ * working install from one that observes no commits for the life of the clone.
+ *
+ * ⚠ **AND IT SAYS "THIS CLONE", EVERY TIME.** Per-clone installation is the real
+ * cost of this design and the one thing a user will be surprised by later, so it
+ * is stated at the moment they can act on it rather than buried in documentation.
+ */
+export const COMMIT_HOOK = {
+    installed: (repo) => `Commit capture is on for this clone (${repo}). Commits are recorded as they happen, including ones made by \`make\`, \`gh\`, an alias or a script.`,
+    chained: (repo) => `Commit capture is on for this clone (${repo}). You already had a \`post-commit\` hook — it was kept and still runs first; ours runs after it.`,
+    already: "Commit capture was already on for this clone.",
+    perClone: "Run `vibecommit connect` in each clone you want commits recorded for — git hooks are per-clone, not per-account.",
+    hooksPathWhat: "Commit capture could NOT be installed for this clone.",
+    hooksPathWhy: (configured) => `This repository sets \`core.hooksPath\` to ${configured}, so git ignores \`.git/hooks\` entirely and a hook installed there would never run. Transcript capture is unaffected; only commit observation is.`,
+    hooksPathFixLabel: "Fix, either one:",
+    hooksPathFixUnset: "git config --unset core.hooksPath",
+    hooksPathFixManual: "or add `vibecommit post-commit` to your existing post-commit hook",
+    failedWhat: "Commit capture could NOT be installed for this clone.",
+    failedWhy: (why) => `Writing the \`post-commit\` hook failed: ${why}. Transcript capture is unaffected; only commit observation is.`,
+};
 export const PATH_CLASH = {
     foreignWhat: "Another program owns the `vibecommit` command.",
     foreignWhy: (resolved) => `\`vibecommit\` on your PATH resolves to ${resolved}, which belongs to the npm package \`vibecommit\` (a different project). Ours is \`@vibe-commit/capture\`. Hook capture is unaffected — it runs by path — but \`why\`, \`report\` and \`status\` will run the other program.`,
@@ -353,22 +379,286 @@ export const SIGNIN = {
     malformedWhat: "The sign-in service returned an unexpected answer.",
     malformedWhy: "The response was not in the form this version can use. No session was stored.",
     malformedFix: "Report this, with the command you ran:",
-    /**
-     * A session already exists, so sign-in is a no-op.
-     *
-     * ⚠ There is deliberately NO copy here for `authorizedAccessToken`'s `busy`
-     * and `expired` outcomes. Nothing renders them yet: the read verbs are
-     * `CR-086` (`why`, W9) and `CR-108` (`report`, W10), and inventing their
-     * wording now would put a phrasing on a screen this task cannot see — the same
-     * mistake `CR-112`'s absence-state grammar exists to prevent.
-     */
+    /** A session already exists, so sign-in is a no-op. */
     alreadySignedIn: "Already signed in on this machine.",
+    // --- `authorizedAccessToken`'s last two outcomes — `CR-086`, W9. ---
+    /**
+     * ⚠ THE COPY THIS OBJECT DEFERRED BY TASK NUMBER, now written by the first
+     * renderer. `why` is that renderer; `report` (`CR-108`, W10) is the second and
+     * inherits these rather than inventing a second phrasing.
+     *
+     * ⚠ AND THIS EXPORT NOW RENDERS ON TWO SURFACES. `SURFACES` in
+     * `test/copy-claims.test.ts` gained `why` beside `connect` for exactly these
+     * four strings — a surface map that still said `connect` alone would be
+     * checking them against the wrong blocked set.
+     *
+     * `expired` — the refresh grant was REFUSED. The session is over; only a new
+     * sign-in fixes it. Distinct from `busy`, which is a wait.
+     */
+    expiredWhat: "This machine's sign-in has ended.",
+    expiredWhy: "The stored sign-in could not be renewed, so nothing could be read. It may have been revoked, or it may simply have run out.",
+    expiredFix: "Sign in again, then run the command again:",
+    /**
+     * `busy` — another process holds the refresh lock and did not release it in
+     * time. NOT a failure of the session: the fix is to run it again, and saying
+     * "sign in again" here would send a user to re-authenticate over a lock.
+     *
+     * ⚠ The `what` line's subject is the state, never "you" (DESIGN.md §13.6).
+     */
+    busyWhat: "Another VibeCommit command is renewing this machine's sign-in.",
+    busyWhy: "Only one process may renew a sign-in at a time, and the one holding it did not finish. Nothing was read and the stored sign-in is unchanged.",
+    busyFix: "Run it again in a moment:",
 };
 /** `vibecommit off`. */
 export const OFF = {
     done: "Capture is off for this repository.",
     alreadyOff: "Capture was already off for this repository.",
     note: "Sessions already recorded are unaffected.",
+};
+/**
+ * `vibecommit why` — `CR-086`, W9.
+ *
+ * The screen is drawn in style guide §10.4 (layout), §10.5 (sub-agent
+ * attribution) and §10.6-A/B (the two absences this verb owns), and the copy is
+ * NORMATIVELY §R3's decision table in `docs/designs/claims-audit-why.md`. §10.4
+ * is explicit that §R3 governs and that it must not be paraphrased here, so the
+ * per-grade sentences live in `grades.ts` behind the one header renderer and
+ * this object holds only what §R3 tables SEPARATELY from the grade.
+ *
+ * ## ⚠ THE HOLE THIS SURFACE SHIPS WITH, HELD OPEN AND NAMED — `CR-129`
+ *
+ * §R3's sub-agent attribution table has three rows and **two of them read data
+ * nothing produces**. Measured at `vibecommit-schema` `2c77400`,
+ * `vibecommit-mcp` `eeda878` and here at `4dcf47d`, every tracked blob read as
+ * utf8 (never `grep` — `src/redact.ts` carries literal NUL bytes and `grep -I`
+ * skips it silently):
+ *
+ *   - `capture_turns.subagent_count` — **0 hits in all three repos** at those
+ *     SHAs. `TODOS[74]` assumed the column; nothing had added it.
+ *     ⚠ **UPDATED BY `CR-129d` (W10): THE COLUMN NOW EXISTS AND STILL HAS NO
+ *     PRODUCER.** `CR-129a` added it at `vibecommit-schema` `f3022c5` —
+ *     `integer`, nullable, no default. Nothing writes it (mcp's
+ *     `insertCaptureTurns` is a seven-key literal) and nothing emits it
+ *     (`blame_commit` selects `position, turn_hash`), so the marker still
+ *     cannot render from real data. The measurement above is kept because it
+ *     is dated and was true; **this note is the correction, not a rewrite.**
+ *     ⚠ A six-column tally stood here and is gone — it was an exact
+ *     transcription of the original `create table` that three later
+ *     migrations emptied, including one renaming `workspace_id` to `org_id`.
+ *     D101: write the predicate, never the count.
+ *   - `commit_file_attribution` EXISTS (`CR-070`,
+ *     `20260814000000_cr070_commit_graph.sql:278`) and **has no writer**:
+ *     `CR-072` shipped the edge only and said so
+ *     (`vibecommit-mcp/src/conversation/edge_derivation.ts:56-64`). That table
+ *     is where `agent_id` lives.
+ *
+ * So `agent_id` is a column on a table nothing writes, and `subagent_count` is
+ * not a column at all. `TODOS[74]` says of that minimum: *"E1 cannot ship
+ * without it… silence about a delegated edit is an overclaim about who wrote
+ * the code."* Both halves are true, and the resolution is neither to omit the
+ * requirement nor to fake it: **the absence renders, in the absence grammar,
+ * naming what it is and what would change it.**
+ *
+ * ⚠ `agent_id` NULL is SEMANTIC — the schema comment says *"NULL = the main
+ * thread. The empty string is refused because '' would render as an unnamed
+ * sub-agent — a plausible wrong answer rather than an error."* **`null` and
+ * ABSENT are therefore different facts**: `null` means we know it was the main
+ * thread; absent means we know nothing. An unmarked turn rendered from an
+ * absent field is the overclaim, so `why.ts` requires the field to be PRESENT
+ * before it renders a turn unmarked, and marks every turn otherwise.
+ *
+ * ## What is deliberately NOT here
+ *
+ * No grade word. §13.3: *"Grade words appear in `--json` only. Prose never
+ * prints a bare grade"* — the two-tier structural summary plus the per-edge
+ * evidence sentence render instead, and the evidence sentence is `grades.ts`'s.
+ *
+ * No `⛓` / `◇` glyphs. §10.5 draws them for the WEB surface; `DESIGN.md` §13.2's
+ * `GLYPH` table has exactly three entries (`ok` / `warn` / `bad`) and neither is
+ * in it. The CLI's binding requirement is §R3's prose evidence line, which
+ * renders. Inventing a fourth glyph is a report to the orchestrator, not an edit
+ * to `term.ts`.
+ *
+ * No colour on the attribution marker or on the grade (D65 §DR3, §DR4).
+ * `agent_id` is an ACTOR IDENTITY, the same class as a branch name, and a
+ * green/yellow/red grade ramp asserts a ranking §R3 forbids.
+ */
+export const WHY = {
+    // --- §R3: the turn-list framing. IDENTICAL AT ALL THREE GRADES. ---
+    /**
+     * ⚠ THIS is where D61 §PS6's file scope lives, and the reason it moved here.
+     * `commit_file_attribution` has no line ranges, so every sentence that
+     * INTRODUCES TURNS is file-scoped — and §PS6 requires the file scope to render
+     * on the same screen as the line number, which it does: the identity line
+     * above carries the line, this sentence carries the file.
+     *
+     * ⚠ §R3 bans a causal vocabulary on this sentence at all grades — *produced,
+     * caused, wrote this line, because, the reason, responsible for, explains, led
+     * to*. "Touched" is the approved verb and it is the weakest true one.
+     */
+    turnsIntro: (file) => `Turns that touched ${file} in this commit:`,
+    /**
+     * §R3's `match_kind` table, the `probable` row — `CR-138d` / `CR-109d`.
+     *
+     * ⚠ **THE ONLY DIFFERENCE BETWEEN THE TWO VARIANTS, AND IT MUST STAY VISIBLE.**
+     * §R3: `exact` renders the squash copy *unqualified* — the pair came from a
+     * recorded successor row — while `probable` renders it **plus a stated
+     * basis**. Rendering them identically is the folding D67 forbids: *"the
+     * disclosure would become the thing that hides the distinction."*
+     *
+     * ⚠ D105 makes this permanent rather than cosmetic: `match_kind` is in
+     * `commit_sha_successors`' primary key and `reject_history_mutation` raises
+     * on every UPDATE including `service_role`, **so a wrong row cannot be
+     * corrected.** A guess labelled as a guess is the only honest rendering.
+     *
+     * ⚠ `witnessed` is §R3's own word and the choice is deliberate. The obvious
+     * phrasing would have reached for the `observed` family, which is BLOCKED on
+     * this surface because it names a mechanism that exists in no repo (D113 §1)
+     * — a blocked claim arriving through a synonym nobody was checking. This
+     * comment names the trap without spelling the phrase, so a source-text scan
+     * does not fire on the note explaining the avoidance.
+     */
+    squashProbableBasis: "These two commits were matched by patch id rather than by a recorded successor row, so the pairing is read off the commits themselves and is not something capture witnessed.",
+    /**
+     * ⚠ WHY THE TWO SHAS ON THE SQUASH SCREEN ARE DIFFERENT LENGTHS.
+     *
+     * Two builders — this one and `CR-101`'s on the web surface — read the
+     * asymmetry as a bug, and **the ruling was to explain it rather than remove
+     * it** (D120 §1 as revised). Web keeps parity by carrying the full value in
+     * the DOM; a terminal line has nowhere to put it, so the line says why.
+     *
+     * ⚠ **THE SENTENCE DOES NOT TELL THE READER TO RUN `git show` ON IT**, and
+     * that restraint is measured rather than cautious: cloned over the git
+     * transport after a squash-merge with branch delete, the original object is
+     * ABSENT and `git show` fails on the full sha as surely as on a short one.
+     * What the full value keeps is that it stays a complete identifier somebody
+     * else can look up. Promising a local command that fails in exactly the case
+     * this state exists for would be the plausible-wrong-answer class in copy.
+     */
+    squashShaLengths: "The recorded commit is written out in full because a squashed commit is often missing from a working copy, and a shortened id cannot be looked up once the commit is gone.",
+    /** §10.4's turn row: `turn 12  [Edit]  session.ts`. */
+    turnLabel: "turn",
+    /** §10.4: excerpts are `muted` and `>`-prefixed — verbatim, never a summary. */
+    excerptPrefix: ">",
+    // --- §R3: the sub-agent attribution table (§10.5). ---
+    /** Row 1 — `agent_id IS NOT NULL`. An identity, rendered plain (D65 §DR3). */
+    subAgentMarker: (agentId) => `· sub-agent ${agentId}`,
+    /**
+     * Row 2 — `capture_turns.subagent_count > 0`.
+     *
+     * ⚠ **NO PRODUCER EXISTS FOR THIS AND THE COLUMN IS NOT IN ANY SCHEMA.** It is
+     * implemented against a validated OPTIONAL payload field so that the day the
+     * column exists the row renders, and it is exercised in the suite against a
+     * synthetic payload — but nothing on the wire can populate it today, and this
+     * comment is the only honest place to say so. It is NOT rendered from a zero
+     * and NOT rendered from an absent field.
+     */
+    subAgentCountMarker: (count) => count === 1 ? "· includes 1 sub-agent record" : `· includes ${count} sub-agent records`,
+    /**
+     * The marker for a turn whose actor we cannot name — `CR-129`'s hole, on the
+     * turn itself rather than only in a footnote. §10.5: *"the turn header and the
+     * file-attribution table ALWAYS name the actor… hiding an actor"* is the thing
+     * that makes a claim. When we cannot name one, we say that, per turn.
+     */
+    actorUnrecordedMarker: "· actor not recorded",
+    /**
+     * The `CR-129` note, in the absence grammar — absence, cause, remedy.
+     *
+     * ⚠ NOT an `ABSENCE` state and it may not become one. Those five are
+     * whole-screen empty states that all exit 4; this is a caveat on a screen that
+     * HAS content, and `test/copy-absence.test.ts` asserts the set is exactly
+     * five. Same ruling the `ABSENCE` docblock already makes for the
+     * shallow-clone refusal: not every absence sentence is an absence STATE.
+     */
+    attributionWhat: "Sub-agent attribution is not recorded for these turns.",
+    /**
+     * ⚠ "on this screen", not "below" — caught by rendering it. The note sits
+     * AFTER the turn list, so a positional word was pointing the wrong way. A
+     * sentence that describes its own layout breaks silently when the layout
+     * moves; one that names the screen does not.
+     */
+    attributionWhy: "The per-turn attribution this marker reads has no writer yet, so no turn on this screen can be shown as main-thread work or as delegated work.",
+    /**
+     * ⚠ THE SECOND SENTENCE IS THE LOAD-BEARING ONE. Without it, an unmarked turn
+     * reads as a finding that the main thread wrote it — which is the inversion
+     * the register permanently BLOCKS, arriving through silence instead of through
+     * a sentence.
+     */
+    attributionNotAFinding: "An unmarked turn here is a missing record, not a finding about who wrote the code.",
+    attributionFix: "Nothing to fix on this machine. The marker renders once attribution is recorded.",
+    // --- §R3: the truncation notice, and the L2 no-silent-drops line. ---
+    /**
+     * §R3, verbatim. ⚠ **The selection rule is ORDINAL AND STATED** — *"in turn
+     * order"*, never *"most relevant"*, which is a ranking, which is server-side
+     * analysis and reverses D48–D51.
+     *
+     * ⚠ **Every number here comes from the PAYLOAD.** D60 §D1a: *"the client may
+     * render; it may not analyze."* Windowing an already-ordered list for display
+     * is rendering; DERIVING the numbers is not, so `why.ts` never counts the
+     * array it was handed.
+     */
+    truncation: (from, to, total) => `Showing turns ${from}-${to} of ${total} that touched this file in this commit, in turn order.`,
+    /** §R3's L2: files in the commit whose `turn_hash` is NULL are COUNTED, never dropped. */
+    filesWithoutTurn: (count) => `${count} more files in this commit have no linked turn.`,
+    /** The one-file form. `1 more files` is the tell that a count was never read. */
+    fileWithoutTurn: "1 more file in this commit has no linked turn.",
+    // --- Usage. §13.7: a bad argument is exit 2, never exit 1. ---
+    usageWhat: "This command needs a file and a line number.",
+    usageWhy: "`why` answers for one line, so it cannot run without one. Nothing was read and nothing was sent.",
+    usageFix: "Name the file and the line:",
+    /**
+     * `--json` — the REFUSAL COPY THAT STOOD HERE IS GONE, and its removal is the
+     * deliverable rather than a tidy-up (`CR-149`, D122 §2).
+     *
+     * It read *"`why` cannot produce JSON yet"*, and its docblock argued the
+     * refusal was *"the honest minimum rather than a gap"*. That was honest as a
+     * STOPGAP and false as a claim about design intent: **§13.3 REQUIRES `--json`
+     * on the read verbs**, so the flag was an UNBUILT FEATURE wearing the shape of
+     * a designed position — which is the harder defect to see, because a refusal
+     * reads as a decision. `src/json.ts` is the document; `status`, `why` and
+     * `report` all emit one.
+     *
+     * Nothing replaces these three constants. A verb that CAN answer the flag has
+     * no refusal to word.
+     */
+    /**
+     * The shallow-clone REFUSAL (D67's posture, D98's hazard class).
+     *
+     * ⚠ A REFUSAL IS NOT AN ABSENCE. `git blame` on a shallow clone attributes to
+     * the graft boundary and returns a plausible WRONG commit — a call that fails
+     * announces itself; a call that returns a plausible answer is absorbed by the
+     * caller. Shallow clones live in CI containers, which is exactly where nobody
+     * is watching. The `ABSENCE` docblock already rules on this for `report`: it
+     * is not a sixth state and one may not be written there.
+     */
+    shallowWhat: "This is a shallow clone, so `git blame` cannot be trusted here.",
+    shallowWhy: "A shallow clone stops at its graft boundary and attributes every older line to the oldest commit it holds. That answer looks ordinary and is wrong, so it is refused rather than shown.",
+    shallowFix: "Fetch the full history, then run this again:",
+    shallowFixCommand: "git fetch --unshallow",
+    /** `git blame` itself failed — no such file, no such line, or git said no. */
+    blameWhat: "`git blame` could not attribute that line.",
+    blameWhy: "git did not return a commit for it. The path may not be tracked in this repository, or the file may have fewer lines than the one named.",
+    blameFix: "Check the path and the line, then run this again:",
+    // --- The read lane. Every arm renders; none exits 0 silent (D61 round 3 §D8). ---
+    /**
+     * ⚠ A READ-LANE FAILURE MUST PRINT AND EXIT NON-ZERO. The whole reason the
+     * exit contract was split is that the hook rule — exit 0, stdout empty — would
+     * have made this verb fail SILENTLY on a 5xx. `src/exit.ts` says so at the top.
+     *
+     * ⚠ And never a bare HTTP status (§13.6). The status is what we know; it is
+     * not what the user can act on.
+     */
+    unreachableWhat: "VibeCommit could not reach the record service.",
+    unreachableWhy: "The request did not complete, so no answer was read. The service may be down, or this machine may have no route to it.",
+    serverErrorWhat: "The record service could not answer that.",
+    serverErrorWhy: "The request reached the service and it returned a failure instead of a record. Nothing on this machine was changed.",
+    malformedWhat: "The record service returned an answer this version cannot read.",
+    malformedWhy: "The response was not in the form this version expects, so none of it was rendered rather than part of it being guessed at.",
+    readFix: "Try again, and report it if it continues:",
+    /** The bearer is dead after one refresh and one retry. Exit 3, not 1. */
+    signedOutWhat: "This machine is not signed in to VibeCommit.",
+    signedOutWhy: "Reading a record needs a signed-in user, and no usable sign-in was found on this machine.",
+    signedOutFix: "Sign in, then run the command again:",
 };
 /**
  * `vibecommit report` (CR-108).
@@ -386,15 +676,142 @@ export const OFF = {
 export const REPORT = {
     coverageLabel: "Commits with a recorded session",
     gradeMixLabel: "Evidence",
+    // --- D67's THREE-PART UNIT. They render TOGETHER OR NOT AT ALL. ---------
+    /**
+     * ⚠ **THE DEFINITION IS PART OF THE NUMBER, NOT A PREFACE.** D67 cleared
+     * §PS6's durability block on stated terms, and the first is that the
+     * definition, the percentage and the grade mix render together — *"without
+     * them, `observed` correlation-in-time is laundered into a KPI."* A build
+     * that ships the number alone does not lift the block.
+     *
+     * ⚠ **THE REF IS IN THE SENTENCE, ALWAYS** — *"a bare percentage is
+     * meaningless because the number is ref-relative."* `commit_coverage` makes
+     * `ref` a REQUIRED payload field for exactly this reason.
+     */
+    definition: (ref) => `Coverage is the share of the commits we hold a recorded session for that are still reachable from ${ref}.`,
+    rate: (reachable, held, ref, percent) => `${reachable} of ${held} commits with a recorded session are still reachable from ${ref} (${percent}%).`,
+    /** §10.3 draws `Of those:` and then the per-grade split. */
+    gradeMixIntro: "Of those:",
+    /**
+     * ⚠ **THE GRADE WORDS THEMSELVES MAY NOT REACH THE SCREEN**, so the mix is
+     * rendered through these labels — DESIGN.md §13.3 (grade words in `--json`
+     * only), D65 §DR4 (no grade word on screen), and `test/why.test.ts` already
+     * enforces it for the other read verb.
+     *
+     * ⚠ §10.3's DRAWING VIOLATES THAT RULE and this deliberately departs from it:
+     * it draws *"41 observed during a session"*, which prints the bare grade
+     * word. D113 §1 makes it worse than a style slip — `observed` is BLOCKED
+     * because it names **a mechanism that exists in no repo**, and its listed
+     * phrasings include *seen during the session* and *watched*, which are the
+     * two shortenings anyone would reach for next. The `observed` label below
+     * mirrors `grades.ts`'s own approved sentence, *"This commit appeared while
+     * the session was running"*, which says the same fact and claims no witness.
+     * The §10.3 fix is owed in `code/` and is not this package's to write.
+     */
+    // ⚠ FLAT KEYS, NOT A NESTED OBJECT, AND THAT IS A GATE CONSTRAINT RATHER
+    // THAN TASTE. `src/copy/claims.ts`'s walker calls `toLowerCase()` on every
+    // value it reaches, so a nested object under an exported copy block throws
+    // `text.toLowerCase is not a function` and takes the whole claims suite with
+    // it. Found by running it, not by reading the walker. Flat keys stay inside
+    // the gate; `claims.ts` is fenced this wave (`CR-132d`, W11) and the copy is
+    // what moves, not the checker.
+    gradeDerivedLabel: "recorded in the transcript",
+    gradeObservedLabel: "appeared while the session ran",
+    gradeDeclaredLabel: "reported by the agent",
+    /** `<n> <label>`, joined by the renderer. Singular and plural read alike. */
+    gradeCount: (count, label) => `${count} ${label}`,
+    /**
+     * ⚠ **THE SEPARATE LABELLED LINE, IN OUR WORDS** — D67: *"only exact
+     * `commit_sha_successors` rows count toward the numerator; patch-id matches
+     * render as a SEPARATE LABELLED 'probable' LINE and are never folded into the
+     * rate."*
+     *
+     * ⚠ **AND IT IS NOT THE SERVER'S SENTENCE.** `vibecommit-mcp`
+     * `src/read/coverage.ts` emits `probable_line.label` — a user-facing string
+     * minted in another repository, on this payload. D112 §3 ruled on exactly
+     * that shape: **the wire carries the fact, the client owns the words.** That
+     * ruling was measured in `src/read/blame.ts` and the class is NOT closed one
+     * file over, so this renders here and the wire's label is never printed.
+     */
+    probable: (count) => `${count} more matched by patch id, reported separately and not counted above.`,
+    probableOne: "1 more matched by patch id, reported separately and not counted above.",
+    // --- The refusals. A refusal is not an absence and not a sixth state. ---
+    /**
+     * ⚠ **A SEPARATE PHRASING FROM `WHY.shallowWhat`, AND THE REASON IS THAT IT
+     * IS A DIFFERENT FACT.** `why`'s says *"`git blame` cannot be trusted here"*,
+     * which is true of blame and says nothing about reachability. On a shallow
+     * clone the commits that would answer *"is this sha still reachable"* may
+     * simply not be present, so the rate would be wrong rather than missing. The
+     * REMEDY is genuinely the same fact, so `shallowFix` and `shallowFixCommand`
+     * are SHARED rather than re-worded — that is the duplication to avoid.
+     */
+    shallowWhat: "This is a shallow clone, so coverage cannot be computed here.",
+    shallowWhy: "Coverage asks which recorded commits are still reachable, and a shallow clone does not hold the history that answers it. The number would be wrong rather than missing.",
+    /**
+     * ⚠ FAILS CLOSED. If git cannot answer reachability for a commit we hold, the
+     * rate would be computed over a set we do not actually know — so it refuses.
+     * Counting an unanswerable probe as unreachable would DEFLATE the number
+     * silently, which is D98's class: no obviously-broken shape.
+     */
+    unknownReachabilityWhat: "Coverage could not be computed for every recorded commit.",
+    unknownReachabilityWhy: "Git could not say whether some recorded commits are still reachable from this ref. A share computed over the rest would be a smaller number presented as a complete one.",
+    unknownReachabilityFix: "Fetch the full history, then run this again:",
+    refWhat: "This command needs a ref it can name.",
+    refWhy: "Coverage is relative to a ref, so the answer is meaningless without one, and HEAD is detached here. Nothing was read and nothing was sent.",
+    refFix: "Name the ref:",
+    /**
+     * The window, as the two empty states name it.
+     *
+     * ⚠ **THE WINDOW BOUNDS THE LOCAL HALF ONLY.** `commit_coverage` accepts no
+     * `since`, so the server's totals are repository-wide and the RATE claims no
+     * window — see `report.ts`. This string appears only on the two empty states,
+     * which are answered from the clone.
+     */
+    window: (since) => `the window since ${since}`,
+    usageWhat: "This command needs a start date.",
+    usageWhy: "The window bounds which commits are counted, so the answer is not defined without one. Nothing was read and nothing was sent.",
+    usageFix: "Name the date the window starts:",
+    sinceWhat: "That start date could not be read.",
+    sinceWhy: "The window must be a calendar date, written as YYYY-MM-DD. A date git cannot read would silently widen the window.",
+    sinceFix: "Write the date as YYYY-MM-DD:",
 };
 export const ABSENCE = {
     /**
-     * 1 — COLD START. Nothing has been captured yet, so `why` has no record to
-     * consult at all. Owner: `CR-086` (W9).
+     * 1 — COLD START. Owner: `CR-086` (W9), and `CR-086` CORRECTED ITS SCOPE.
+     *
+     * ## ⚠ It said MACHINE; the state it names is a REPOSITORY
+     *
+     * The shipped text was *"No sessions have been recorded on this MACHINE
+     * yet"*, and neither half of that survived measurement. `why`'s answer is
+     * repository-scoped — the payload that selects this state answers for one
+     * repo — and a developer with capture running in three repos and none here
+     * would have been told capture had never run at all. Nothing in the client
+     * holds a machine-wide "never captured" fact either: `state.ts` keys sends by
+     * project.
+     *
+     * ## Why it does not render §10.6-A's two extra facts, and that is deliberate
+     *
+     * §10.6-A and §R3 draw *"That commit predates capture on this repo (first
+     * capture 2026-08-08). … 14 commits captured since."* **Both numbers are
+     * facts this client does not hold.** `state.ts` records `lastSendForRepo` —
+     * the LAST send, never a FIRST-capture date — and the commit count is
+     * `commit_coverage`'s, a server figure behind `CR-085`. D81's order applies:
+     * make the claim honest before building the mechanism.
+     *
+     * So the state says the thing that IMPLIES §10.6-A's headline without
+     * asserting either number: **if no session was ever recorded for this
+     * repository, then every commit in it predates capture** — including this
+     * one. That is §10.6-A's meaning, carried by a fact the payload can state.
+     * The date and the count are registered as owed (see the PR) rather than
+     * approximated, because a first-capture date guessed from a last-send record
+     * is D98's plausible-wrong-answer class exactly.
+     *
+     * ⚠ NO SIXTH STATE WAS ADDED, and none may be: `test/copy-absence.test.ts`
+     * asserts the EXACT set of five.
      */
     coldStart: {
-        what: "No sessions have been recorded on this machine yet.",
-        why: "Capture has not run here, so there is no session to look up for any commit.",
+        what: "No session has been recorded for this repository yet.",
+        why: "Capture has not sent anything for this repository, so no commit in it has a conversation record — including this one.",
         fix: "Connect this repository, then work as usual:",
         exit: EXIT.empty,
     },
@@ -594,7 +1011,23 @@ export const COMMANDS = {
     /** `CR-084d`. A FLAG, not a verb — `--help`'s verb list and its golden file do not move. */
     signIn: "vibecommit connect --sign-in",
     status: "vibecommit status",
+    /**
+     * `CR-108`. The ARGUMENT SHAPE, shown once so the usage error and the retry
+     * fix line cannot drift apart — the same convention `why` uses.
+     */
+    report: "vibecommit report --since 2026-07-08",
+    /** The ref form, for the detached-HEAD refusal. */
+    reportRef: "vibecommit report --since 2026-07-08 --ref main",
     off: "vibecommit off",
+    /**
+     * `CR-086`. The ARGUMENT SHAPE, shown once so the usage error and the retry
+     * fix line cannot drift apart. There is no argument parser in this package —
+     * `connect` reads `argv.includes("--sign-in")` and that is the whole
+     * convention — so `file:line` is the smallest shape that satisfies the
+     * verbatim-approved `--help` sentence, and it is the form editors and `grep`
+     * already print.
+     */
+    why: "vibecommit why src/auth/session.ts:47",
     chmodCredentials: "chmod 600 ~/.vibecommit/credentials.json",
 };
 /**
