@@ -1,12 +1,14 @@
 # Opt-in: PostToolUse capture-enforcement hook (compliance tier)
 
-> **Not installed by default.** The VibeCommit plugin's default capture path is
-> cooperative MCP — the agent reads the rules in `CLAUDE.md` / `AGENTS.md` and
-> calls `commit_conversation` itself. This recipe is for teams that need
-> *deterministic* capture (a commit is never recorded without its conversation)
-> and are willing to run a local hook in a trusted environment. Enabling it is a
-> deliberate, per-project act; nothing here is wired by `plugin.json`, `.mcp.json`,
-> or any shipped `settings.json`.
+> **Not installed by default.** The plugin's default capture path already
+> includes Claude Code hooks — `Stop`, `PreCompact`, `SessionEnd`
+> ([`hooks.json`](hooks.json)) — that invoke the bundled capture client
+> directly, no agent cooperation required. What those hooks do NOT do is fire
+> at the moment of `git commit` itself; they fire at the next session boundary.
+> This recipe is for teams that want capture tied to each commit specifically,
+> without waiting for that boundary, and are willing to run a local hook in a
+> trusted environment. Enabling it is a deliberate, per-project act; nothing
+> here is wired by `plugin.json`, `.mcp.json`, or any shipped `settings.json`.
 
 ## What it does
 
