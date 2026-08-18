@@ -1,7 +1,9 @@
 # VibeCommit — Claude Code Plugin
 
 One-command install for session capture in Claude Code.
-VibeCommit records what your AI agent did and why — every commit, every session.
+VibeCommit records what your AI agent did: Claude Code hooks capture sessions at
+their Stop, PreCompact, and SessionEnd boundaries by default, with an opt-in hook
+for capture at the moment of commit — see [below](#optional-capture-on-every-commit-compliance-tier).
 
 ## Install
 
