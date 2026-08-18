@@ -11,6 +11,9 @@ VibeCommit records what your AI agent did and why — every commit, every sessio
 ```
 
 That's it. Claude Code now automatically:
+- Fires Claude Code hooks on `Stop`, `PreCompact`, and `SessionEnd` that invoke
+  the bundled capture client directly — capture that does not depend on the
+  agent calling a tool
 - Calls `setup` once per session to load the capture rules
 - Calls `commit_conversation` to capture your work — after each meaningful chunk
   and right after every commit — and shares the provenance URL with you
@@ -44,8 +47,14 @@ content either way.
 
 ## How it works
 
-VibeCommit is an MCP server at `https://api.vibecommit.ai/mcp`. The tools the
-capture flow relies on:
+Capture happens two ways, and both write to the same history: Claude Code hooks
+(`Stop`/`PreCompact`/`SessionEnd`, installed automatically with this plugin)
+invoke the bundled capture client directly, and the MCP server below is called
+cooperatively by your agent per the rules files. Re-capturing the same
+conversation through either path is a free no-op, so the two never double-record.
+
+VibeCommit's MCP server is at `https://api.vibecommit.ai/mcp`. The tools the
+cooperative flow relies on:
 
 - **`setup`** — returns the rules files for your agent (idempotent; skip-if-current
   on the common path)
@@ -61,19 +70,18 @@ history (`search_history`, `blame_commit`, `commit_coverage`,
 First call triggers OAuth in your browser (GitHub login). After that, every
 `commit_conversation` call is silent.
 
-## Optional: deterministic capture (compliance tier)
+## Optional: capture on every commit (compliance tier)
 
-The default install is **cooperative MCP only**: the rules files tell the agent
-to call `commit_conversation` itself, and adherence is high but not guaranteed.
-No hooks are installed.
-
-Teams that need *guaranteed* capture — where a commit is never recorded without
-its conversation — can opt into one of two local hooks. Recipes live in
+The default hooks above ([`hooks/hooks.json`](hooks/hooks.json)) fire at session
+boundaries — `Stop`, `PreCompact`, `SessionEnd` — not at the moment of `git commit`
+itself. Teams that want a capture tied to each commit, without waiting for the
+next boundary, can opt into one of two additional local hooks. Recipes live in
 [`hooks/`](hooks); neither is wired by the plugin.
 
 - **PostToolUse capture hook** ([`hooks/post-tool-use-capture.md`](hooks/post-tool-use-capture.md))
   — a Claude Code `PostToolUse` hook that fires on `git commit` Bash calls and
-  invokes the local capture driver. This is the enforcement path.
+  invokes the local capture driver immediately, tighter-grained than the default
+  session-boundary hooks.
 - **git `post-commit` breadcrumb** ([`hooks/post-commit.sample`](hooks/post-commit.sample))
   — a vendor-agnostic shell hook. It is **secondary**: it cannot authenticate or
   capture on its own; it just keeps `recent_git_log` warm for the agent's next

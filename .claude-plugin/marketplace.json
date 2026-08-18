@@ -4,12 +4,12 @@
     "name": "VibeCommit",
     "email": "hello@vibecommit.ai"
   },
-  "description": "VibeCommit session-capture plugin for Claude Code. Installs the cooperation-rate rules files (AGENTS.md + CLAUDE.md) so Claude calls commit_conversation after each chunk of work and right after every commit.",
+  "description": "VibeCommit session-capture plugin for Claude Code. Installs Claude Code hooks — Stop, PreCompact, SessionEnd — for deterministic capture, the AGENTS.md + CLAUDE.md rules files, and an MCP read surface for your captured history.",
   "plugins": [
     {
       "name": "vibecommit",
       "source": "./",
-      "description": "Install the VibeCommit MCP rules files (AGENTS.md + CLAUDE.md + SKILL.md) and MCP server config for one-command session capture.",
+      "description": "Installs Claude Code hooks (Stop, PreCompact, SessionEnd) for deterministic capture, the AGENTS.md + CLAUDE.md + SKILL.md rules files, and MCP server config for searching, blaming, and diffing your history.",
       "version": "1.0.0",
       "author": {
         "name": "VibeCommit"
