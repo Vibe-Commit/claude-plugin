@@ -17,12 +17,19 @@
  * `capture_commits` rows cannot be retracted (D105/D108). So the truncation is
  * the LAST step and it is conditional on the server's 2xx.
  *
- * ## ⛔ THE SESSION GATE IS WHAT KEEPS THE HUMAN'S COMMITS OUT
+ * ## ⛔ THE SESSION GATE IS ABOUT WHICH SESSION, NOT ABOUT WHO TYPED IT
  *
- * `post-commit` fires for EVERY commit in the work tree, including ones a human
- * typed with no agent involved. Attributing those would link a commit its author
- * never asked us to see, permanently. So a line is written only when a capture
- * session is demonstrably live for that repo — see `activeSessionFor`.
+ * ⚠ **This block used to say the gate is what keeps a HUMAN'S commits out. That
+ * has been FALSE since `CR-170` shipped** — `activeSessionFor` has never
+ * inspected authorship, and `post_commit.ts` says three lines below its own copy
+ * of the claim that the hook *"fires for every commit in this work tree,
+ * including ones no agent was involved in."* Corrected as a comment fix; no
+ * behaviour moved with it (`D5`).
+ *
+ * What the gate actually asks is whether a capture session is demonstrably live
+ * for this repo, and — since the ladder below — **WHICH ONE**. A line is written
+ * only when that question has an answer, and the answer carries the rung that
+ * produced it so the server can tell an observation from a guess.
  *
  * ## The line is deliberately small, and the file list stays here
  *
@@ -163,39 +170,120 @@ export function dropSpooled(home, key, count) {
     }
 }
 /**
- * Which session, if any, is live for this repo right now.
+ * Which session, if any, is live for this repo right now — ⛔ **AND HOW WE KNOW.**
  *
- * ⛔ **THIS IS THE GATE BETWEEN A CAPTURE AND SOMEONE ELSE'S COMMIT.**
- * `post-commit` knows the repository — it is running inside it — but it has no
- * `session_id`: that only ever arrives on the Claude Code hook's stdin. So the
- * session is discovered from the state the hook itself writes, and if no session
- * is live the answer is `null` and nothing is spooled.
+ * ## The defect this replaces
  *
- * The most recently touched state file wins. Two concurrent Claude Code sessions
- * in ONE clone are genuinely ambiguous — nothing in a `post-commit` can tell
- * which agent typed the commit — and the most recent one is the best available
- * answer rather than a correct one. ⚠ Stated because it is a real limit of the
- * design, not an oversight.
+ * Until the ladder, this function returned *the most recently mtime'd state file
+ * within 30 minutes* and said nothing about its own confidence. Two agents in one
+ * clone: session A commits, B's state file is newer, **A's commit enters B's
+ * spool** — and `cr071:157` makes the resulting edge PERMANENT, with UPDATE and
+ * DELETE both raising for `service_role` too. A wrong edge is forever, so the
+ * guess had to stop being indistinguishable from the answer.
  *
- * ⚠ **A commit made before a session's FIRST hook has fired is NOT captured**,
- * because the state file it would key on does not exist yet. That is the
- * fail-closed direction and it costs at most the first commit of a session.
+ * ## The ladder
+ *
+ * ```
+ *  env id names a live session ─────────> env_session_id         WRITE
+ *  no live session at all ──────────────> null                   REFUSE (no row)
+ *  env id names NONE of them ───────────> env_session_unmatched  REFUSE (named)
+ *  exactly ONE candidate ───────────────> sole_live_session      WRITE  (D5)
+ *  TWO OR MORE candidates ──────────────> recency_heuristic      HOLD
+ * ```
+ *
+ * ⛔ **`sole_live_session` ALWAYS WRITES, and that is not a change.** It never
+ * inspected authorship and does not start now: a human's `git commit` in a clone
+ * with one live session produces a spool line today, at HEAD, and
+ * `test/post-commit-spool.test.ts` has a green arm asserting exactly that. What
+ * is new is that the server will write a PERMANENT row off this rung, so the rung
+ * has to be named on the wire (`D190`).
+ *
+ * ## ⛔ `env_session_unmatched` — THE THIRD ARM, AND IT IS A REFUSAL WITH A NAME
+ *
+ * An env id that names **none** of the live candidates is a shape the plan's
+ * ladder does not draw, and the code must answer it. It is REAL rather than
+ * hypothetical: `agents/registry.ts:11-13` rejects an environment variable as the
+ * agent selector precisely because **Codex exports `CLAUDE_PLUGIN_ROOT` itself**,
+ * so a Codex agent running under an outer Claude session carries a
+ * `CLAUDE_CODE_SESSION_ID` that corroborates nothing here.
+ *
+ *   - ⛔ `sole_live_session` there would name a session we have POSITIVE evidence
+ *     did not commit — the permanent wrong edge, arrived at from the other
+ *     direction. Never.
+ *   - ⛔ `recency_heuristic` is what this ladder used first, and it is wrong for
+ *     the reason `AttributionRung` records: cardinality one, refused **23514**,
+ *     and a doubt we do not actually have.
+ *   - ⛔ **A silent refusal is worse than either in one respect** — nobody can
+ *     afterwards ask *why did that commit vanish*. That is the failure class this
+ *     whole wave exists to close, so the refusal is RECORDED and NAMED.
+ *
+ * ⚠ **The line goes in the recency winner's spool bucket, because that is the
+ * only bucket that exists** — an uncorroborated env id deliberately does not open
+ * one of its own. The bucket is a FILE LOCATION and the rung is the attribution:
+ * the line says, in terms, *this commit is attributed to nobody, and here is
+ * why*. It never reaches `x-commits` and never becomes a `commit_attributions`
+ * row.
+ *
+ * ⚠ **So `recency_heuristic` is reachable ONLY with two or more candidates**,
+ * which is what `commit_attributions_ambiguity_is_plural` demands. That is a
+ * property of the ladder's SHAPE now rather than of a caller's care, and
+ * `test/post-commit-spool.test.ts` asserts it directly.
+ *
+ * ⚠ **A commit made before a session's FIRST hook has fired is still NOT
+ * captured**, because the state file it would key on does not exist yet. The env
+ * id could key a bucket that has no state file, and deliberately does not: the
+ * ladder's first rung requires CORROBORATION, so a stale or inherited variable
+ * cannot open a spool of its own.
+ *
+ * `envSessionId` is a PARAMETER rather than a read of `process.env` here, and it
+ * has no default: the compiler is the only thing that will notice a caller which
+ * forgot the env path, and this seam has no other check.
  */
-export function activeSessionFor(home, repoKey, nowMs = Date.now(), windowMs = SESSION_LIVE_WINDOW_MS) {
+export function activeSessionFor(home, repoKey, envSessionId, nowMs = Date.now(), windowMs = SESSION_LIVE_WINDOW_MS) {
+    const live = liveSessions(home, repoKey, nowMs, windowMs);
+    // Rung 1 — the committing process told us, and a state file agrees.
+    if (envSessionId !== null && live.some((s) => s.sessionId === envSessionId)) {
+        return { sessionId: envSessionId, attribution: "env_session_id" };
+    }
+    // No candidate at all: nothing has captured this repo inside the window, so
+    // there is no bucket to record anything in. The refusal has to be silent here
+    // and only here.
+    if (live.length === 0)
+        return null;
+    // ⛔ THE NAMED REFUSAL, AND IT COMES BEFORE BOTH WRITE RUNGS. We were TOLD who
+    // committed, and it is none of these. Falling through would attribute the
+    // commit to a session we have positive evidence did not make it.
+    if (envSessionId !== null) {
+        return { sessionId: live[0].sessionId, attribution: "env_session_unmatched" };
+    }
+    // Rung 2 — D5. One session, nothing contradicting it.
+    if (live.length === 1) {
+        return { sessionId: live[0].sessionId, attribution: "sole_live_session" };
+    }
+    // ⛔ Rung 3 — the guess, and TWO OR MORE candidates is now structurally
+    // guaranteed here: every path with an env id returned above, and one candidate
+    // returned on the line before. `commit_attributions_ambiguity_is_plural`
+    // requires exactly that, and a cardinality-one row is refused 23514.
+    return { sessionId: live[0].sessionId, attribution: "recency_heuristic" };
+}
+/** Every session state file touched inside the window, most recent first. */
+function liveSessions(home, repoKey, nowMs, windowMs) {
     const dir = repoSessionsDir(home, repoKey);
     if (dir === null)
-        return null;
+        return [];
     let entries;
     try {
         entries = readdirSync(dir);
     }
     catch {
         // No directory at all: nothing has ever captured this repo.
-        return null;
+        return [];
     }
-    let best = null;
+    const live = [];
     for (const entry of entries) {
-        // ⚠ State files only. `.spool.jsonl` lives here too and is not a session.
+        // ⚠ State files only. `.spool.jsonl` and `.rewrites.jsonl` live here too and
+        // are not sessions — and neither ends with `.json`, which is the same
+        // load-bearing spelling `spoolPath` documents.
         if (!entry.endsWith(".json"))
             continue;
         let touchedAt;
@@ -207,23 +295,212 @@ export function activeSessionFor(home, repoKey, nowMs = Date.now(), windowMs = S
         }
         if (nowMs - touchedAt > windowMs)
             continue;
-        if (best === null || touchedAt > best.at) {
-            best = { sessionId: entry.slice(0, -".json".length), at: touchedAt };
-        }
+        live.push({ sessionId: entry.slice(0, -".json".length), at: touchedAt });
     }
-    return best === null ? null : best.sessionId;
+    // ⚠ Ties broken by name so the guess is at least DETERMINISTIC. Two state files
+    // written in the same millisecond is ordinary on a coarse-grained filesystem,
+    // and a rung that picked differently on each read would be unreproducible as
+    // well as wrong.
+    live.sort((a, b) => (b.at - a.at) || a.sessionId.localeCompare(b.sessionId));
+    return live;
 }
 /**
- * The SHAs this hook will carry, and how many to drop after a 2xx.
+ * ⛔ **THE TWO RUNGS THAT MAY GO ON `x-commit-attributions` (`D190`).**
+ *
+ * The server's vocabulary is exactly these two (`edge_derivation.ts:178`) and a
+ * rung outside it is **skipped silently** — no edge, no error, no log. So the
+ * refusal lives here, on the producing side, rather than being discovered as a
+ * zero where edges should have been.
+ *
+ * ⚠ **This constant is NOT what the wire cell asserts against.** There is no
+ * shared type across that seam and inventing one would couple an MIT client to a
+ * closed server, so the cell types the literals itself — round-tripping this
+ * constant through our own code would only prove it equals itself (`D190 §5`).
+ */
+export const WIRE_RUNGS = ["env_session_id", "sole_live_session"];
+/**
+ * The SHAs this hook will carry, their rungs, and how many lines to drop after a
+ * 2xx.
  *
  * ⛔ **FULL WIDTH, ALWAYS.** `capture_commits.commit_sha` is 7..40 because the
  * server's `expandShortSha` can fail, so an abbreviated sha makes the web join
  * SILENTLY EMPTY — a wrong answer with no error, D98's class exactly. Anything
- * that is not a full sha is dropped here rather than sent.
+ * that is not a full sha is dropped by `parseEntry` rather than sent.
+ *
+ * ⛔ **`shas` AND `attributions` ARE THE SAME LENGTH BY CONSTRUCTION** — one
+ * `push` each, in one iteration, or neither. That is not style.
+ * `parseObservedCommits` returns `[]` when the two lists differ in length: **the
+ * ENTIRE BATCH is dropped, not the odd entry**, with no edge, no error and no
+ * log (`D190 §1`). A `filter` and a `map` over the same array would be the same
+ * thing until someone changed one of them.
+ *
+ * ⛔ **`count` IS LINES CONSUMED, NOT `shas.length`, AND THEY DIVERGE.** A held
+ * entry is consumed and never sent. `dropSpooled` drops **the first N lines**, so
+ * a caller truncating by `shas.length` would delete a held line at the head and
+ * re-send the commit that was actually delivered — forever.
+ *
+ * ⚠ **A held entry IS dropped on the 2xx, and the observation is lost.** Stated
+ * rather than hidden: this wave gives the client no way to transmit a held
+ * commit, and leaving it in the file would make every subsequent hook re-read a
+ * line that can never be sent. The asymmetry this module already runs on decides
+ * it — a MISSED commit is recoverable, the sha is still in git, while a WRONGLY
+ * ATTRIBUTED one is a permanent row (`cr071:157`).
  */
 export function capSpool(entries) {
     const taken = entries.slice(0, MAX_SPOOLED_SHAS);
-    return { shas: taken.map((e) => e.sha), count: taken.length };
+    const shas = [];
+    const attributions = [];
+    for (const entry of taken) {
+        if (!WIRE_RUNGS.includes(entry.attribution))
+            continue;
+        shas.push(entry.sha);
+        attributions.push(entry.attribution);
+    }
+    return { shas, attributions, count: taken.length };
+}
+/**
+ * How many rewrite pairs one hook may put on the wire.
+ *
+ * ⛔ **ITS OWN CONSTANT, AND SHARING `MAX_SPOOLED_SHAS` WOULD MAKE ONE OF THE TWO
+ * WRONG.** The units differ: a sha plus a separator is 41 bytes, a pair plus a
+ * separator is **82** (40 + `:` + 40 + `,`). 16 pairs is 1,312 bytes — the same
+ * header budget `MAX_SPOOLED_SHAS = 32` was sized against, arrived at through the
+ * arithmetic of this header rather than inherited from the other one.
+ *
+ * ⛔ **The rest stay spooled**, exactly as the commit spool's remainder does.
+ */
+export const MAX_SPOOLED_PAIRS = 16;
+/** `<repo>/<session>.rewrites.jsonl`, beside the commit spool. */
+export function rewriteSpoolPath(home, key) {
+    const state = sessionStatePath(home, key);
+    if (state === null)
+        return null;
+    return state.replace(/\.json$/, ".rewrites.jsonl");
+}
+/**
+ * Append rewrite pairs, skipping any already spooled. Returns how many were
+ * WRITTEN — ⛔ not how many were offered.
+ *
+ * ## ⛔ THE DEDUP IS ONE OF T4'S TWO GUARDS, AND IT IS NOT REDUNDANCY
+ *
+ * `M6` measured the squash hazard and it is **SIZE-DEPENDENT**. A 3→1 squash
+ * fires `post-rewrite` twice — `amend A→F`, then `rebase A→F; B→F` — so **the
+ * pair `A→F` arrives twice**. A 4→1 squash instead produces rows naming an
+ * INTERMEDIATE sha that never existed on any branch; that one is killed by the
+ * in-progress-rebase suppression in `hooks/post_rewrite.ts`, which cannot see the
+ * duplicate, exactly as this cannot see the intermediate. **One squash size
+ * cannot test both.**
+ *
+ * ⚠ **Dedup is against the FILE, not against the batch**, because the two fires
+ * are two processes: a batch-local check would see one pair each time and dedup
+ * nothing. ⚠ The read-then-append is not atomic — two rewrites racing in one
+ * clone could both miss — but `post-rewrite` runs inside git's own serialised
+ * rebase, and the cost of the residual race is one duplicate pair rather than a
+ * wrong one.
+ *
+ * ⛔ **NEVER THROWS.** This runs inside the user's `git rebase`.
+ */
+export function appendRewrites(home, key, pairs) {
+    const path = rewriteSpoolPath(home, key);
+    if (path === null)
+        return 0;
+    const seen = new Set(readRewrites(home, key).map(wirePair));
+    let written = 0;
+    try {
+        mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+        for (const pair of pairs) {
+            const wire = wirePair(pair);
+            if (seen.has(wire))
+                continue;
+            seen.add(wire);
+            appendFileSync(path, `${JSON.stringify(pair)}\n`, { mode: 0o600 });
+            written += 1;
+        }
+        if (written > 0)
+            chmodSync(path, 0o600);
+        return written;
+    }
+    catch {
+        return written;
+    }
+}
+/** Every well-formed pair in the rewrite spool, oldest first. */
+export function readRewrites(home, key) {
+    const path = rewriteSpoolPath(home, key);
+    if (path === null)
+        return [];
+    let raw;
+    try {
+        raw = readFileSync(path, "utf8");
+    }
+    catch {
+        return [];
+    }
+    const out = [];
+    for (const line of raw.split("\n")) {
+        if (line.trim() === "")
+            continue;
+        const pair = parsePair(line);
+        if (pair !== null)
+            out.push(pair);
+    }
+    return out;
+}
+/** Drop the first `count` pairs — called ONLY after the server's 2xx. */
+export function dropRewrites(home, key, count) {
+    const path = rewriteSpoolPath(home, key);
+    if (path === null || count <= 0)
+        return false;
+    try {
+        const lines = readFileSync(path, "utf8").split("\n").filter((l) => l.trim() !== "");
+        writeFileSync(path, lines.slice(count).map((l) => `${l}\n`).join(""), { mode: 0o600 });
+        chmodSync(path, 0o600);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+/**
+ * The pairs this hook will carry, and how many to drop after a 2xx.
+ *
+ * ⛔ **`ancestor:successor`, COLON-SEPARATED.** `parseRewritePairs` drops
+ * silently on a wrong separator, on a third colon-field, on a bad sha and on a
+ * self-pair — no edge, no error, no log (`D190 §1`).
+ */
+export function capSuccessors(pairs) {
+    const taken = pairs.slice(0, MAX_SPOOLED_PAIRS);
+    return { pairs: taken.map(wirePair), count: taken.length };
+}
+/** The wire spelling of one pair. Also the dedup key. */
+function wirePair(pair) {
+    return `${pair.ancestor}:${pair.successor}`;
+}
+function parsePair(line) {
+    let parsed;
+    try {
+        parsed = JSON.parse(line);
+    }
+    catch {
+        return null;
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))
+        return null;
+    const o = parsed;
+    const { ancestor, successor } = o;
+    // ⛔ Re-validated on the way OUT as well as in. A spool file is on disk and
+    // outlives the process that wrote it, so what comes back is input.
+    if (!isFullSha(ancestor) || !isFullSha(successor))
+        return null;
+    // ⚠ A self-pair is dropped by the server anyway; dropping it here keeps a
+    // no-op from occupying one of the 16 slots a real pair needs.
+    if (ancestor === successor)
+        return null;
+    return { ancestor, successor };
+}
+/** Full width, both widths git uses. ⛔ Never abbreviated. */
+export function isFullSha(value) {
+    return typeof value === "string" && /^[0-9a-f]{40}$|^[0-9a-f]{64}$/.test(value);
 }
 function parseEntry(line) {
     let parsed;
@@ -240,11 +517,40 @@ function parseEntry(line) {
     // ⛔ The width check lives here as well as at the boundary: a spool file is
     // on disk and outlives the process that wrote it, so what comes back out is
     // input, not something we already validated.
-    if (typeof sha !== "string" || !/^[0-9a-f]{40}$|^[0-9a-f]{64}$/.test(sha))
+    if (!isFullSha(sha))
         return null;
     const at = typeof o.at === "string" ? o.at : "";
     const branch = typeof o.branch === "string" && o.branch !== "" ? o.branch : null;
     const files = Array.isArray(o.files) ? o.files.filter((f) => typeof f === "string") : [];
-    return { sha, branch, at, files };
+    return { sha, branch, at, files, attribution: parseRung(o.attribution) };
+}
+/**
+ * ⛔ **AN UNLABELLED LINE IS `recency_heuristic`, AND THAT IS NOT A DEFAULT — IT
+ * IS THE CORRECT NAME FOR HOW IT WAS PRODUCED.**
+ *
+ * A spool file outlives the process that wrote it and survives an upgrade, so a
+ * line written by a PRE-LADDER client is ordinary input here. That client picked
+ * its session by mtime recency, with no corroboration and no way to tell one
+ * candidate from two. Naming it anything else would upgrade a guess to an
+ * observation on the strength of a version number.
+ *
+ * ⚠ **This is `D190 §2`'s NO RUNG, NO EDGE, on the client side.** The server
+ * refuses to write an edge for a commit that arrives without a rung, for exactly
+ * this reason; here the same commit is refused a place on `x-commits` before it
+ * is ever sent. Both directions of the seam agree, independently.
+ */
+function parseRung(value) {
+    switch (value) {
+        case "env_session_id":
+        case "sole_live_session":
+        case "env_session_unmatched":
+            return value;
+        default:
+            // ⛔ INCLUDING an unlabelled line and a rung outside the vocabulary. A
+            // near-miss spelling is NOT admitted: the server skips an unknown rung
+            // silently, which is a zero with no error, so it is resolved here to the
+            // value that says *we do not know*.
+            return "recency_heuristic";
+    }
 }
 //# sourceMappingURL=spool.js.map

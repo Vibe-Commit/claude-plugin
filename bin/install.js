@@ -128,10 +128,26 @@ export const CHAINED_SUFFIX = ".chained-by-vibecommit";
  * `git commit` at 0), so this cannot break a commit either way — but preserving
  * the status keeps the chained hook's own contract with anything that reads it.
  *
- * `>/dev/null 2>&1` on our side: `post-commit` output lands in the user's commit
- * terminal, and a capture tool has no business writing there.
+ * `>/dev/null 2>&1` on our side: hook output lands in the user's own terminal,
+ * and a capture tool has no business writing there.
+ *
+ * ## ⛔ `post-rewrite` TAKES ITS INPUT ON STDIN, AND A STREAM IS READ ONCE
+ *
+ * `post-commit` is handed nothing. `post-rewrite` is handed the ancestor/successor
+ * pairs on stdin (`M6`) — and **a chained hook that reads stdin leaves ours with
+ * an empty stream, and ours would leave theirs with one.** Copying the
+ * `post-commit` body would therefore have silently broken every pre-existing
+ * `post-rewrite` hook the moment we chained it: their tooling would run, read
+ * nothing, and conclude nothing was rewritten.
+ *
+ * So the stdin variant buffers the stream ONCE and feeds a copy to each. ⚠
+ * `$(cat)` strips trailing newlines and cannot carry a NUL, which is fine and is
+ * checked rather than assumed: this stream is `<40-hex> <40-hex>` lines, ASCII,
+ * one per rewrite. `printf '%s\n'` restores the single trailing newline.
  */
-function hookScript(binPath) {
+function hookScript(binPath, hookName, readsStdin) {
+    const chained = `"$d/${hookName}${CHAINED_SUFFIX}"`;
+    const ours = `${shellQuote(binPath)} ${hookName}`;
     return [
         "#!/bin/sh",
         `# ${HOOK_MARKER}`,
@@ -139,10 +155,15 @@ function hookScript(binPath) {
         "# no commits for this clone.",
         'd=$(dirname "$0")',
         "status=0",
-        `if [ -x "$d/post-commit${CHAINED_SUFFIX}" ]; then`,
-        `  "$d/post-commit${CHAINED_SUFFIX}" "$@" || status=$?`,
+        ...(readsStdin ? ["input=$(cat)"] : []),
+        `if [ -x "$d/${hookName}${CHAINED_SUFFIX}" ]; then`,
+        readsStdin
+            ? `  printf '%s\\n' "$input" | ${chained} "$@" || status=$?`
+            : `  ${chained} "$@" || status=$?`,
         "fi",
-        `${shellQuote(binPath)} post-commit >/dev/null 2>&1 || true`,
+        readsStdin
+            ? `printf '%s\\n' "$input" | ${ours} "$@" >/dev/null 2>&1 || true`
+            : `${ours} >/dev/null 2>&1 || true`,
         "exit $status",
         "",
     ].join("\n");
@@ -166,17 +187,49 @@ function shellQuote(value) {
  * dogfooding cannot exercise this path — it is covered by deliberate tests.
  */
 export function installPostCommitHook(toplevel, binPath) {
+    return installCaptureHooks(toplevel, binPath).commit;
+}
+/**
+ * Install BOTH capture hooks for the work tree at `toplevel`.
+ *
+ * ⛔ **`post-rewrite` IS NOT AN EXTRA, IT IS THE OTHER HALF OF `post-commit`.**
+ * `--amend` and `rebase` fire `post-commit` for a sha they then DESTROY (`M5`),
+ * so a clone with only the commit hook records observations that name commits
+ * unreachable from every branch and gone after `gc --prune=now`. The two go in
+ * together, behind the same `core.hooksPath` refusal and the same chaining.
+ *
+ * ⚠ **`installPostCommitHook` RETURNS ONLY THE COMMIT VERDICT, and the rewrite
+ * verdict is currently PRINTED BY NOTHING.** `commands/connect.ts` reports one
+ * install and `src/copy/` has one string for it, both outside this lane's scope.
+ * The gap is narrow — `core.hooksPath` and a `not a git work tree` failure are
+ * shared, so they are reported by the commit verdict — and is limited to a clone
+ * that has a pre-existing `post-rewrite` and no pre-existing `post-commit`: that
+ * chaining happens correctly and is not announced. ⛔ Recorded here rather than
+ * left to be discovered, because an unreported install outcome is precisely what
+ * the block at the top of this section calls the third silent no-op.
+ */
+export function installCaptureHooks(toplevel, binPath) {
     const configured = gitProbe(toplevel, ["config", "--get", "core.hooksPath"]);
     // `--get` exits 1 when unset, which `gitProbe` reports as null. A SET value
     // is the failure case here, which is the opposite of the usual reading.
     if (configured !== null && configured.trim() !== "") {
-        return { kind: "hooks-path", configured: configured.trim() };
+        // ⛔ BOTH refuse. `.git/hooks` is dead for every hook in it, not just ours.
+        const verdict = { kind: "hooks-path", configured: configured.trim() };
+        return { commit: verdict, rewrite: verdict };
     }
     const hooksDir = resolveHooksDir(toplevel);
-    if (hooksDir === null)
-        return { kind: "failed", why: "not a git work tree" };
-    const hookPath = join(hooksDir, "post-commit");
-    const script = hookScript(binPath);
+    if (hooksDir === null) {
+        const verdict = { kind: "failed", why: "not a git work tree" };
+        return { commit: verdict, rewrite: verdict };
+    }
+    return {
+        commit: writeHook(hooksDir, "post-commit", hookScript(binPath, "post-commit", false)),
+        rewrite: writeHook(hooksDir, "post-rewrite", hookScript(binPath, "post-rewrite", true)),
+    };
+}
+/** Write one hook into an empty slot, over ours, or in front of theirs. */
+function writeHook(hooksDir, hookName, script) {
+    const hookPath = join(hooksDir, hookName);
     const existing = readIfPresent(hookPath);
     try {
         mkdirSync(hooksDir, { recursive: true });

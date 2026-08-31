@@ -197,13 +197,66 @@ function parseWindow(value) {
         return null;
     return { first, last, total };
 }
-/** The whole document. `null` means malformed, and malformed renders as malformed. */
+/**
+ * ⛔ THE SKEW SENTINEL. Returned when the document is WELL-FORMED but names a
+ * `state` this build does not know — which means the server is newer than this
+ * client, not that the answer is broken.
+ *
+ * ⚠ A UNIQUE OBJECT, compared by identity. A string sentinel could collide with
+ * a future legitimate return, and `null` is already taken by "malformed" — the
+ * two must stay distinguishable, because they send the user to opposite
+ * remedies: "report this" versus "update the plugin".
+ */
+export const PAYLOAD_VERSION_SKEW = Object.freeze({ skew: true });
+/**
+ * ⚠ A TYPE GUARD RATHER THAN A BARE `===`. TypeScript does not narrow a union
+ * on object identity — the two members share no discriminant literal — so
+ * `payload === PAYLOAD_VERSION_SKEW` compiles but leaves `payload` wide, and
+ * the next line passing it to a renderer fails to typecheck. The guard makes
+ * the narrowing explicit and keeps the identity comparison as the actual test.
+ */
+export function isVersionSkew(p) {
+    return p === PAYLOAD_VERSION_SKEW;
+}
+/**
+ * The whole document.
+ *
+ * - `null` — MALFORMED. The server sent something that is not a valid document
+ *   in any version, and the remedy is to report it.
+ * - `PAYLOAD_VERSION_SKEW` — WELL-FORMED, UNKNOWN STATE. The server is newer
+ *   than this client and the remedy is to upgrade. ⛔ Added by `U1`
+ *   (2026-08-30): before it, this case returned `null` and told the user a
+ *   perfectly good answer was broken. See `WHY.skewWhat` for why that mattered
+ *   more here than in most protocols.
+ * - a payload — parsed.
+ */
 export function parseBlameCommitPayload(document) {
     if (!isRecord(document))
         return null;
     const state = document.state;
+    // ⚠ SKEW IS CHECKED BEFORE MALFORMEDNESS, and only for a STRING state. A
+    // non-string `state` is malformed in every version — it is not evidence of a
+    // newer server — so it must keep falling through to `null` below rather than
+    // being excused as skew. Excusing it would turn a genuine protocol break into
+    // a spurious "update the plugin".
+    if (typeof state === "string" &&
+        state !== "cold_start" &&
+        state !== "no_edge" &&
+        state !== "edge_unreadable" &&
+        state !== "squash_resolved" &&
+        state !== "turns") {
+        return PAYLOAD_VERSION_SKEW;
+    }
     if (state !== "cold_start" &&
         state !== "no_edge" &&
+        // ⛔ ADDED BY `U1` (2026-08-30), AND THE ORDER OF THE TWO REPO CHANGES IS
+        // LOAD-BEARING. An unknown `state` returns null here, and null renders as
+        // MALFORMED — so if mcp had shipped `edge_unreadable` before this line
+        // existed, every such answer would have reached the user as a broken
+        // payload rather than as the state it is. That is strictly worse than the
+        // false negative `U1` set out to fix. This half lands FIRST, exactly as
+        // Lane A landed inert ahead of `CR-174`.
+        state !== "edge_unreadable" &&
         state !== "squash_resolved" &&
         state !== "turns") {
         return null;
@@ -669,6 +722,14 @@ function render(ctx, outcome, commit, file, json) {
             if (payload === null) {
                 return fail(ctx, errorCopy(WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, COMMANDS.why), EXIT.failure, commit);
             }
+            // ⛔ SKEW IS NOT MALFORMEDNESS. The server answered correctly and this
+            // build is too old to render it, so the user is sent to an upgrade rather
+            // than told to report a bug that does not exist. `EXIT.failure` is kept:
+            // the command genuinely produced no answer, and a caller scripting `why`
+            // must not read a skew screen as success.
+            if (isVersionSkew(payload)) {
+                return fail(ctx, errorCopy(WHY.skewWhat, WHY.skewWhy, WHY.skewFix, COMMANDS.pluginInstall), EXIT.failure, commit);
+            }
             return renderPayload(ctx, payload, commit, file, json);
         }
     }
@@ -712,6 +773,7 @@ function squashWhy(blamed, matchKind) {
 const ABSENCE_EXIT = {
     cold_start: ABSENCE.coldStart.exit,
     no_edge: ABSENCE.noEdge.exit,
+    edge_unreadable: ABSENCE.edgeUnreadable.exit,
     squash_resolved: ABSENCE.squashResolved.exit,
 };
 /**
@@ -788,6 +850,17 @@ function renderPayload(ctx, payload, commit, file, json) {
         case "no_edge":
             // `fix` is "Nothing to fix…", so there is no command to offer beside it.
             return absence(ctx, ABSENCE.noEdge, [], commit);
+        case "edge_unreadable":
+            // ⚠ THE ONE ARM THAT MUST NOT READ AS "NO SESSION". The payload says we
+            // HOLD a link and could not render the conversation behind it; `no_edge`
+            // above says the opposite. Rendering them alike would re-create, in the
+            // client, the exact conflation `U1` removed from the server — which is
+            // why this is its own arm and its own copy rather than a fall-through.
+            //
+            // No command beside it: `fix` states the two conditions that produce this
+            // (erased, or never uploaded) and neither is repaired by a verb we could
+            // offer here. Offering `connect` would imply a repair that does not exist.
+            return absence(ctx, ABSENCE.edgeUnreadable, [], commit);
         case "squash_resolved": {
             // ⚠ D65 §DR5 — BOTH SHAs render. `CR-109` owns this state and `CR-074`
             // owns the successor lookup; this renders what the payload says and builds

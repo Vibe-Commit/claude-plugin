@@ -19,6 +19,7 @@
 import { writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { createInterface } from "node:readline/promises";
+import { resolveAgentId } from "./agents/registry.js";
 import { connect } from "./commands/connect.js";
 import { off, status } from "./commands/status.js";
 import { report } from "./commands/report.js";
@@ -27,6 +28,7 @@ import { HELP, INTERNAL, USAGE } from "./copy/index.js";
 import { EXIT } from "./exit.js";
 import { runHook } from "./hooks/entry.js";
 import { runPostCommit } from "./hooks/post_commit.js";
+import { runPostRewrite } from "./hooks/post_rewrite.js";
 import { LABEL_GUTTER, renderErrorBlock, resolveColour, wrap } from "./term.js";
 import { CLIENT_VERSION } from "./version.js";
 const VERBS = ["connect", "status", "off", "why", "report"];
@@ -90,6 +92,10 @@ function interactiveContext(argv) {
         home: homedir(),
         cwd: process.cwd(),
         nodeVersion: process.versions.node,
+        // `CR-183`. Resolved from argv HERE, the same pure read the hook branch at
+        // the bottom of this file makes — `connect` needs it to know whether the
+        // agent it was told about has a way to find the running session at all.
+        agentId: resolveAgentId(argv),
         colour: resolveColour({
             env: process.env,
             isTty: process.stdout.isTTY === true,
@@ -285,15 +291,59 @@ if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
         //
         // It runs inside the user's `git commit`, so it exits 0 unconditionally and
         // writes nothing to either stream (`hooks/post_commit.ts`).
-        process.exit(runPostCommit({ home: homedir(), cwd: process.cwd() }));
+        //
+        // ⛔ `env` IS THE LADDER'S FIRST RUNG. Claude Code exports
+        // `CLAUDE_CODE_SESSION_ID` into the Bash tool's environment and git passes it
+        // through to us (`M1`), so the committing session identifies ITSELF instead of
+        // being guessed at by mtime. This is the one place the real environment is
+        // read on this path; everything below takes it as a parameter.
+        process.exit(runPostCommit({ home: homedir(), cwd: process.cwd(), env: process.env }));
     }
-    if (invocationMode(process.env, argv) === "hook") {
+    if (argv[0] === "post-rewrite") {
+        // The other hidden verb, for the same reason — and it is `post-commit`'s
+        // other half: `--amend` and `rebase` fire `post-commit` for a sha they then
+        // DESTROY (`M5`), and this is the only hook git tells about the pairing.
+        //
+        // ⛔ THE PAIRS ARRIVE ON STDIN, and it is read HERE so `hooks/post_rewrite.ts`
+        // opens nothing — the same seam that keeps every other module in this package
+        // free of a real file descriptor. ⚠ `readStdin` REUSED rather than a second
+        // synchronous reader beside it: it already resolves an `error` to `""`, and
+        // two stdin readers in one file is how the two come to disagree about what an
+        // unreadable stream means. An empty read parses to zero pairs, which is an
+        // ordinary answer rather than a failure.
+        void readStdin().then((stdin) => process.exit(runPostRewrite({
+            home: homedir(),
+            cwd: process.cwd(),
+            env: process.env,
+            // git's own `argv[1]` — `amend` or `rebase`.
+            kind: argv[1] ?? "",
+            stdin,
+        })));
+        // ⛔ `else if` FROM HERE, AND THE BRANCH ABOVE IS WHY. Reading stdin is
+        // asynchronous, so unlike `post-commit` this block RETURNS rather than
+        // exiting — and a plain `if` below would then run `main(["post-rewrite"])`
+        // synchronously, print an unknown-verb error, and put it in the terminal of
+        // someone in the middle of a `git rebase`. The contract this hook is held to
+        // is silence.
+    }
+    else if (invocationMode(process.env, argv) === "hook") {
         // `runHook` installs the contract guards before it does any work and always
         // calls `process.exit(0)`. It never returns, so nothing follows it.
         void runHook({
             env: process.env,
             home: homedir(),
             nodeVersion: process.versions.node,
+            // ⛔ `CR-183` — THE ONE PLACE THE FLAG IS READ ON THIS PATH, and it is read
+            // HERE rather than inside the hook for a structural reason: `runHook` never
+            // receives argv at all, and `parseHookInput` must not select the adapter
+            // because stdin is the input the confinement boundary exists to constrain.
+            // This is the seam that already injects `home` and `nodeVersion`.
+            //
+            // ⚠ Note what the line ABOVE this block does and does not do: resolving an
+            // id is not entering hook mode. `invocationMode` keys on `argv[0]`, so the
+            // registered command MUST lead with the `hook` verb — put the flag first
+            // and this branch is never taken.
+            agentId: resolveAgentId(argv),
             readStdin,
         });
     }

@@ -139,6 +139,65 @@ export const CONNECT = {
      * §DR7 bans, arriving as arithmetic instead of as an adjective.
      */
     consentScrubber: "A scrubber removes 12 known secret formats (AWS keys, GitHub tokens, and similar). It is a pattern list, not a general secret detector: a secret it has no pattern for is uploaded. Command output is not path-filtered.",
+    /**
+     * ⛔ **THE SECOND DATA CLASS, AND THE DISCLOSURE DID NOT MENTION IT AT ALL —
+     * `T15`, `D190`.**
+     *
+     * The three paragraphs above enumerate TRANSCRIPT CONTENT. They were the whole
+     * disclosure, and commit SHAs have gone on the wire since `CR-170` without a
+     * word here. `D190` adds two more headers, one of which is a genuinely new
+     * class, so the copy is extended rather than the send being scoped — scoping
+     * the send would gut the feature.
+     *
+     * ## ⛔ WHAT IS HERE IS MEASURED FROM `buildIngestHeaders`, NOT FROM THE PLAN
+     *
+     * | said here | header | since |
+     * |---|---|---|
+     * | the commit ID | `x-commits` | `CR-170` |
+     * | the branch name | `x-head-branch` | `CR-170` |
+     * | the session it was linked to | `x-session-id` | pre-`CR-170` |
+     * | how that link was made | `x-commit-attributions` | `D190`, NEW |
+     * | the replaced commit's ID | `x-rewrites` | `D190`, NEW |
+     *
+     * ⛔ **AND WHAT IS DELIBERATELY NOT HERE, BECAUSE IT DOES NOT LEAVE THE
+     * MACHINE.** `post_commit.ts` gathers the changed-file list and the committer
+     * date because they are free at that moment, and `capSpool` returns only
+     * `{shas, attributions, count}`. **Describing them as uploaded would be a FALSE
+     * DISCLOSURE, which is as much a claims defect as a missing one** — and it is
+     * the easier mistake, because over-disclosing feels safe.
+     *
+     * ⚠ **`SpoolEntry.branch` and `delta.head.branch` are NOT the same noun.** The
+     * per-commit one stays local; the repo's CURRENT branch goes out on every
+     * delta as `x-head-branch` (`post.ts:228`, `entry.ts:612`). The branch name is
+     * named here on the strength of the second, never the first.
+     *
+     * ## ⛔ THE REWRITE SENTENCE IS THE ONE THIS STRING EXISTS FOR
+     *
+     * `x-rewrites` carries LOCAL, UNPUSHED REWRITE HISTORY — `ancestor:successor`
+     * pairs whose ancestor is unreachable from every branch and gone after
+     * `gc --prune=now`. Telling a user "we upload your transcripts" does not cover
+     * "we upload a record of the commits you rewrote before pushing". **Someone who
+     * squashes to bury a false start is entitled to know that the false start's ID
+     * left the machine.**
+     *
+     * ⚠ *"may never have left this machine"*, not *"was never pushed"*: you can
+     * amend a commit that WAS pushed and force-push it, so the stronger sentence is
+     * false in a real case.
+     *
+     * ## ⛔ NO NEGATIVE LIST, AND THAT IS A DECISION
+     *
+     * An earlier draft closed with *"commit messages, authors, dates and the
+     * changed-file list are not uploaded."* True today (`post.ts:166-174`), and
+     * CUT: `D190 §6` says this wire has **no compiler, no schema and no shared
+     * type**, so a negative claim in shipping copy goes false the first time anyone
+     * adds a header — silently, with no gate able to see it. Positive claims only.
+     *
+     * ⚠ Opens *"Not only the transcript"* because `consentHeading` still says
+     * *"uploads your Claude Code transcripts"*, which is now narrower than the
+     * truth. Repairing the scope where a skimmer meets it; the heading itself is a
+     * bigger copy change than this task was scoped for.
+     */
+    consentCommits: "Not only the transcript. Commits you make while a session is recording are uploaded too: the commit ID, the branch name, the session it was linked to, and how that link was made. If you amend or rebase, the ID of the commit you replaced goes with them — that commit may never have left this machine, and git will eventually delete it from here.",
     /** §10.2's first labelled link. Points at `HELP.docsUrl` — one definition. */
     consentDocsLabel: "Read the full list:",
     /**
@@ -655,6 +714,41 @@ export const WHY = {
     malformedWhat: "The record service returned an answer this version cannot read.",
     malformedWhy: "The response was not in the form this version expects, so none of it was rendered rather than part of it being guessed at.",
     readFix: "Try again, and report it if it continues:",
+    /**
+     * ⛔ VERSION SKEW — DISTINCT FROM `malformed`, AND THE DISTINCTION IS THE
+     * WHOLE POINT (`U1`, 2026-08-30).
+     *
+     * `parseBlameCommitPayload` is a STRICT ALLOWLIST on `state`: a value it does
+     * not know returns null, and null rendered as "malformed". So the day the
+     * server added a state, every client older than that day told the user its
+     * ANSWER WAS BROKEN — when the answer was fine and the CLIENT was old.
+     * `edge_unreadable` is the first such addition and it would have been the
+     * first casualty.
+     *
+     * ⚠ THE ROOT CAUSE, NOT THE SYMPTOM. Without this, every future state the
+     * server adds needs a lockstep client release FOREVER, and the coupling is
+     * invisible until a user hits it — worse here than in most protocols, because
+     * the vendored bundle in `claude-plugin/bin/` lags this source (10 commits at
+     * the time of writing) so "old client" is the NORMAL case, not the edge one.
+     *
+     * ## Why this is not a sixth ABSENCE state
+     *
+     * It is not an absence. Nothing is missing from the record — the server
+     * answered, and this build cannot render what it said. Same reason the
+     * shallow-clone refusal is not one: a REFUSAL and a SKEW are both about this
+     * client's limits, and `ABSENCE` is about the record's contents.
+     *
+     * ⚠ It still follows CR-112's grammar (absence · cause · remedy), because
+     * that grammar is what makes a dead end actionable, and here — unlike most of
+     * `ABSENCE` — the remedy is real: upgrading genuinely fixes it.
+     *
+     * ⚠ THE COPY MAY NOT NAME THE STATE IT COULD NOT READ. The whole premise is
+     * that this build does not know what that value means; printing it would
+     * invite the reader to interpret a token this client cannot interpret either.
+     */
+    skewWhat: "The record service sent an answer this version is too old to show.",
+    skewWhy: "The service described this commit in a way this build does not recognise. The record itself is fine — this copy of the client cannot render it, so it showed nothing rather than guessing at part of it.",
+    skewFix: "Reinstall the VibeCommit plugin to pick up the current client, then run this again:",
     /** The bearer is dead after one refresh and one retry. Exit 3, not 1. */
     signedOutWhat: "This machine is not signed in to VibeCommit.",
     signedOutWhy: "Reading a record needs a signed-in user, and no usable sign-in was found on this machine.",
@@ -874,6 +968,50 @@ export const ABSENCE = {
         fix: "Nothing to fix. Read the session as the record of the original commit.",
         exit: EXIT.empty,
     },
+    /**
+     * 6 — EDGE UNREADABLE. ⛔ THE SET IS NOW SIX, AND THIS IS THE FIRST ADDITION.
+     * Owner: `U1` (2026-08-30). `test/copy-absence.test.ts` was updated in the
+     * same commit and its "not a sixth" cell now reads "not a seventh" — that
+     * cell is a CLOSURE TRIPWIRE, not a cap, and it did its job: this state could
+     * not be added without a reviewer being made to read why.
+     *
+     * ## ⚠ THIS IS THE ONE ABSENCE STATE THAT IS NOT AN ABSENCE OF RECORD
+     *
+     * The other five say some version of "we hold nothing here". This one says
+     * the OPPOSITE: **we hold a link for this commit and could not render the
+     * conversation behind it.** Reading it as "no session" inverts it.
+     *
+     * It exists because mcp used to return `no_edge` for this case, which
+     * reported "this repository is captured and this commit has no linked
+     * session" about a commit we demonstrably hold a link for — a false negative
+     * on the only question `why` asks. `blame.ts` now emits `edge_unreadable`
+     * and this is its rendering.
+     *
+     * ⚠ IT IS THE DIRECT-EDGE TWIN OF `squashResolved`, which already carries
+     * exactly this shape one hop later (a mapping we resolved whose evidence will
+     * not render). Same fact, different route to it. That symmetry is the reason
+     * this is a sixth state rather than a caveat note: `attributionNote`'s shape
+     * is a caveat on a screen WITH content, and this screen has none.
+     *
+     * ## ⚠ THE `fix` MAY NOT PROMISE A REPAIR
+     *
+     * CR-112 requires the remedy to say what would CHANGE the state, and here the
+     * honest answer is often "nothing the reader can do": if the turn content was
+     * erased, or was never uploaded, the evidence is gone and the link stays.
+     * Saying "re-run capture" would be a plausible-wrong-answer (D98) — it
+     * repairs neither case. So the line states the two conditions and stops.
+     *
+     * ⚠ NOT "corrupt", "lost", or "missing data" — all three are diagnoses of a
+     * cause this client did not measure. What we know is that the server held a
+     * link and returned no readable turns; the reason is the server's and is not
+     * on the wire.
+     */
+    edgeUnreadable: {
+        what: "A recorded session is linked to this commit, but its conversation could not be read.",
+        why: "The link between this commit and a session is on record. The turns behind that link came back without readable content, so there is a record here and no conversation to show for it. This is a gap in what can be displayed, not a missing link.",
+        fix: "Nothing to fix from here. Turn content can be unreadable because it was erased on request or was never uploaded, and neither is repaired by re-running capture.",
+        exit: EXIT.empty,
+    },
 };
 // ⚠ NO `ALL_ABSENCE_STATES` EXPORT HERE, DELIBERATELY. The expected set lives in
 // `test/copy-absence.test.ts`, because a list exported from this file and then
@@ -1029,6 +1167,23 @@ export const COMMANDS = {
      */
     why: "vibecommit why src/auth/session.ts:47",
     chmodCredentials: "chmod 600 ~/.vibecommit/credentials.json",
+    /**
+     * ⛔ THE INSTALL COMMAND, TRANSCRIBED FROM `claude-plugin/README.md:12` — and
+     * it is deliberately NOT an invented update verb (`U1`, 2026-08-30).
+     *
+     * The skew remedy wants "get a newer client". There is **no documented update
+     * command anywhere in this product**: grepped `claude-plugin/README.md`, its
+     * manifests, and this package — the README documents `marketplace add` and
+     * `install`, and nothing else. Printing `/plugin update vibecommit` because it
+     * reads plausibly is D98's class exactly: a command-shaped string that may not
+     * exist, handed to a user who is already stuck.
+     *
+     * So the fix line names the install command that IS documented, and
+     * `WHY.skewFix` is worded as REINSTALL rather than update, which is true of
+     * this string. ⚠ If a real update verb is ever documented, change both
+     * together — the wording and the command are one unit.
+     */
+    pluginInstall: "/plugin install vibecommit@vibecommit-capture",
 };
 /**
  * Every URL the CLI prints. Here rather than inline for the same reason as the

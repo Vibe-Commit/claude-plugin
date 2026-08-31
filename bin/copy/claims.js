@@ -202,23 +202,49 @@ export const BLOCKED_PHRASES = [
         reason: "Register: licensing REVERSED by D60/D1 — the phrase is retired and was never a description of us.",
         gate: "NEVER LIFTS — the term is retired, not gated.",
     },
+    // --- ⛔ THE `observed` FAMILY. THE GATE BELOW HAS FIRED AND THE ROWS DO NOT
+    //     LIFT. Register changelog 2026-08-21 (W20, D183/D184/D185).
+    //
+    //     These three carried *"the producer is ABSENT, not immature"* and *"None
+    //     exists (D111 §2)"* until W20, and BOTH became false when `CR-170` shipped
+    //     `observe()` in `src/hooks/post_commit.ts` — false metadata sitting on copy
+    //     that ships. This is the correction, and it is a correction of the REASON,
+    //     never of the verdict.
+    //
+    //     ⛔ THE GROUND CHANGED SPECIES; IT DID NOT GO AWAY. It was a
+    //     signed-receipts claim — copy describing a component that is not there —
+    //     and it is now an ordinary OVERCLAIM: a real component, described past its
+    //     reach. The producer observes THE COMMIT EVENT and never THE AUTHORSHIP;
+    //     these three are scoped to `why`, the one surface that answers who wrote a
+    //     line, so on THAT surface they still assert what no mechanism produces.
+    //
+    //     ⛔ A READER WHO FINDS THE GATE FIRED AND LIFTS THESE HAS READ THE GATE AND
+    //     NOT THE CLAIM. The register says so in those words. `env_session_id` — the
+    //     strongest rung the ladder can reach — is SAFE as command provenance and
+    //     STILL BLOCKED as authorship, because `git commit -a` commits a human's
+    //     working-tree edits identically.
+    //
+    //     ⚠ `phrase` and `surfaces` are DELIBERATELY UNCHANGED. `test/copy-claims.test.ts:318`
+    //     pins this projection against a hand-written list, and the register's block
+    //     is hand-synced across repos — a phrase edit here breaks a projection that
+    //     has no compiler.
     {
         phrase: "seen during the session",
         surfaces: ["why"],
-        reason: "Register: no git probe exists to have seen anything — the producer is ABSENT, not immature.",
-        gate: "A producer for the `observed` edge. None exists (D111 §2).",
+        reason: "Register: the post-commit hook sees the COMMIT EVENT, never who wrote the line; on `why` this claims the second.",
+        gate: "A mechanism that establishes AUTHORSHIP. ⛔ NOT the producer gate — that one FIRED (CR-170) and these rows stayed.",
     },
     {
         phrase: "we observed",
         surfaces: ["why"],
         reason: "Register: the same claim in the first person; the form a rewrite reaches for.",
-        gate: "A producer for the `observed` edge. None exists (D111 §2).",
+        gate: "A mechanism that establishes AUTHORSHIP. ⛔ NOT the producer gate — that one FIRED (CR-170) and these rows stayed.",
     },
     {
         phrase: "watched",
         surfaces: ["why"],
-        reason: "Register: same proposition, no registered root.",
-        gate: "A producer for the `observed` edge. None exists (D111 §2).",
+        reason: "Register: same proposition, no registered root — and `watched` adds a continuity nothing does.",
+        gate: "A mechanism that establishes AUTHORSHIP. ⛔ NOT the producer gate — that one FIRED (CR-170) and these rows stayed.",
     },
     {
         phrase: "not agent-authored",
