@@ -4,12 +4,19 @@
  *
  * ⚠ **This is not `project.ts`'s question and the two answers are not
  * interchangeable.** `resolveProjectKey()` answers "which work tree is this?"
- * with a local filesystem path, and that path is the consent key and (since
- * `CR-017d`) half the local state key — it never leaves the machine.
- * `resolveRepoSlug()` answers "which repository is this, in terms the SERVER can
- * resolve?" and its value goes on the wire as `X-Repo-Slug`. Conflating them
- * would put an absolute path from a developer's laptop into a tenant-scoped
- * lookup, so they stay separate functions with separate return shapes.
+ * with a local filesystem path, and that path is (since `CR-017d`) half the
+ * local state key — it never leaves the machine. `resolveRepoSlug()` answers
+ * "which repository is this, in terms the SERVER can resolve?" and its value
+ * goes on the wire as `X-Repo-Slug`. Conflating them would put an absolute path
+ * from a developer's laptop into a tenant-scoped lookup, so they stay separate
+ * functions with separate return shapes.
+ *
+ * ⛔ **THIS PARAGRAPH USED TO CALL THAT PATH "THE CONSENT KEY" TOO, AND `D184`
+ * MADE THAT FALSE.** The consent gate now keys on the canonicalised git COMMON
+ * DIR — `resolveProjectKeys(dir).consent` — and `resolveProjectKey`'s own
+ * docblock says so in terms (`project.ts:197`). Corrected here rather than left
+ * standing, because this is the paragraph a reader meets first and it was
+ * teaching the retired model.
  *
  * ## The contract this must satisfy, read from the merged server, not inferred
  *
@@ -41,6 +48,23 @@
  * at worst. On the wire, one identity is simply true — two worktrees of one
  * repository ARE one repository, and minting two would fragment the audit record
  * of a single repo.
+ *
+ * ⛔ **THE SPLIT IS NOW THE STATE BUCKET'S ALONE, AND IT USED TO BE EVERYTHING'S
+ * (`D184`).** Read the paragraph above as being about the OFFSET LEDGER, because
+ * that is all it still governs. Consent no longer follows the toplevel: it keys
+ * on the git common dir, which a main clone and every worktree linked to it
+ * SHARE. So the two statements a reader is likely to run together are now
+ * opposites — two worktrees are **two** state buckets and **one** consent
+ * grant — and the `CR-017d`/D58 reasoning above is kept verbatim because it is
+ * still exactly right about the half it was written for.
+ *
+ * ⚠ **The reason they moved apart is the same fact seen from two sides.** A
+ * per-worktree consent key made an agent session inside a `git worktree` capture
+ * NOTHING, silently, while `D19` makes worktree-per-builder the house convention
+ * — so sharing was the fix. A per-worktree state key is what stops two work
+ * trees applying each other's byte offsets — so separating is the fix. One
+ * value could not do both, and `project.ts` is where the two are produced
+ * together precisely so taking the wrong one has to be deliberate.
  *
  * The one reachable oddity: two worktrees driven by ONE Claude Code session (so,
  * one `session_id`) would keep two independent client ledgers against a single

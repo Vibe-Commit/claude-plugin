@@ -18,9 +18,11 @@
  * @provenance vibecommit-mcp src/conversation/ingest_session.ts — wire shape, retyped
  */
 import { createHash } from "node:crypto";
+import { agentForTranscript } from "./agents/registry.js";
+import { UNKNOWN_AGENT_ID } from "./agents/types.js";
 import { classify, markDelivered, markHeld, markSkipped, nextSpan, resolveCaps, } from "./policy.js";
 import { fileState, isStopped, loadSessionState, saveSessionState, withFileState, } from "./state.js";
-import { dropSpooled } from "./spool.js";
+import { dropRewrites, dropSpooled } from "./spool.js";
 import { CLIENT_VERSION, CLIENT_VERSION_HEADER } from "./version.js";
 /** Production data plane. Overridable for tests and for a self-hosted server. */
 export const DEFAULT_INGEST_URL = "https://api.vibecommit.ai/ingest/v1/session";
@@ -84,6 +86,39 @@ export function buildIngestHeaders(credential, delta) {
         "x-repo-slug": delta.repoSlug,
         [CLIENT_VERSION_HEADER.toLowerCase()]: CLIENT_VERSION,
     };
+    // ⛔ OMITTED ON `unknown`, AND THE OMISSION IS THE POINT — not a tidier way of
+    // saying the same thing.
+    //
+    // The server keeps ABSENT and `unknown` apart deliberately, and its own
+    // comment says the header's parsed type is nullable *because* of this guard:
+    // an absent header leaves a stream's pinned agent alone, while a PRESENT
+    // header resolves and is compared — and `unknown` resolves to `unknown`, which
+    // disagrees with any non-`unknown` pin. That disagreement is not a rejection;
+    // it drops the stream's buffered `tail_records` and re-pins, which SHEDS THE
+    // IN-FLIGHT TURN (D164 §4's mismatch-as-rewind).
+    //
+    // ⛔ So sending `unknown` would manufacture exactly the disagreement the
+    // nullable type exists to prevent. A stream that resolves cleanly on delta 1
+    // and becomes ambiguous later — a second root appearing, an env var set in one
+    // shell and not the next, a symlink flipped — would shed a turn on every flip.
+    // Omitting cannot: it says nothing, and nothing cannot disagree.
+    //
+    // ⚠ **NOT "silently", and the correction is worth its line**: the server
+    // ECHOES `agent_rewind` in the ingest 200 body (D169 §1), so the RE-PIN is
+    // reported. What is NOT reported is the shed itself. ⚠ And nothing on this
+    // side reads either — `send()` parses a body only on a non-2xx. So the case
+    // against sending rests on the turn being LOST, not on the loss being
+    // invisible; a designed, reported rewind (D164 §4) is survivable, and this
+    // client would simply be causing them for no gain.
+    //
+    // ⚠ On a genuinely ambiguous FIRST delta the two are indistinguishable — the
+    // bind writes `unknown` either way. There is no case where sending wins, and
+    // one class where it loses, so the header is conditional.
+    //
+    // This is also this function's existing idiom, four lines below: OMITTED,
+    // never sent empty; an absent header is unambiguously "nothing to say".
+    if (delta.agent !== UNKNOWN_AGENT_ID)
+        headers["x-agent"] = delta.agent;
     // ⚠ OMITTED, never sent empty. A blank header is a value the server has to
     // have an opinion about; an absent one is unambiguously "nothing to say", and
     // an empty repository genuinely has nothing to say here.
@@ -92,8 +127,41 @@ export function buildIngestHeaders(credential, delta) {
         if (delta.head.branch !== null)
             headers["x-head-branch"] = delta.head.branch;
     }
-    if (delta.commits !== undefined && delta.commits.length > 0) {
-        headers["x-commits"] = delta.commits.join(",");
+    // ⛔⛔ THE WIRE CONTRACT, AND EVERY WAY OF GETTING IT WRONG IS SILENT IN BOTH
+    // DIRECTIONS (`D190`). Three header names and two separators, agreed between
+    // two repositories with NO COMPILER, NO SCHEMA AND NO SHARED TYPE spanning the
+    // seam. Name it `x-commit-attribution` (singular), join with `;`, or emit the
+    // pairs as `ancestor,successor`, and you get a green client suite, a green
+    // server suite, a 200 response, and ZERO EDGES FOREVER. Nothing goes red
+    // anywhere. `test/wire-attribution.test.ts` types these literals a second time
+    // rather than importing them, because a cell that round-trips this code's own
+    // constant proves only that it equals itself.
+    //
+    // ⛔ THE TWO LISTS ARE SENT TOGETHER OR NOT AT ALL, AND THEY ARE THE SAME
+    // LENGTH. `parseObservedCommits` returns `[]` — the ENTIRE BATCH, not the odd
+    // entry — when `rungs.length !== shas.length`. `capSpool` builds them in one
+    // loop so they cannot disagree; this line refuses to send them if they somehow
+    // do, because a batch dropped server-side is invisible and a batch not sent is
+    // retried by the next hook.
+    //
+    // ⚠ NO RUNG, NO EDGE (`D190 §2`) is why the guard is a REFUSAL rather than a
+    // fallback to `x-commits` alone: the server treats a commit with no attribution
+    // as a PRE-LADDER client's mtime guess and writes nothing, so sending the shas
+    // bare would be a slower road to the same zero, with a spool truncated on the
+    // 2xx as though it had worked.
+    const observed = delta.commits;
+    if (observed !== undefined && observed.shas.length > 0) {
+        if (observed.shas.length === observed.attributions.length) {
+            headers["x-commits"] = observed.shas.join(",");
+            headers["x-commit-attributions"] = observed.attributions.join(",");
+        }
+    }
+    // ⚠ Same idiom as every other conditional header here: OMITTED, never sent
+    // empty. `parseRewritePairs` drops silently on a wrong separator, a third
+    // colon-field, a bad sha or a self-pair, so the spelling is fixed by
+    // `capSuccessors` and asserted literally by the wire cell.
+    if (delta.rewrites !== undefined && delta.rewrites.length > 0) {
+        headers["x-rewrites"] = delta.rewrites.join(",");
     }
     return headers;
 }
@@ -254,8 +322,14 @@ export async function deliver(ctx, eof, readBody) {
         byteOffset: span.from,
         fileKey: ctx.fileKey,
         repoSlug: ctx.repoSlug,
+        // ⛔ THE ONE PLACE THE WIRE AGENT IS DECIDED — from the containing
+        // registry root, never from the flag (D177 §7). Per delivery rather than
+        // per hook: a delegated stream is a file in its own right, and the root
+        // that contains it is what names its producer.
+        agent: agentForTranscript(ctx.home, ctx.env, ctx.transcriptPath),
         head: ctx.head,
         commits: ctx.commits,
+        rewrites: ctx.rewrites,
     }), body, ctx.timeoutMs);
     const disposition = classify(outcome);
     const caps = resolveCaps(ctx.env);
@@ -267,8 +341,17 @@ export async function deliver(ctx, eof, readBody) {
             // so a commit survives a 500, a timeout and a `later` and is retried by
             // the next hook. Dropping on READ would lose it permanently to one bad
             // response, and `capture_commits` rows can never be retracted (D105/D108).
-            if (ctx.commits !== undefined && ctx.commits.length > 0) {
-                dropSpooled(ctx.home, key, ctx.commits.length);
+            //
+            // ⛔ `count`, NEVER `shas.length`. `dropSpooled` drops the FIRST N LINES,
+            // and a HELD line is consumed without being sent — so truncating by the
+            // number of shas on the wire would delete the held line at the head and
+            // leave the delivered commit to be re-sent on every hook, forever.
+            if (ctx.commits !== undefined && ctx.commits.count > 0) {
+                dropSpooled(ctx.home, key, ctx.commits.count);
+            }
+            // The rewrite spool is its own file with its own cap, so its own drop.
+            if (ctx.rewrites !== undefined && ctx.rewrites.length > 0) {
+                dropRewrites(ctx.home, key, ctx.rewrites.length);
             }
             break;
         case "later":

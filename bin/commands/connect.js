@@ -22,21 +22,19 @@
  *
  * @provenance vibecommit-mcp src/oauth/ingest_credential.ts — no route mints one, verified
  */
-import { readdirSync, statSync } from "node:fs";
-import { basename, join } from "node:path";
 import { CONNECT, COMMANDS, COMMIT_HOOK, ERRORS, HELP, PATH_CLASH, RUNTIME, SIGNIN, URLS, } from "../copy/index.js";
+import { dialectFor } from "../agents/registry.js";
 import { grantProject, isAffirmative, isProjectAllowed } from "../consent.js";
 import { loadCredential } from "../credential.js";
 import { EXIT } from "../exit.js";
 import { resolveRepoSlug } from "../git.js";
-import { readSpan, DEFAULT_HOOK_BUDGET_MS } from "../hooks/entry.js";
+import { confinementRoots, readSpan, DEFAULT_HOOK_BUDGET_MS } from "../hooks/entry.js";
 import { classifyInstall, installPostCommitHook } from "../install.js";
 import { mcpUrl } from "../oauth/discovery.js";
 import { loadSession } from "../oauth/session.js";
 import { openBrowser, signIn } from "../oauth/signin.js";
-import { isInside, transcriptRoot } from "../paths.js";
 import { CAPTURE_NOT_APPROVED, deliver, ingestUrl, } from "../post.js";
-import { resolveProjectKey } from "../project.js";
+import { resolveProjectKeys } from "../project.js";
 import { meetsNodeFloor, NODE_FLOOR_TEXT } from "../runtime.js";
 import { paint, renderErrorBlock, truncatePath, wrap } from "../term.js";
 import { writeLines } from "./context.js";
@@ -55,17 +53,25 @@ export async function connect(ctx, options = {}) {
         }, ctx.colour));
         return EXIT.failure;
     }
-    // (2) A project key is the git toplevel. Outside a work tree there is nothing
-    // to consent ABOUT, and inventing a key from cwd would grant consent to
-    // something the user cannot see in `status`.
-    const projectKey = resolveProjectKey(ctx.cwd);
-    if (projectKey === null) {
+    // (2) BOTH KEYS (`D184 §1`). Outside a work tree there is nothing to consent
+    // ABOUT, and inventing a key from cwd would grant consent to something the
+    // user cannot see in `status`.
+    //
+    // ⛔ THE GRANT BELOW IS THE ONLY WRITER OF THE ALLOW LIST, so this verb decides
+    // what every gate can ever match. It writes `keys.consent` — the git common
+    // dir — which is what admits the worktrees of this clone as well as the clone
+    // itself. Granting the toplevel here while `entry.ts` and `post_commit.ts`
+    // check the common dir is a TOTAL, SILENT capture outage in every repository
+    // (`D184 §9`), and no cell that grants and checks through one helper can see
+    // it.
+    const keys = resolveProjectKeys(ctx.cwd);
+    if (keys === null) {
         writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", what: ERRORS.notAGitRepo, why: [] }, ctx.colour));
         return EXIT.failure;
     }
-    if (isProjectAllowed(ctx.home, projectKey)) {
+    if (isProjectAllowed(ctx.home, keys.consent)) {
         writeLines(ctx.stdout, wrap(CONNECT.alreadyConnected, 2));
-        return await afterConsent(ctx, projectKey, options);
+        return await afterConsent(ctx, keys, options);
     }
     // (3) The disclosure, then the gate.
     writeLines(ctx.stdout, disclosure(ctx));
@@ -89,8 +95,8 @@ export async function connect(ctx, options = {}) {
         // Declining is a successful consent flow, not a failure. Exit 0 (§13.7).
         return EXIT.ok;
     }
-    grantProject(ctx.home, projectKey, ctx.now());
-    return await afterConsent(ctx, projectKey, options);
+    grantProject(ctx.home, keys.consent, ctx.now());
+    return await afterConsent(ctx, keys, options);
 }
 /**
  * Consent is settled. Sign in if asked, then do the credential beat.
@@ -101,13 +107,13 @@ export async function connect(ctx, options = {}) {
  * A failure in one says nothing about the other — which is why a failed sign-in
  * returns here rather than falling through to report the install as fine.
  */
-async function afterConsent(ctx, projectKey, options) {
+async function afterConsent(ctx, keys, options) {
     if (options.signIn === true) {
         const code = await signInBeat(ctx);
         if (code !== EXIT.ok)
             return code;
     }
-    return await credentialBeat(ctx, projectKey);
+    return await credentialBeat(ctx, keys);
 }
 /**
  * The browser sign-in beat — `CR-084d`.
@@ -180,9 +186,10 @@ function signInError(ctx, what, why, fixLabel = SIGNIN.noServerFix) {
 /**
  * The disclosure block — `CR-111d`, style guide §10.2 transcribed.
  *
- * Three paragraphs and two labelled links: what is uploaded, what that means
- * concretely, and the scrubber's STATED LIMIT — then the docs list and the
- * public bundle.
+ * FOUR paragraphs and two labelled links: what is uploaded, what that means
+ * concretely, the scrubber's STATED LIMIT, and — `T15` — the COMMITS, which are
+ * a second data class the first three never mentioned. Then the docs list and
+ * the public bundle.
  *
  * ⚠ The rules it satisfies that no gate can check (§10.2 rules 3-6): every noun
  * names something actually uploaded IN THE USER'S VOCABULARY (*"the output of
@@ -205,6 +212,14 @@ function disclosure(ctx) {
         "",
         ...wrap(CONNECT.consentScrubber, 2),
         "",
+        // ⛔ THE SECOND DATA CLASS (`T15`, `D190`). The three paragraphs above are
+        // TRANSCRIPT CONTENT and were the whole disclosure; commit SHAs have been on
+        // the wire since `CR-170` with no word here, and `D190` adds the attribution
+        // rung and LOCAL, UNPUSHED REWRITE HISTORY. Placed AFTER the scrubber so the
+        // transcript thread — what is uploaded, then that its secret scrubbing has a
+        // stated limit — is not split by a different subject.
+        ...wrap(CONNECT.consentCommits, 2),
+        "",
         // Both URLs have ONE definition each, in the copy module. `accent` is
         // allowed on a URL (§13.1) and neither line carries a second colour.
         `  ${CONNECT.consentDocsLabel.padEnd(gutter)}${paint(ctx.colour, "accent", HELP.docsUrl)}`,
@@ -226,10 +241,10 @@ function disclosure(ctx) {
  * name, and on npm >= 7 the clash surfaces as EEXIST during the first install of
  * exactly the population that installs commit tooling.
  */
-async function credentialBeat(ctx, projectKey) {
+async function credentialBeat(ctx, keys) {
     const load = loadCredential({ env: ctx.env, home: ctx.home });
     if (load.kind === "ok") {
-        return await captureBeat(ctx, projectKey, load.credential);
+        return await captureBeat(ctx, keys, load.credential);
     }
     writeLines(ctx.stderr, renderErrorBlock({
         kind: "warn",
@@ -254,9 +269,24 @@ async function credentialBeat(ctx, projectKey) {
  *   - **`Opening your browser to sign in...`.** That beat is the oauth lane's.
  *     Until PKCE lands, `VIBECOMMIT_TOKEN` is the supported path.
  */
-async function captureBeat(ctx, projectKey, credential) {
-    const found = findCurrentTranscript(ctx, projectKey);
-    if (found === null) {
+async function captureBeat(ctx, keys, credential) {
+    // ⚠ EVERY USE BELOW BUT ONE IS THE TOPLEVEL ROLE — locating the transcript,
+    // the `repoKey` binding, the slug, the hook install and the copy the user
+    // reads. The exception is the redaction root set at `readSpan`, which takes
+    // BOTH keys through `confinementRoots`. Aliased rather than renamed
+    // throughout, so the diff shows the line whose ROLE changed and not fourteen
+    // that did not.
+    const projectKey = keys.worktree;
+    // ⛔ SKIPPED ENTIRELY ON A DIALECT WITH NO LOCATOR — `CR-183`. `connect` is
+    // typed by a human and is handed no `transcript_path`, so finding the running
+    // session is a per-agent capability rather than something this verb can do.
+    // The absence is a real answer and not a gap to fill: the available fallback
+    // is reading a `cwd` out of the transcript's own records, which is ANALYSIS
+    // and D60 §D6 forbids it. The refusal below would also be a false statement —
+    // it names Claude Code, and this is not that agent.
+    const locate = dialectFor(ctx.agentId).locateCurrentTranscript;
+    const found = locate === undefined ? null : locate(ctx.home, ctx.env, projectKey);
+    if (locate !== undefined && found === null) {
         writeLines(ctx.stderr, renderErrorBlock({
             kind: "warn",
             what: CONNECT.noTranscriptWhat,
@@ -268,7 +298,7 @@ async function captureBeat(ctx, projectKey, credential) {
     }
     const url = ingestUrl(ctx.env);
     let delivery = null;
-    if (url !== null) {
+    if (found !== null && url !== null) {
         // Through `deliver()`, so the offset ledger, the failure policy and
         // `CR-024d`'s redaction all apply exactly as they do for a hook. A second
         // upload path here would bypass all three.
@@ -281,9 +311,28 @@ async function captureBeat(ctx, projectKey, credential) {
             repoSlug: resolveRepoSlug(projectKey),
             sessionId: found.sessionId,
             fileKey: "main",
+            // ⛔ The LOCATED path (`CR-204`), so this test capture names its producer
+            // on the wire exactly as a hook's would — and names it the same way,
+            // from the root that contains the file rather than from `ctx.agentId`.
+            // ⚠ The LOCATOR above is still the flag's: `connect` is looking FOR a
+            // transcript, so there is no path yet to ask a root about.
+            transcriptPath: found.path,
             timeoutMs: DEFAULT_HOOK_BUDGET_MS,
             nowMs: ctx.now().getTime(),
-        }, found.size, (from, to) => readSpan(found.path, from, to, projectKey));
+        }, found.size, 
+        // ⛔ THE ROOT SET, and it is `confinementRoots` — THE SAME FUNCTION THE
+        // HOOK PATH CALLS (`entry.ts`), not a set built here. `D184 §3`: the
+        // confinement root is `[worktree, mainToplevel]` and the consent key is
+        // NEVER a member, so this does not follow the flip above.
+        //
+        // ⚠ WHY IT CANNOT STAY THE SINGLETON IT WAS: `connect` runs in whatever
+        // cwd a human typed it in, which is reachable from inside a worktree. With
+        // one root, this preview would redact main-clone content that the hook
+        // path transmits — the two would disagree SILENTLY, and the preview is the
+        // artefact the user reads to decide whether redaction works. `isInside`
+        // fail-closes an unresolvable path to REDACT, so the disagreement shows up
+        // as a plausible, well-formed, emptier payload rather than an error.
+        (from, to) => readSpan(found.path, from, to, confinementRoots(keys), ctx.home, ctx.env));
     }
     // THE FIFTH BEAT — `CR-110`, D65 §DR6, D81.
     //
@@ -413,64 +462,6 @@ function approvalPendingBeat(ctx, projectKey, ownersNotified) {
     // The PATH clash still runs — it is about the verbs a human types and is
     // orthogonal to whether capture is approved. It can still exit 1.
     return pathClash(ctx);
-}
-/**
- * The transcript for the session running right now.
- *
- * A hook is HANDED `transcript_path` on stdin. `connect` is typed by a human and
- * gets nothing, so it has to find one: Claude Code stores transcripts at
- * `<transcriptRoot>/<encoded-project-path>/<session-id>.jsonl`, where the
- * encoding replaces `/` and `.` with `-`. That was derived by comparing every
- * directory on this machine against the `cwd` its transcripts record — 15 of 17
- * matched exactly, and both misses were sessions whose `cwd` MOVED mid-session,
- * not a different encoding.
- *
- * Which is also why this looks up the directory for THIS project rather than
- * taking the newest transcript anywhere: a session that started in another
- * project and `cd`'d here lives under that project's directory, and uploading it
- * would attach one project's session to another's repo — the same confusion
- * `CR-017d`'s key exists to prevent.
- *
- * **Confined.** `isInside(transcriptRoot(...))` gates the result, because this is
- * a NEW reader of transcript bytes and `/cso` finding 1 is about exactly this
- * class of read. A candidate that resolves outside the root is not returned.
- */
-function findCurrentTranscript(ctx, projectKey) {
-    const root = transcriptRoot(ctx.home, ctx.env);
-    const dir = join(root, projectKey.replace(/[/.]/g, "-"));
-    let entries;
-    try {
-        entries = readdirSync(dir);
-    }
-    catch {
-        return null;
-    }
-    let best = null;
-    for (const entry of entries) {
-        if (!entry.endsWith(".jsonl"))
-            continue;
-        const path = join(dir, entry);
-        if (!isInside(root, path))
-            continue;
-        let stat;
-        try {
-            stat = statSync(path);
-        }
-        catch {
-            continue;
-        }
-        if (!stat.isFile() || stat.size === 0)
-            continue;
-        if (best === null || stat.mtimeMs > best.mtime) {
-            best = {
-                path,
-                sessionId: basename(entry, ".jsonl"),
-                size: stat.size,
-                mtime: stat.mtimeMs,
-            };
-        }
-    }
-    return best === null ? null : { path: best.path, sessionId: best.sessionId, size: best.size };
 }
 /**
  * Does the `vibecommit` a user types belong to us? — `DESIGN.md` §13.6's worked

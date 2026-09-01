@@ -11,8 +11,29 @@
  *   1. **The default is `N`.** A consent prompt whose default is yes is not a
  *      consent prompt.
  *   2. **Non-TTY refuses**, with exit 2 (DESIGN.md §13.7). Never proceed.
- *   3. Storage is an allow list keyed on the git toplevel — absence is a NO.
+ *   3. Storage is an allow list keyed on the CONSENT KEY — absence is a NO.
  *      Nothing here can fail open: every error path returns "not allowed".
+ *
+ * ## ⛔ The key is `resolveProjectKeys(dir).consent`, NOT the git toplevel (D184)
+ *
+ * A toplevel key differs per `git worktree`, and with no wildcards and
+ * absence-means-no that meant an agent session inside a worktree captured
+ * **nothing** — silently, by design, because an unconsented repo must not nag.
+ * The consent key is the canonicalised git COMMON DIR instead: shared by a main
+ * clone and every worktree linked to it, and `M2` shows the post-commit install
+ * already had that same reach.
+ *
+ * ⛔ **This file stays key-agnostic — it stores the string it is given.** The
+ * canonicalisation that stops `.git` from being every main clone's key lives in
+ * `project.ts` where the value is produced, because a key is only as good as the
+ * one place that can mint it. What changes here is the CONTRACT: callers pass
+ * `.consent`, and the parameter is named for it so a toplevel passed by habit
+ * reads wrong at the call site.
+ *
+ * ⚠ **No migration for allow lists written under the old key**, and that is a
+ * decision rather than an omission: pre-launch there are zero users and zero
+ * rows (`project_pre_launch_no_data`), so there is nothing to migrate. See
+ * `resolveProjectKeys`.
  */
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
@@ -48,31 +69,31 @@ export function readAllowList(home) {
     }
 }
 /** Absence is a NO. There is no wildcard and no "all projects" key. */
-export function isProjectAllowed(home, projectKey) {
-    if (projectKey === null)
+export function isProjectAllowed(home, consentKey) {
+    if (consentKey === null)
         return false;
-    return Object.prototype.hasOwnProperty.call(readAllowList(home), projectKey);
+    return Object.prototype.hasOwnProperty.call(readAllowList(home), consentKey);
 }
 /** Record consent for one project. 0700 on the directory, 0600 on the file. */
-export function grantProject(home, projectKey, now) {
+export function grantProject(home, consentKey, now) {
     const path = projectsPath(home);
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     chmodSync(rootDir(home), 0o700);
     const next = {
         ...readAllowList(home),
-        [projectKey]: { at: now.toISOString() },
+        [consentKey]: { at: now.toISOString() },
     };
     writeFileSync(path, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
     // writeFileSync's `mode` is ignored when the file already exists.
     chmodSync(path, 0o600);
 }
 /** Revoke consent for one project (`vibecommit off`). */
-export function revokeProject(home, projectKey) {
+export function revokeProject(home, consentKey) {
     const current = readAllowList(home);
-    if (!Object.prototype.hasOwnProperty.call(current, projectKey))
+    if (!Object.prototype.hasOwnProperty.call(current, consentKey))
         return false;
     const next = { ...current };
-    delete next[projectKey];
+    delete next[consentKey];
     const path = projectsPath(home);
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     writeFileSync(path, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });

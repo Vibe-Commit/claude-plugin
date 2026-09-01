@@ -33,9 +33,10 @@
  * `TODOS[87]`'s watchdog does not exist here to be defeated.
  */
 import { EXIT } from "../exit.js";
+import { DEFAULT_AGENT_ID, dialectFor } from "../agents/registry.js";
 import { isProjectAllowed } from "../consent.js";
 import { gitProbe, headRef } from "../git.js";
-import { resolveProjectKey } from "../project.js";
+import { resolveProjectKeys } from "../project.js";
 import { activeSessionFor, appendSpool } from "../spool.js";
 /**
  * Observe the commit that just happened, or do nothing.
@@ -56,25 +57,52 @@ export function runPostCommit(ctx) {
     return EXIT.ok;
 }
 export function observe(ctx) {
-    const toplevel = resolveProjectKey(ctx.cwd);
-    if (toplevel === null)
+    // ⛔ BOTH KEYS, AND ONLY ONE OF THE SIX USES BELOW MOVES (`D184 §1`). The
+    // consent gate keys on the git COMMON DIR; the session bucket, the `repoKey`
+    // and every `git -C` in this function stay on the worktree TOPLEVEL. They were
+    // one value until `D184` and the variable name did not change, so read what
+    // each line DOES with it — `resolveProjectKeys` exists so taking the wrong one
+    // has to be deliberate.
+    //
+    // ⚠ +1 spawn on git's own process, accepted on the record (`D184 §6`): this
+    // hook arms no spawn budget (`:30-33`), so the probe takes its own 5s ceiling
+    // and the watchdog `TODOS[87]` defeats does not exist on this path.
+    const keys = resolveProjectKeys(ctx.cwd);
+    if (keys === null)
         return false;
+    const toplevel = keys.worktree;
     // ⛔ THE CONSENT GATE, on the same key the Claude Code hook uses. A repo the
     // user declined must not have its commits recorded either.
-    if (!isProjectAllowed(ctx.home, toplevel))
+    //
+    // ⛔ IT IS `keys.consent` OR THE COMMIT GATE IS A HALF-FLIP. `entry.ts` checks
+    // the common dir and `connect` grants it; a `post_commit` still checking the
+    // toplevel would refuse every commit in every repository — silently, because
+    // silence is this file's whole contract — while transcript capture worked
+    // fine. That asymmetry is invisible to any cell that grants and checks through
+    // one helper (`D184 §9`).
+    if (!isProjectAllowed(ctx.home, keys.consent))
         return false;
-    // ⛔ THE SESSION GATE — the one that keeps a HUMAN'S commit out. `post-commit`
-    // fires for every commit in this work tree, including ones no agent was
-    // involved in. A commit they did not write, linked forever, is the harm.
-    const sessionId = activeSessionFor(ctx.home, toplevel);
-    if (sessionId === null)
+    // ⛔ THE SESSION GATE — WHICH SESSION, NOT WHOSE HANDS.
+    //
+    // ⚠ **This comment used to say it is "the one that keeps a HUMAN'S commit
+    // out", and that has been FALSE since `CR-170` shipped** — not since D5, and
+    // not because of the ladder. `activeSessionFor` gates on a session being active
+    // in this clone and has never inspected authorship; the paragraph three lines
+    // below already said so, in this same file, about this same hook. Corrected as
+    // a comment fix.
+    //
+    // What the gate really does is refuse when no capture session is live here, and
+    // — since the ladder — SAY HOW IT DECIDED. `sole_live_session` still writes for
+    // a human's commit in a clone with one live session, exactly as it did at HEAD.
+    const active = activeSessionFor(ctx.home, toplevel, envSessionId(ctx.env));
+    if (active === null)
         return false;
     const head = headRef(toplevel);
     // No HEAD means a repository with no commits, which cannot be the state
     // immediately after one — so this is a git we could not read, not a case.
     if (head === null)
         return false;
-    return appendSpool(ctx.home, { repoKey: toplevel, sessionId }, {
+    return appendSpool(ctx.home, { repoKey: toplevel, sessionId: active.sessionId }, {
         sha: head.sha,
         branch: head.branch,
         at: committedAt(toplevel),
@@ -83,7 +111,32 @@ export function observe(ctx) {
         // would need the repository. It stays in the spool for wave 2 and never
         // reaches a header (`CR-170` §4).
         files: changedFiles(toplevel),
+        // ⛔ RECORDED AT OBSERVATION TIME, because the evidence expires. By the
+        // time the next hook delivers this line, the environment belonged to a
+        // process that has exited and the mtimes have all moved on — the rung
+        // could not be re-derived from anything then, only re-guessed.
+        attribution: active.attribution,
     });
+}
+/**
+ * The committing session's own id, or null.
+ *
+ * ⛔ **THE DIALECT ANSWERS, NOT THIS FILE.** `sessionIdFromEnv` is a required
+ * member precisely so a new agent has to declare its own variable rather than
+ * inherit a guess (`D3`), and reading `CLAUDE_CODE_SESSION_ID` here would put a
+ * second, quieter copy of that knowledge outside the registry.
+ *
+ * ⚠ **`DEFAULT_AGENT_ID`, because git hands this hook no `--agent=` flag** — the
+ * installed script is `vibecommit post-commit`, with no argv to read. Asking
+ * every dialect instead would be identical today (the other two answer `null`,
+ * UNMEASURED) and would invent a precedence rule nobody has needed yet.
+ *
+ * ⚠ A value from the WRONG agent is survivable by construction: the ladder's
+ * first rung requires a live state file to agree with it, and an id that
+ * corroborates nothing drops to the HOLD rung rather than naming anyone.
+ */
+function envSessionId(env) {
+    return dialectFor(DEFAULT_AGENT_ID).sessionIdFromEnv(env);
 }
 /** git's own `%cI` — strict ISO-8601, the committer date. */
 function committedAt(dir) {

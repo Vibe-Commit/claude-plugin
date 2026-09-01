@@ -30,19 +30,29 @@ import { loadCredential } from "../credential.js";
 import { EXIT } from "../exit.js";
 import { resolveRepoSlug } from "../git.js";
 import { emitJson } from "../json.js";
-import { resolveProjectKey } from "../project.js";
+import { resolveProjectKeys } from "../project.js";
 import { lastSendForRepo } from "../state.js";
 import { LABEL_GUTTER, WRAP_COLUMNS, glyph, labelled, paint, renderErrorBlock, truncatePath, wrap, } from "../term.js";
 import { writeLines } from "./context.js";
 /** §10.3 indents the gutter rows four columns under the state line. */
 const ROW_INDENT = 4;
 export function status(ctx, argv = []) {
-    const projectKey = resolveProjectKey(ctx.cwd);
-    if (projectKey === null) {
+    // ⛔ THIS SCREEN USES BOTH ROLES AT ONCE (`D184 §1`), which is why the whole
+    // function is not flipped: `on` below is CONSENT STATE and keys on the git
+    // common dir, while the repo row, the send scan and the `--json` document are
+    // REPO IDENTITY and stay on the worktree toplevel. The `--json` field is
+    // literally named `toplevel`, so moving it would make the document lie.
+    const keys = resolveProjectKeys(ctx.cwd);
+    if (keys === null) {
         writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", what: ERRORS.notAGitRepo, why: [] }, ctx.colour));
         return EXIT.failure;
     }
-    const on = isProjectAllowed(ctx.home, projectKey);
+    const projectKey = keys.worktree;
+    // ⛔ CONSENT STATE, on the common dir. A worktree of a consented clone must
+    // report ON here, because the hook that runs there is now admitted — a
+    // `status` still keyed on the toplevel would tell that user they are
+    // disconnected while their session was being captured.
+    const on = isProjectAllowed(ctx.home, keys.consent);
     const kind = on ? "ok" : "warn";
     const lines = [
         `  ${paint(ctx.colour, kind, glyph(ctx.colour, kind))} ${paint(ctx.colour, "strong", on ? STATUS.onForRepo : STATUS.offForRepo)}`,
@@ -158,12 +168,18 @@ function actionLines(ctx, on) {
     });
 }
 export function off(ctx) {
-    const projectKey = resolveProjectKey(ctx.cwd);
-    if (projectKey === null) {
+    const keys = resolveProjectKeys(ctx.cwd);
+    if (keys === null) {
         writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", what: ERRORS.notAGitRepo, why: [] }, ctx.colour));
         return EXIT.failure;
     }
-    const changed = revokeProject(ctx.home, projectKey);
+    // ⛔ THE REVOKE SIDE, AND IT MUST DELETE THE KEY `connect` WROTE (`D184 §9`).
+    // `revokeProject` deletes by exact string and reports `false` when the key is
+    // absent — so a revoke still keyed on the toplevel would find nothing, print
+    // "already off", and LEAVE THE GRANT IN PLACE. The user believes they
+    // withdrew consent; capture continues. That is the worse direction of this
+    // same bug, and it is the second mutation the cells below pin.
+    const changed = revokeProject(ctx.home, keys.consent);
     writeLines(ctx.stdout, [
         ...wrap(changed ? OFF.done : OFF.alreadyOff, 2),
         ...wrap(OFF.note, 2),
