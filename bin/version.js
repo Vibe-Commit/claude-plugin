@@ -11,7 +11,7 @@
  * fields on disk (D58 plan §ER5/§ER14). This constant plus the skew check is the
  * whole fix: one source, asserted equal to the manifest and to the release tag.
  */
-export const CLIENT_VERSION = "0.1.0";
+export const CLIENT_VERSION = "0.2.0";
 /** Header name for the wire contract. */
 export const CLIENT_VERSION_HEADER = "X-Client-Version";
 //# sourceMappingURL=version.js.map

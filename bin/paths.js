@@ -457,4 +457,42 @@ function sanitise(value) {
     const cleaned = value.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 128);
     return cleaned === "" || /^\.+$/.test(cleaned) ? "_" : cleaned;
 }
+/**
+ * ⛔ **WHERE EACH AGENT'S HOOK CONFIG LIVES — `CR-195`/U4b, D205.**
+ *
+ * A sibling set to the `*TranscriptRoot` functions above, and separate from them
+ * on purpose: those name where an agent WRITES transcripts, and these name the
+ * one file `connect` WRITES INTO. Same home, same env, different question — and
+ * conflating them would put an install-time write behind the confinement
+ * boundary's reasoning, where it does not belong.
+ *
+ * ⚠ **The env vars are honoured on exactly the evidence the transcript roots
+ * cite: because the product honours them.** `CLAUDE_CONFIG_DIR` relocates the
+ * whole `~/.claude` tree, settings included, and `CODEX_HOME` relocates
+ * `~/.codex` — MEASURED for Codex rather than assumed, since every probe in this
+ * unit drove a real `codex` through a throwaway `CODEX_HOME` and it read the
+ * `hooks.json` there. Hard-coding either would write a file the agent never
+ * reads, which is the silent no-op this whole unit exists to delete.
+ *
+ * ⛔ **No Cursor equivalent, for the reason `cursorTranscriptRoot` gives:** none
+ * has been measured, and inventing one is a configuration surface this client
+ * would read and nothing would write.
+ */
+export function claudeSettingsPath(home, env) {
+    const configured = env.CLAUDE_CONFIG_DIR;
+    const root = configured !== undefined && configured.trim() !== ""
+        ? configured.trim()
+        : join(home, ".claude");
+    return join(root, "settings.json");
+}
+export function codexHooksPath(home, env) {
+    const configured = env.CODEX_HOME;
+    const root = configured !== undefined && configured.trim() !== ""
+        ? configured.trim()
+        : join(home, ".codex");
+    return join(root, "hooks.json");
+}
+export function cursorHooksPath(home) {
+    return join(home, ".cursor", "hooks.json");
+}
 //# sourceMappingURL=paths.js.map

@@ -9,7 +9,7 @@
  */
 import { readdirSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
-import { isInside, isTranscriptFile, transcriptRoot } from "../paths.js";
+import { claudeSettingsPath, isInside, isTranscriptFile, transcriptRoot } from "../paths.js";
 /**
  * The client-side backstop, per event.
  *
@@ -138,6 +138,17 @@ export const CLAUDE_CODE = {
     // `subagents/` directory, so every file here is already a transcript; there is
     // no interior shape to require, unlike Cursor's.
     admitsFile: isTranscriptFile,
+    // ⛔ IDENTITY, and it is the reference the other two are measured AGAINST —
+    // `HOOK_EVENTS` is spelled the way Claude Code spells it, because this is the
+    // agent the client was built for. Declared explicitly rather than defaulted so
+    // that a dialect added later must ANSWER the question; a default would let a
+    // camelCase agent inherit Claude's spellings and match nothing (`CR-195`).
+    eventNames: { Stop: "Stop", PreCompact: "PreCompact", SessionEnd: "SessionEnd" },
+    // ⛔ `~/.claude/settings.json`, honouring `CLAUDE_CONFIG_DIR`. ⚠ This is the
+    // file the PLUGIN path does not need — the plugin ships its own `hooks.json`
+    // — and the npm path had no writer at all, which is the defect `/install`
+    // has been advertising past since it first claimed `connect` wires hooks.
+    hookConfig: { path: claudeSettingsPath, shape: "claude" },
     events: {
         Stop: {
             registeredTimeoutMs: CLAUDE_REGISTERED_STOP_MS,

@@ -22,13 +22,14 @@
  *
  * @provenance vibecommit-mcp src/oauth/ingest_credential.ts — no route mints one, verified
  */
-import { CONNECT, COMMANDS, COMMIT_HOOK, ERRORS, HELP, PATH_CLASH, RUNTIME, SIGNIN, URLS, } from "../copy/index.js";
+import { CONNECT, COMMANDS, AGENT_HOOKS, COMMIT_HOOK, ERRORS, HELP, PATH_CLASH, RUNTIME, SIGNIN, URLS, } from "../copy/index.js";
 import { dialectFor } from "../agents/registry.js";
 import { grantProject, isAffirmative, isProjectAllowed } from "../consent.js";
 import { loadCredential } from "../credential.js";
 import { EXIT } from "../exit.js";
 import { resolveRepoSlug } from "../git.js";
 import { confinementRoots, readSpan, DEFAULT_HOOK_BUDGET_MS } from "../hooks/entry.js";
+import { installAgentHooks } from "../agent_install.js";
 import { classifyInstall, installPostCommitHook } from "../install.js";
 import { mcpUrl } from "../oauth/discovery.js";
 import { loadSession } from "../oauth/session.js";
@@ -359,8 +360,89 @@ async function captureBeat(ctx, keys, credential) {
     // success, which is the only place the PER-CLONE cost can be stated at a
     // moment the user can act on it.
     commitHookBeat(ctx, projectKey);
+    // ⛔ SESSION CAPTURE IS REGISTERED AND REPORTED HERE (`CR-195`/U4b). This is
+    // the beat `/install` has been describing since before it existed — until it,
+    // `connect` wrote GIT hooks only and the npm path gave a user no session
+    // capture at all. It runs AFTER the commit beat because the two are
+    // independent and the commit one is per-clone: reporting the per-clone thing
+    // beside the global one, in that order, is what makes the scope difference
+    // legible rather than a detail in a sentence.
+    agentHookBeat(ctx);
     return pathClash(ctx);
 }
+/**
+ * Register capture with every agent on this machine and SAY WHAT HAPPENED.
+ *
+ * ⚠ **Never changes the exit code**, for `commitHookBeat`'s reason: an agent
+ * whose config we could not parse does not make the connection fail, and
+ * exiting non-zero would tell the user their whole connect failed when one file
+ * of three was unreadable.
+ *
+ * ⛔ **EVERY OUTCOME PRINTS THE PATH.** This is a write OUTSIDE the repository,
+ * into a file shared by every project — the one new responsibility `CR-195`
+ * names — so "we configured your editor" is the shape this must not take.
+ */
+function agentHookBeat(ctx) {
+    const outcomes = installAgentHooks(ctx.home, ctx.env, ctx.selfPath);
+    for (const outcome of outcomes) {
+        // Absent agents say nothing at all. A line per tool the user does not have
+        // is the noise DX3's one-line rule exists to avoid, and it would bury the
+        // agents that WERE wired under a list of ones that were not.
+        if (outcome.install === null)
+            continue;
+        const agent = AGENT_LABELS[outcome.agentId];
+        // ⛔ TRUNCATED, exactly as `commitHookBeat` truncates the repo path. DESIGN.md
+        // §13.4 caps every line at 80 columns and `wrap` cannot break a path — it has
+        // no spaces — so an untruncated `~/.claude/settings.json` under a long temp
+        // or home prefix silently blows the width contract. `test/connect-ending.ts`
+        // caught this at 96 columns; the elision keeps the filename, which is the
+        // half that identifies the file.
+        const path = truncatePath(outcome.path, 56);
+        if (outcome.install.kind === "refused" || outcome.install.kind === "failed") {
+            const refused = outcome.install.kind === "refused";
+            writeLines(ctx.stdout, [
+                "",
+                ...renderErrorBlock({
+                    kind: "warn",
+                    what: refused
+                        ? AGENT_HOOKS.refusedWhat(agent)
+                        : AGENT_HOOKS.failedWhat(agent),
+                    why: [
+                        refused
+                            ? AGENT_HOOKS.refusedWhy(path, outcome.install.why)
+                            : AGENT_HOOKS.failedWhy(path, outcome.install.why),
+                    ],
+                    ...(refused
+                        ? {
+                            fixLabel: AGENT_HOOKS.refusedFixLabel,
+                            fixes: [AGENT_HOOKS.refusedFix(path)],
+                        }
+                        : {}),
+                }, ctx.colour),
+            ]);
+            continue;
+        }
+        const line = outcome.install.kind === "installed"
+            ? AGENT_HOOKS.installed(agent, path)
+            : AGENT_HOOKS.already(agent, path);
+        writeLines(ctx.stdout, [
+            "",
+            ...wrap(line, 2),
+            ...wrap(AGENT_HOOKS.kept(agent), 2),
+            // ⛔ Codex only, and it is not optional politeness: Codex ships the literal
+            // option "Continue without trusting (hooks won't run)", so the file we
+            // just wrote does NOT run until the user trusts it. Printing `installed`
+            // without this would be a true-sounding claim that is not yet true.
+            ...(outcome.agentId === "codex-cli" ? wrap(AGENT_HOOKS.codexTrust, 2) : []),
+        ]);
+    }
+}
+/** What each agent is called in prose. The ids are wire values, not labels. */
+const AGENT_LABELS = {
+    "claude-code": "Claude Code",
+    "codex-cli": "Codex CLI",
+    cursor: "Cursor",
+};
 /**
  * Install the `post-commit` hook for this clone and SAY WHAT HAPPENED.
  *

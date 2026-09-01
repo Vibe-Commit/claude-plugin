@@ -17,15 +17,19 @@
  * ⚠ **What is DATA here and what is MEASURED is not the same set**, and the
  * difference is marked on each member below rather than left to a reader.
  */
-import { cursorTranscriptRoot, isCursorTranscript } from "../paths.js";
+import { cursorHooksPath, cursorTranscriptRoot, isCursorTranscript } from "../paths.js";
 /**
  * ⛔ **UNMEASURED, AND ADOPTED AS A FLOOR RATHER THAN GUESSED.**
  *
- * The plan's `D5` — the exact `hook_event_name` strings Cursor sends, and the
- * timeouts its `~/.cursor/hooks.json` registers — is **founder-blocked and
- * gates `CR-195`**, the unit that writes that file. Nothing installs a Cursor
- * hook today, so no Cursor hook has ever fired and these numbers are currently
- * unreachable in production.
+ * ⚠ **`D5` HAD TWO HALVES AND ONLY ONE OF THEM IS ANSWERED (D205).** It asked
+ * for the exact `hook_event_name` strings Cursor sends *and* the timeouts its
+ * `~/.cursor/hooks.json` registers. The STRINGS are now measured — see
+ * `eventNames` below, read out of the shipped app bundle, which is what
+ * discharged `CR-195`'s block. ⛔ **The TIMEOUTS below are still not measured**,
+ * and are deliberately left as the floor they always were rather than quietly
+ * promoted on the strength of the other half. Nothing installs a Cursor hook
+ * today, so no Cursor hook has ever fired and these numbers remain unreachable
+ * in production.
  *
  * ⚠ **The direction of safety is what picks them.** Too WIDE and the agent
  * kills the process before this client's watchdog fires — which loses the
@@ -50,6 +54,28 @@ export const CURSOR = {
     // ⛔ THE GATE D177 §2 REQUIRES TO SHIP IN THIS UNIT — `.jsonl`, plus the
     // `<workspace>/agent-transcripts/` shape that puts §2's boundary back.
     admitsFile: isCursorTranscript,
+    // ⛔ **THE MEASUREMENT THAT DISCHARGED `D5`'s FIRST HALF — camelCase, and this
+    // is the defect `CR-195` exists to fix** (D205). Read out of the SHIPPED app
+    // bundle at `/Applications/Cursor.app/Contents/Resources/app`, whose `*.js`
+    // carry the event object as literals: seventeen events, of which
+    // `stop`/`preCompact`/`sessionEnd` are ours and `subagentStart`/`subagentStop`
+    // are the pair `delegatedTranscripts: "announce"` would want next.
+    //
+    // ⚠ **No live Cursor session was needed**, which is what `D5` had assumed and
+    // what kept this unit blocked. The bundle is the same artifact a user runs.
+    //
+    // ⛔ Against the client's `SessionEnd`, `sessionEnd` matched NOTHING — not an
+    // error, a `false` — so a Cursor session took no settle on its final turn and
+    // lost it permanently. That is the whole of the bug.
+    eventNames: { Stop: "stop", PreCompact: "preCompact", SessionEnd: "sessionEnd" },
+    // ⛔ `~/.cursor/hooks.json`, and the `cursor` SHAPE — the two are a pair.
+    // Read out of the shipped bundle's validator: a top-level numeric `version`
+    // is REQUIRED, entries are a FLAT array of hook scripts each needing a
+    // `command`, and an unrecognised event key is a validation ERROR rather than
+    // something ignored. The `claude` shape written here would be rejected for
+    // having no `command` — silently, registering nothing.
+    // ⚠ No env override: none has been measured, per `cursorTranscriptRoot`.
+    hookConfig: { path: (home) => cursorHooksPath(home), shape: "cursor" },
     events: {
         Stop: {
             registeredTimeoutMs: CURSOR_REGISTERED_MS,

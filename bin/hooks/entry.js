@@ -45,7 +45,8 @@ import { deliver, ingestUrl } from "../post.js";
 import { markSkipped } from "../policy.js";
 import { fileState, loadSessionState, saveSessionState, withFileState } from "../state.js";
 import { SESSION_END_EVENT, settleDelayMs, settledSize, } from "./session_end.js";
-import { admitsTranscript, agentForTranscript, dialectFor, transcriptRoots, } from "../agents/registry.js";
+import { admitsTranscript, agentForTranscript, canonicalHookEvent, dialectFor, transcriptRoots, } from "../agents/registry.js";
+import { claimFiring, fireLockPath } from "./fire_lock.js";
 import { announcedSubagentFileKey, isInsideAny, subagentFileKey, subagentsDir, } from "../paths.js";
 import { resolveProjectKeys } from "../project.js";
 import { startSpawnBudget } from "../spawn_budget.js";
@@ -154,10 +155,31 @@ const MAX_SUBAGENT_FILES = 8;
  * is set at, and small enough that it costs the send 90 ms of 2850 on the
  * default budget.
  *
- * ⚠ **A mitigation, not a guarantee.** Enough scheduler pressure defeats any
- * fixed reserve, exactly as it defeats the watchdog itself. What this buys is
- * that the ordinary slow-server case — the one Codex's 3 s cap makes routine —
- * stops eating the gap record.
+ * ## ⛔ THE RESERVE WAS NOT ACTUALLY RESERVED UNTIL `CR-195/U2` — the two clocks
+ * started at different instants
+ *
+ * Everything above this paragraph diagnosed the defect correctly and then
+ * subtracted the reserve from the WRONG ORIGIN. `budgetMs - 150` is a bound on
+ * the loop's own clock, which starts at `settleStart`; the watchdog's clock
+ * starts in `runHook`, before stdin is read. So the loop was permitted to spend
+ * until `budgetMs` *measured from the settle* — already past the watchdog's
+ * deadline by exactly the pre-entry interval this docblock names — and the
+ * watchdog then fired MID-SEND. `stampGaps` runs after the loop, so it did not
+ * run at all, and the held spans stayed held.
+ *
+ * ⛔ **That is the G6 flake, and it was a real product defect rather than a
+ * timing-sensitive assertion.** `test/session-end-gaps.test.ts` caught it as
+ * `held: [[0, 39]]` where a stamped gap belonged: on `SessionEnd` — which has no
+ * next invocation — a hole that is held rather than stamped is the final turn
+ * recorded as delivered-so-far instead of as short. `sendBudgetMs` now takes the
+ * elapsed time since `runHook` armed the watchdog and charges it, so the reserve
+ * is measured against the deadline that can actually end the process.
+ *
+ * ⚠ **Still a mitigation, not a guarantee.** Enough scheduler pressure defeats
+ * any fixed reserve, exactly as it defeats the watchdog itself — a timer cannot
+ * fire while the event loop is blocked. What changed is that the reserve now
+ * survives the ordinary case it was written for; before, the ordinary case is
+ * precisely what consumed it.
  *
  * ⛔ Zero on every other event: `stampGaps` runs on `SessionEnd` alone, so
  * reserving elsewhere would shrink `Stop`'s send for a stamp that never happens.
@@ -176,8 +198,22 @@ const GAP_STAMP_RESERVE_MS = 150;
  * ⛔ `budgetMs` itself still governs the SETTLE and the WATCHDOG. Only the sends
  * are carved.
  */
-export function sendBudgetMs(budgetMs, eventName) {
-    return budgetMs - (eventName === SESSION_END_EVENT ? GAP_STAMP_RESERVE_MS : 0);
+/**
+ * ⛔ **TAKES THE RESOLVED EVENT, NEVER THE RAW `hook_event_name` (`CR-195`).**
+ *
+ * It used to take a `string`, and that is precisely how Cursor's `sessionEnd`
+ * bought a full-budget send with no reserve: the comparison was against
+ * `"SessionEnd"`, so an unrecognised spelling was `false` rather than an error.
+ * `HookEventName | null` makes the resolution a thing the CALLER must already
+ * have done — `null` is the honest "none of the three", and an unresolved wire
+ * string is no longer expressible here at all.
+ */
+export function sendBudgetMs(budgetMs, event, sinceHookStartMs = 0) {
+    const reserve = event === SESSION_END_EVENT ? GAP_STAMP_RESERVE_MS : 0;
+    // ⛔ FLOORED AT ZERO. A negative would reach `sendTimeoutMs`, whose own
+    // `Math.max(0, budgetMs - consumedMs)` turns a negative budget into a POSITIVE
+    // remaining — a blown clock reading as fresh time.
+    return Math.max(0, budgetMs - sinceHookStartMs - reserve);
 }
 /**
  * Parse hook stdin. Claude Code supplies `{ session_id, transcript_path, cwd,
@@ -252,6 +288,14 @@ export function silenceStderr() {
  * truncated write is the silent-unconfigured failure DX3 exists to kill.
  */
 function finish(payload) {
+    // ⛔ RELEASED HERE, AND HERE IS THE ONLY PLACE THAT COVERS EVERY EXIT
+    // (`CR-195`/U4a). A `try/finally` around `hookBody` would look tidier and
+    // would leak the lock on the one path that matters most: the WATCHDOG calls
+    // this function directly, and the signal handlers do too, so neither unwinds
+    // `hookBody` at all. A lock leaked there survives until it goes stale, and
+    // until then it suppresses the next firing of that event — turning a guard
+    // against duplicates into a guard against captures.
+    releaseFiring();
     if (payload !== null) {
         try {
             writeSync(1, `${payload}\n`);
@@ -263,6 +307,28 @@ function finish(payload) {
     process.exit(EXIT.ok);
 }
 /**
+ * The firing this process claimed, if it claimed one.
+ *
+ * ⚠ **Module state, deliberately, and it is the narrow case that justifies it.**
+ * This process handles exactly ONE hook invocation and then exits; `finish` is
+ * its single exit point and is reached from paths that never return through
+ * `hookBody`. Threading a claim out to those paths is not possible — the
+ * watchdog holds no reference to the body's locals.
+ */
+let firingClaim = null;
+/** Idempotent, and never throws: the hook contract forbids saying anything. */
+function releaseFiring() {
+    const claim = firingClaim;
+    firingClaim = null;
+    try {
+        claim?.release();
+    }
+    catch {
+        // A lock we could not release goes stale on its own; the bound is derived
+        // from the budget precisely so a lost release costs one invocation, once.
+    }
+}
+/**
  * Install every contract guard, then run the body.
  *
  * Guards go in FIRST, before any work, because the paths they cover include
@@ -271,6 +337,13 @@ function finish(payload) {
 export async function runHook(ctx) {
     silenceStderr();
     const budgetMs = hookBudgetMs(ctx.env, ctx.agentId);
+    // ⛔ THE WATCHDOG'S OWN ORIGIN, read on the line that arms it (`CR-195/U2`).
+    // Every other deadline in this process is derived from this instant, because
+    // this is the one that can actually end it. Taken here rather than passed in
+    // so the two cannot drift: a caller-supplied start could be older than the
+    // timer, which would UNDER-charge the send loop and reopen the G6 defect from
+    // the other side.
+    const hookStartedAt = Date.now();
     // The watchdog covers the wall-clock clause on paths no `await` can reach: a
     // socket that never settles, a promise that never resolves. `unref` so it
     // never itself keeps the process alive.
@@ -289,7 +362,7 @@ export async function runHook(ctx) {
     }
     let payload = null;
     try {
-        payload = await hookBody(ctx, budgetMs);
+        payload = await hookBody(ctx, budgetMs, hookStartedAt);
     }
     catch {
         payload = null;
@@ -335,7 +408,7 @@ function dialectBudgetMs(agentId) {
  *   2. the CONSENT GATE runs BEFORE `transcript_path` is opened (D56 §D19). A
  *      gate that runs after the read has already read the thing it was gating.
  */
-async function hookBody(ctx, budgetMs) {
+async function hookBody(ctx, budgetMs, hookStartedAt) {
     const raw = await ctx.readStdin();
     const input = parseHookInput(raw);
     if (input === null)
@@ -463,12 +536,73 @@ async function hookBody(ctx, budgetMs) {
     // `SessionEnd` SETTLES FIRST (D57 §DX7). Every other event has a next
     // invocation to pick up a lagging write; this one does not, so bytes missed
     // here are the final turn, lost permanently.
-    const isSessionEnd = input.eventName === SESSION_END_EVENT;
+    // ⛔ RESOLVED THROUGH THE DIALECT BEFORE EITHER BRANCH READS IT (`CR-195`,
+    // D205). `input.eventName` is the agent's own spelling — Cursor sends
+    // `sessionEnd`, not `SessionEnd` — and both lines below used to compare the
+    // raw string against this client's vocabulary. That comparison did not fail
+    // loudly for Cursor; it returned `false`, which cost the final turn every
+    // session and carved no reserve.
+    //
+    // ⚠ Keyed on `ctx.agentId`, deliberately, and this is NOT the `CR-204`
+    // root-derived selection used for redaction and delegated transcripts. The
+    // event vocabulary is a property of the process that INVOKED us, and
+    // `--agent=` is the value WE write into that agent's own hook config — so it
+    // is the one selector that is not attacker-influenced input. `dialectBudgetMs`
+    // already keys the budget off it for the same reason.
+    const event = canonicalHookEvent(dialectFor(ctx.agentId), input.eventName);
+    const isSessionEnd = event === SESSION_END_EVENT;
+    // ⛔ ONE FIRING, ONE PROCESS — `CR-195`/U4a. Claimed BEFORE the settle, so a
+    // duplicate costs nothing rather than spending the budget to discover it is
+    // redundant.
+    //
+    // ⛔ KEYED ON THE CANONICAL EVENT, NOT `input.eventName`. The two racers do
+    // not necessarily agree on the wire spelling — that is the whole shape of this
+    // defect: one invocation comes from Cursor's own config and one from Claude's,
+    // mapped, and they carry different `--agent=` flags. Resolving first is what
+    // makes both compute the SAME key; keying on the raw string would give them
+    // two keys and let both run, which is the failure this guards.
+    //
+    // ⚠ The raw name is the fallback for an event we could not resolve. Such an
+    // invocation does almost nothing, but two of them are still two writers.
+    const fireKey = {
+        repoKey: projectKey,
+        sessionId: input.sessionId,
+        event: event ?? input.eventName,
+    };
+    // ⛔ `claimFiring` RETURNS `null` FOR TWO DIFFERENT REASONS, and conflating
+    // them would turn this guard into a silent capture outage. One means *another
+    // process holds this firing* — bow out. The other means *no lock path could be
+    // built at all*, and treating that as a duplicate would refuse EVERY
+    // invocation, permanently and silently.
+    //
+    // ⚠ It is currently unreachable — `resolveProjectKeys` returns `null` rather
+    // than an empty toplevel, and the consent gate above has already returned on
+    // that. It is distinguished anyway because the two errors are not the same
+    // size: an unlockable firing that runs is one possible duplicate, and an
+    // unlockable firing that bows out is total silence. So the lock FAILS OPEN.
+    const lockable = fireLockPath(ctx.home, fireKey) !== null;
+    firingClaim = claimFiring(ctx.home, fireKey, budgetMs);
+    if (firingClaim === null && lockable) {
+        // Another process holds this exact firing. ⛔ Silent and exit 0: there is
+        // nothing to report, and a `systemMessage` here would put a line in the
+        // user's turn for a duplicate they did not cause. `finish` releases nothing
+        // because we hold nothing.
+        return null;
+    }
     const settleFor = isSessionEnd ? settleDelayMs(ctx.env, budgetMs) : 0;
     // `CR-182`. Carved OUT of the budget, never added on top — the same shape the
     // settle takes, and for the same reason: the watchdog does not move.
-    const sendBudget = sendBudgetMs(budgetMs, input.eventName);
+    //
+    // ⛔ AND THE PRE-ENTRY COST IS CHARGED HERE (`CR-195/U2`, the G6 defect). The
+    // send loop measures its own consumption from `settleStart`, one line below;
+    // the watchdog has been running since `runHook`. The stdin read, the consent
+    // gate's `git rev-parse` spawn and the credential load all happened in
+    // between, and `CR-126` measured that interval at p99 392 ms — more than the
+    // whole 150 ms reserve. Passing it in is what makes the reserve a reserve
+    // against the deadline that can actually end the process, rather than against
+    // a clock that starts later than the one holding the gun.
     const settleStart = Date.now();
+    const sendBudget = sendBudgetMs(budgetMs, event, settleStart - hookStartedAt);
     const eof = settleFor > 0
         ? await settledSize(() => fileSize(input.transcriptPath), wait, settleFor)
         : fileSize(input.transcriptPath);

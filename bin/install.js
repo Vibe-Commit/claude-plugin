@@ -25,7 +25,7 @@
  * only fake by building a directory of shims.
  */
 import { accessSync, chmodSync, constants, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { delimiter, isAbsolute, join } from "node:path";
+import { delimiter, isAbsolute, join, resolve } from "node:path";
 import { gitProbe } from "./git.js";
 /** The command name D55 kept. */
 const BIN = "vibecommit";
@@ -183,8 +183,14 @@ function shellQuote(value) {
  * owned by whatever tool configured it, and a file we drop in gets regenerated
  * away without warning. The honest move is to say so.
  *
- * ⚠ **VERIFIED that our own repos set NEITHER `core.hooksPath` NOR husky**, so
- * dogfooding cannot exercise this path — it is covered by deliberate tests.
+ * ⛔ **THAT CLAIM WAS TRUE AND IS NOT ANY MORE — `TODOS[127]`.** This said
+ * *"VERIFIED that our own repos set NEITHER `core.hooksPath` NOR husky, so
+ * dogfooding cannot exercise this path."* `code` sets `core.hooksPath`, and
+ * dogfooding is exactly how the false negative surfaced: `connect` refused a
+ * clone whose hooks would have run. ⚠ Corrected rather than deleted, because a
+ * verified-then-falsified claim is worth more to the next reader than a silent
+ * edit — the lesson is that "our repos don't do X" decays without a guard, and
+ * nothing here watches it.
  */
 export function installPostCommitHook(toplevel, binPath) {
     return installCaptureHooks(toplevel, binPath).commit;
@@ -212,10 +218,22 @@ export function installCaptureHooks(toplevel, binPath) {
     const configured = gitProbe(toplevel, ["config", "--get", "core.hooksPath"]);
     // `--get` exits 1 when unset, which `gitProbe` reports as null. A SET value
     // is the failure case here, which is the opposite of the usual reading.
+    //
+    // ⛔ **SET IS NOT THE SAME AS REDIRECTED — `TODOS[127]`.** A value pointing at
+    // the directory git would have used ANYWAY is not a redirect, and refusing it
+    // costs the user their commit binding for nothing. Alexander hit exactly this:
+    // `code` sets `core.hooksPath` to `<toplevel>/.git/hooks` and `connect`
+    // answered "could NOT be installed". MEASURED in a throwaway `git init` — a
+    // `post-commit` under a `core.hooksPath` pointed at its own default DOES fire.
     if (configured !== null && configured.trim() !== "") {
-        // ⛔ BOTH refuse. `.git/hooks` is dead for every hook in it, not just ours.
-        const verdict = { kind: "hooks-path", configured: configured.trim() };
-        return { commit: verdict, rewrite: verdict };
+        if (!redirectsHooks(toplevel, configured.trim())) {
+            // Not a redirect. Fall through and install exactly as an unset repo would.
+        }
+        else {
+            // ⛔ BOTH refuse. `.git/hooks` is dead for every hook in it, not just ours.
+            const verdict = { kind: "hooks-path", configured: configured.trim() };
+            return { commit: verdict, rewrite: verdict };
+        }
     }
     const hooksDir = resolveHooksDir(toplevel);
     if (hooksDir === null) {
@@ -264,6 +282,43 @@ function writeHook(hooksDir, hookName, script) {
  * two differ for a linked work tree and for a repository with a separate git
  * dir — and it answers RELATIVE to the work tree, so it is resolved here.
  */
+/**
+ * ⛔ **DOES `core.hooksPath` SEND HOOKS SOMEWHERE ELSE? — `TODOS[127]`.**
+ *
+ * ⛔ **NOT `rev-parse --git-path hooks`, AND THAT IS THE WHOLE TRAP.** The
+ * obvious narrowing is to compare the configured value against that command's
+ * output, and it is wrong in the direction that does damage: `--git-path hooks`
+ * **respects `core.hooksPath`**, so it returns the configured directory itself
+ * and the two are equal for EVERY set value — husky's included. That comparison
+ * retires the refusal entirely and starts writing into directories other tools
+ * own and regenerate. MEASURED both ways before this function was written.
+ *
+ * The honest question is *"is this the directory git would use if the setting
+ * were absent"*, so the answer comes from `--git-common-dir`, which is what the
+ * default is built from and is not itself affected by the setting.
+ *
+ * ⚠ **FAILS CLOSED.** Anything unresolvable — a probe that fails, a path that
+ * normalises to neither form — is treated as a REDIRECT and refused. The two
+ * errors are not the same size: a false refusal costs commit binding and says
+ * so out loud, while a false accept drops a file into a directory another tool
+ * regenerates, silently, which is the failure the refusal exists to prevent.
+ */
+function redirectsHooks(toplevel, configured) {
+    const common = gitProbe(toplevel, ["rev-parse", "--git-common-dir"]);
+    if (common === null || common.trim() === "")
+        return true;
+    const commonDir = common.trim();
+    const fallback = join(isAbsolute(commonDir) ? commonDir : join(toplevel, commonDir), "hooks");
+    // `core.hooksPath` is interpreted relative to the top of the work tree.
+    const a = resolve(toplevel, configured);
+    const b = resolve(toplevel, fallback);
+    if (a === b)
+        return false;
+    // Only then pay for `realpath`, which also settles a symlinked `.git`.
+    const ra = realpathOrNull(a);
+    const rb = realpathOrNull(b);
+    return !(ra !== null && rb !== null && ra === rb);
+}
 export function resolveHooksDir(toplevel) {
     const out = gitProbe(toplevel, ["rev-parse", "--git-path", "hooks"]);
     if (out === null)

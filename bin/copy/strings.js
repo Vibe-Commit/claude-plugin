@@ -16,11 +16,19 @@
  * @provenance vibecommit-schema capture_turns column list — MEASURED ABSENCE, cited (CR-086)
  */
 import { EXIT } from "../exit.js";
+// Same precedent as `EXIT` above: the prefix is a WIRE FACT, and a copy line that
+// spelled `vcik_` out by hand would be a second definition of it — free to drift
+// from the one `credential.ts` actually enforces. `credential.ts` imports no copy,
+// so this direction does not close a cycle.
+import { INGEST_TOKEN_PREFIX } from "../credential.js";
 /** `--help` copy. The `why` line is verbatim-approved (D61 §PS6) — do not reword. */
 export const HELP = {
     usage: "vibecommit <command> [options]",
     tagline: "Record Claude Code sessions against the commits they produced.",
     commands: {
+        // `CR-216/U2`. FIRST in the list because it is first in the sequence: on a
+        // new machine there is nothing for `connect` to use until this has run.
+        auth: "Save this machine's ingest credential.",
         connect: "Connect this repo and capture the current session.",
         status: "Show whether capture is on for this repo and when it last succeeded.",
         off: "Stop capturing for this repo.",
@@ -82,6 +90,16 @@ export const STATUS = {
     repoToplevel: (slug, path) => `${slug} (git toplevel ${path})`,
     /** `4 minutes ago · seq 41`. No turn count — see the module note in status.ts. */
     lastSuccessValue: (age, seq) => `${age} · seq ${seq}`,
+    /**
+     * `CR-216/U3` — the one status fault that is invisible from the outside.
+     *
+     * `VIBECOMMIT_TOKEN` wins over the saved credential (D56, for CI), so a token
+     * left exported in a shell keeps sending under an identity the user stopped
+     * choosing, while every other line on this screen still reads normally. It
+     * states the precedence and the undo, and makes no claim about which of the
+     * two is correct — the client cannot know that.
+     */
+    credentialShadowed: "VIBECOMMIT_TOKEN is set and takes precedence over the credential saved on this machine. Unset it to use the saved one.",
     fixCommandLabel: "To reconnect, run",
     /** §10.3's two trailing actions, rendered as an aligned pair. */
     turnOffLabel: "Turn capture off for this repo",
@@ -233,8 +251,20 @@ export const CONNECT = {
      */
     credentialNeededWhat: "This machine has no ingest credential.",
     credentialNeededWhy: "Consent is recorded for this repository, but nothing can be uploaded without a credential for this machine.",
-    credentialNeededFix: "Set one, then run connect again:",
-    credentialNeededCommand: "export VIBECOMMIT_TOKEN=…",
+    /**
+     * `CR-216/U4` REPLACED `export VIBECOMMIT_TOKEN=…` HERE.
+     *
+     * The old line taught the CI escape hatch as the install fix, and it was the
+     * only fix that existed because `credentials.json` had no producer. Following
+     * it repaired exactly one shell: the next terminal, and every `git commit` run
+     * from any other one, was broken again in the same silent way — the hook found
+     * no credential and bound nothing, which the exit contract makes soundless.
+     *
+     * `VIBECOMMIT_TOKEN` is unchanged and still read first (D56, founder call); it
+     * is simply no longer what a stuck human is told to type.
+     */
+    credentialNeededFix: "Save one for this machine, then connect:",
+    credentialNeededCommand: "vibecommit auth",
     // --- The ending (CR-025). Style guide §10.2's last three lines. ---
     /** `Capture is on for <repo>. Nothing else to do.` */
     doneForRepo: (repo) => `Capture is on for ${repo}. Nothing else to do.`,
@@ -341,6 +371,37 @@ export const COMMIT_HOOK = {
     hooksPathFixManual: "or add `vibecommit post-commit` to your existing post-commit hook",
     failedWhat: "Commit capture could NOT be installed for this clone.",
     failedWhy: (why) => `Writing the \`post-commit\` hook failed: ${why}. Transcript capture is unaffected; only commit observation is.`,
+};
+/**
+ * Registering capture with the agents on this machine — `CR-195`/U4b.
+ *
+ * ⛔ **A GLOBAL-SCOPE WRITE, OUTSIDE THE REPOSITORY**, which `CR-195`'s own note
+ * calls out as a new responsibility: unlike `.git/hooks`, this touches a file the
+ * user shares with every project. So every line names the FILE and the AGENT.
+ * "We configured your editor" would be the shape that hides it.
+ *
+ * ⚠ **Nothing here narrates the credential.** `connect`'s token step is being
+ * rewritten to mint and persist through the browser session it already opens, so
+ * a line telling the user to paste a `vcik_` would be stale on arrival. What was
+ * written and where is durable; how the credential got there is another unit's
+ * copy, in another unit's strings.
+ */
+export const AGENT_HOOKS = {
+    installed: (agent, path) => `Session capture is on for ${agent}. Registered Stop, PreCompact and SessionEnd in ${path}.`,
+    already: (agent, path) => `Session capture was already on for ${agent}; refreshed the command in ${path}.`,
+    kept: (agent) => `Any hooks you already had are untouched and still run — ${agent}'s config was added to, never replaced.`,
+    // ⛔ TRUE TODAY AND AFTER THE CREDENTIAL WORK LANDS. This describes Codex's own
+    // startup behaviour, not ours: the binary ships the literal option "Continue
+    // without trusting (hooks won't run)", so a file written here does not run
+    // until the user says so. Claiming success without it would ship exactly the
+    // false install claim this unit exists to delete.
+    codexTrust: "Codex asks you to trust new hooks the next time it starts — until you do, it will not run them.",
+    refusedWhat: (agent) => `Session capture could NOT be set up for ${agent}.`,
+    refusedWhy: (path, why) => `${path} could not be read as JSON (${why}), and it was left exactly as it is. Overwriting a file we cannot parse would discard settings we cannot see.`,
+    refusedFixLabel: "Fix:",
+    refusedFix: (path) => `check ${path} for a syntax error, then run \`vibecommit connect\` again`,
+    failedWhat: (agent) => `Session capture could NOT be set up for ${agent}.`,
+    failedWhy: (path, why) => `Writing ${path} failed: ${why}. Commit capture and any agent already configured are unaffected.`,
 };
 export const PATH_CLASH = {
     foreignWhat: "Another program owns the `vibecommit` command.",
@@ -970,10 +1031,16 @@ export const ABSENCE = {
     },
     /**
      * 6 — EDGE UNREADABLE. ⛔ THE SET IS NOW SIX, AND THIS IS THE FIRST ADDITION.
-     * Owner: `U1` (2026-08-30). `test/copy-absence.test.ts` was updated in the
-     * same commit and its "not a sixth" cell now reads "not a seventh" — that
-     * cell is a CLOSURE TRIPWIRE, not a cap, and it did its job: this state could
-     * not be added without a reviewer being made to read why.
+     * Owner: `U1`. ⛔ **FOUNDER-RATIFIED, 2026-08-31 — `D203`.** Not an
+     * implementer's judgement call: three independent tripwires forbade a sixth
+     * state, they all fired, and the decision to clear them was put to the
+     * founder and ruled rather than argued past. `D203` carries the reasoning and
+     * the cost that was spent (reversibility — a field promotes to a state later,
+     * a shipped state does not un-ship).
+     *
+     * ⚠ The tripwires are CLOSURE TRIPWIRES, not a cap, and they did exactly what
+     * they exist for: this state could not enter the set without a reviewer being
+     * made to read the argument for it.
      *
      * ## ⚠ THIS IS THE ONE ABSENCE STATE THAT IS NOT AN ABSENCE OF RECORD
      *
@@ -1058,7 +1125,15 @@ export const CREDENTIAL = {
     wrongClassWhat: "The credential set for this machine is not an ingest credential.",
     wrongClassEnvWhy: "VIBECOMMIT_TOKEN is set, but its value is not a VibeCommit ingest credential. It was not sent anywhere.",
     wrongClassFileWhy: "The credential on disk is not a VibeCommit ingest credential. It was not sent anywhere.",
-    wrongClassFix: "Mint a fresh one:",
+    /**
+     * `CR-216/U4`. The fix COMMAND is named here rather than left to the caller,
+     * because the caller passed `COMMANDS.connect` and `connect` has never written
+     * the credential file — "reconnecting" re-read the same bad bytes and printed
+     * the same fault. Every credential fix now names a verb that can change the
+     * thing being complained about, and `credential-fix-copy.test.ts` enforces it.
+     */
+    wrongClassFix: "Save a fresh one for this machine:",
+    wrongClassCommand: "vibecommit auth",
     insecureFileWhat: "The credential file is readable by other accounts on this machine.",
     insecureFileWhyLabel: "file",
     insecureFileModeLabel: "mode",
@@ -1066,7 +1141,46 @@ export const CREDENTIAL = {
     insecureFileFix: "Restore the mode, then reconnect:",
     unreadableWhat: "The credential file could not be read.",
     unreadableWhy: "It exists but does not contain a credential in the expected form.",
-    unreadableFix: "Replace it by reconnecting:",
+    /** `CR-216/U4`. Was "Replace it by reconnecting:" — see `wrongClassFix` above. */
+    unreadableFix: "Replace it:",
+    unreadableCommand: "vibecommit auth",
+};
+/**
+ * `vibecommit auth` — `CR-216/U2`, D206.
+ *
+ * The verb that gives `credentials.json` a producer. Until it existed the file
+ * had a reader, a permission check and a `chmod` instruction in this very object
+ * (`TROUBLESHOOTING.chmodCredentials`) and nothing that ever wrote it.
+ *
+ * ⚠ `argvWhy` IS THE ONE LINE HERE THAT HAS TO BE EXACT. It is not a usage
+ * scolding — it tells a user who already typed the secret that it is now in
+ * their shell history, which is a thing they must go and act on. Softening it to
+ * "invalid usage" would leave a live credential in `.zsh_history` with the user
+ * believing the command simply failed. It names the two channels and no more:
+ * this package does not know which shell they run or whether history is on.
+ *
+ * No reassurance adjectives anywhere below (D65 §DR7) — nothing here is called
+ * secure, safe, protected or encrypted. The mode is stated as a fact instead.
+ */
+export const AUTH = {
+    /** Trailing space: a prompt, not a sentence. Reaches a TTY only. */
+    prompt: "Ingest credential for this machine: ",
+    savedWhat: "Credential saved for this machine.",
+    /** `mode 0600` stated, never adjectives. §13.6's `why` shape. */
+    savedWhy: (path) => `Written to ${path}, mode 0600.`,
+    nextLabel: "Next, connect a repository:",
+    nextCommand: "vibecommit connect",
+    emptyWhat: "No credential was given.",
+    emptyWhy: "Nothing was read, so nothing was written.",
+    emptyFix: "Mint one, then run:",
+    wrongClassWhat: "That is not a VibeCommit ingest credential.",
+    wrongClassWhy: `An ingest credential begins ${INGEST_TOKEN_PREFIX}. Nothing was written and nothing was sent.`,
+    wrongClassFix: "Mint one, then run:",
+    argvWhat: "A credential must not be passed as an argument.",
+    argvWhy: "Arguments are written to your shell history and are readable by other processes on this machine while the command runs. Treat the one you just typed as exposed and revoke it.",
+    argvFix: "Read it from the terminal, or from a pipe:",
+    argvFixPrompt: "vibecommit auth",
+    argvFixStdin: 'printf %s "$TOKEN" | vibecommit auth --stdin',
 };
 /**
  * The Node floor (D57 plan §DX11). `NODE_FLOOR_TEXT` and the running version are
@@ -1146,6 +1260,8 @@ export const REDACTION = {
 /** Commands the copy points at. One definition, so a rename cannot half-land. */
 export const COMMANDS = {
     connect: "vibecommit connect",
+    /** `CR-216/U2`. The only verb that writes this machine's ingest credential. */
+    auth: "vibecommit auth",
     /** `CR-084d`. A FLAG, not a verb — `--help`'s verb list and its golden file do not move. */
     signIn: "vibecommit connect --sign-in",
     status: "vibecommit status",

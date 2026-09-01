@@ -249,8 +249,8 @@ export function parseBlameCommitPayload(document) {
     }
     if (state !== "cold_start" &&
         state !== "no_edge" &&
-        // ⛔ ADDED BY `U1` (2026-08-30), AND THE ORDER OF THE TWO REPO CHANGES IS
-        // LOAD-BEARING. An unknown `state` returns null here, and null renders as
+        // ⛔ ADDED BY `U1`, founder-ratified 2026-08-31 (`D203`). THE ORDER OF THE
+        // TWO REPO CHANGES IS LOAD-BEARING. An unknown `state` returns null here, and null renders as
         // MALFORMED — so if mcp had shipped `edge_unreadable` before this line
         // existed, every such answer would have reached the user as a broken
         // payload rather than as the state it is. That is strictly worse than the

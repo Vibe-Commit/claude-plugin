@@ -34,7 +34,7 @@
  *
  * @provenance vibecommit-mcp src/oauth/ingest_credential.ts — wire contract, retyped
  */
-import { lstatSync, readFileSync, statSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, statSync, writeFileSync, } from "node:fs";
 import { inspect } from "node:util";
 import { credentialsPath, rootDir } from "./paths.js";
 /**
@@ -155,6 +155,64 @@ export function loadCredential(ctx) {
         return { kind: "wrong-class", source: "file" };
     }
     return { kind: "ok", credential: new IngestCredential(secret, "file") };
+}
+/**
+ * Persist the ingest credential. 0700 on the directory, 0600 on the file.
+ *
+ * `CR-216/U1`. Until this existed the module was a reader with no producer:
+ * `loadCredential` parsed an envelope, `readSecretFile` policed its modes and
+ * `copy/strings.ts:1412` told the user to `chmod 600` it, but nothing in the
+ * package ever wrote it. The only credential that reached a hook came from
+ * `VIBECOMMIT_TOKEN`, so a commit from a shell without it exported bound nothing
+ * and said nothing — the hook's exit contract makes a missing credential silent
+ * on purpose, which is right for the hook and fatal for a first install.
+ *
+ * ⚠ THE TWO `chmod`s AFTER THE WRITES ARE NOT REDUNDANT, and this is the third
+ * time this package has had to say so (`consent.ts`'s `grantProject` first, then
+ * `oauth/session.ts:139`). `writeFileSync`'s `mode` is masked by the umask, and
+ * it is IGNORED ENTIRELY when the file already exists — so the re-auth after a
+ * rotation, which is exactly the write that follows a leak, would silently
+ * inherit whatever mode was there before.
+ *
+ * The refusal below is the write-side half of the class check. The read side
+ * already refuses a token of the wrong class in both directions (see
+ * `CredentialLoad`'s `wrong-class`); this is the third door into the same slot,
+ * and a door that admits what the others refuse is not a door with a check.
+ * It refuses BEFORE touching the disk: a half-written envelope would load as
+ * `unreadable` rather than `absent`, sending the user to a different fix.
+ *
+ * The single `expose()` here is unavoidable — persisting a secret means writing
+ * its bytes — and greppable, which is the property the wrapper buys.
+ *
+ * @throws if handed a credential of the wrong class. The message carries the
+ * class, never the rejected bytes.
+ */
+export function saveCredential(home, credential) {
+    const secret = credential.expose();
+    if (!secret.startsWith(INGEST_TOKEN_PREFIX)) {
+        throw new Error(`refusing to persist a credential that is not an ingest credential: expected a ${INGEST_TOKEN_PREFIX}… token`);
+    }
+    const path = credentialsPath(home);
+    mkdirSync(rootDir(home), { recursive: true, mode: 0o700 });
+    chmodSync(rootDir(home), 0o700);
+    writeFileSync(path, `${JSON.stringify({ token: secret }, null, 2)}\n`, { mode: 0o600 });
+    chmodSync(path, 0o600);
+}
+/**
+ * Is there a saved credential for `VIBECOMMIT_TOKEN` to be shadowing?
+ *
+ * `CR-216/U3`. PRESENCE, not validity, and the distinction is the point: this
+ * answers "is the env var overriding something?", and a file that is present but
+ * unreadable or wrongly-moded is still something being overridden — arguably the
+ * case most worth saying out loud, since the user who saved it believes it is in
+ * use. Validity is `loadCredential`'s question and it answers it separately.
+ *
+ * Deliberately not `loadCredential({ env: {} , home })`: that would silently
+ * return `absent` for an insecure file and suppress the warning exactly where a
+ * user is most confused about which credential is live.
+ */
+export function savedCredentialExists(home) {
+    return existsSync(credentialsPath(home));
 }
 /**
  * Belt and braces for the `inspect` path specifically.
