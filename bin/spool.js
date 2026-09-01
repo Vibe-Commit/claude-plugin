@@ -40,7 +40,7 @@
  * the sha; the observation is not. `files` is carried for wave 2 and never put
  * in a header.
  */
-import { appendFileSync, chmodSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { repoSessionsDir, sessionStatePath } from "./paths.js";
 /**
@@ -245,11 +245,45 @@ export function activeSessionFor(home, repoKey, envSessionId, nowMs = Date.now()
     if (envSessionId !== null && live.some((s) => s.sessionId === envSessionId)) {
         return { sessionId: envSessionId, attribution: "env_session_id" };
     }
-    // No candidate at all: nothing has captured this repo inside the window, so
-    // there is no bucket to record anything in. The refusal has to be silent here
-    // and only here.
-    if (live.length === 0)
-        return null;
+    // ⛔ **THE COLD CASE — `CR-195`/D208, and it used to DROP THE COMMIT SILENTLY.**
+    //
+    // No state file is live for this repo. Until D208 that returned `null` and the
+    // observation was gone: MEASURED in a real session as commit `f1608bc`, spooled
+    // nowhere. And it is not an edge case — `Stop` fires at the END of a turn, so
+    // **every commit made during a session's first turn lands here**, which is
+    // exactly what a tester does before asking `blame_commit`.
+    //
+    // ⚠ **Rung 1 cannot cover it, structurally.** That rung requires
+    // `live.some(s => s.sessionId === envSessionId)` — a state file must
+    // corroborate the environment — and on the first turn none can exist.
+    //
+    // So when the committing process DID name itself, record the observation at a
+    // rung that says exactly that and cannot mint an edge. When it did not, there
+    // is genuinely nothing to record and the silence stands.
+    if (live.length === 0) {
+        // ⛔ **ONLY FOR A SESSION THAT HAS NO STATE FILE AT ALL, NEVER A STALE ONE.**
+        // `activeSessionFor(…, SESSION, +9h)` must stay `null`, and the reason is
+        // pinned by a cell: *"an id naming a session that went quiet nine hours ago
+        // is still nothing — otherwise a shell that exported the value once would
+        // keep a session alive for as long as the terminal lived."* That hazard is
+        // real and this rung would have re-opened it, because state files are never
+        // deleted: a lingering variable would file every future commit under one
+        // ancient session, and promotion would then mint permanent edges for it.
+        //
+        // ⚠ The distinction is exactly the case this rung is for: a session on its
+        // FIRST turn has written nothing yet, while a dead one left a file behind.
+        // ⚠ Absence of the file is the line between too EARLY and too LATE. (Worded
+        // to avoid `from` followed by a quoted string: `provenance.test.ts` walls
+        // RAW TEXT and reads that shape as an escaping import specifier. Third time
+        // this guard has fired on ordinary prose in this package; the house response
+        // is to move the wording and leave the guard alone.)
+        if (envSessionId === null)
+            return null;
+        const state = sessionStatePath(home, { repoKey, sessionId: envSessionId });
+        if (state === null || existsSync(state))
+            return null;
+        return { sessionId: envSessionId, attribution: "env_session_uncorroborated" };
+    }
     // ⛔ THE NAMED REFUSAL, AND IT COMES BEFORE BOTH WRITE RUNGS. We were TOLD who
     // committed, and it is none of these. Falling through would attribute the
     // commit to a session we have positive evidence did not make it.
@@ -552,5 +586,161 @@ function parseRung(value) {
             // value that says *we do not know*.
             return "recency_heuristic";
     }
+}
+// ---------------------------------------------------------------------------
+// ⛔ THE PENDING SIDECAR — `CR-195`/D208.
+//
+// A THIRD file beside `.spool.jsonl` and `.rewrites.jsonl`, for the same reason
+// the second one exists: the two are read by different code at different times,
+// and a discriminator inside one file would make a torn line of one kind cost
+// the other kind too.
+//
+// ⛔ **WHY NOT JUST LEAVE THE LINE IN `.spool.jsonl`.** `capSpool` returns
+// `count: taken.length` — every line taken, wire-eligible or not — and
+// `dropSpooled` truncates by that count on the 2xx, so a non-wire line is
+// DISCARDED by the next successful post (`spool.ts`'s own note: *"A held entry
+// IS dropped on the 2xx, and the observation is lost"*). An uncorroborated line
+// left there would be destroyed by the very post that could not carry it, and
+// "binds when a state file appears" could never happen.
+//
+// ⚠ And the truncation rule it would have to change is load-bearing: `count`
+// rather than `shas.length` exists precisely so a retained line at the head
+// cannot shift every subsequent index and re-send a delivered commit forever.
+// A separate file gives this rung different retention while leaving that
+// invariant byte-untouched.
+//
+// ⚠ `.pending.jsonl` — like its two siblings it must NOT end in `.json`, or
+// `lastSendForRepo` parses it as session state and `liveSessions` counts it as a
+// live session, which would make an uncorroborated commit corroborate itself.
+// ---------------------------------------------------------------------------
+/**
+ * How many uncorroborated commits one session may hold.
+ *
+ * ⛔ **ITS OWN CONSTANT** — the house rule `MAX_SPOOLED_PAIRS` states: sharing a
+ * bound across two files with different units makes one of them wrong. This one
+ * is not a header budget at all, because nothing here reaches a header; it is a
+ * bound on how much unpromotable observation may accumulate before the oldest is
+ * dropped. Sized under `MAX_SPOOLED_SHAS` deliberately: a session that made 32
+ * commits before its first `Stop` is not a session, and the failure direction of
+ * being too small is a MISSED commit, which the module's own asymmetry prefers
+ * to a wrong one.
+ */
+export const MAX_PENDING_SHAS = 16;
+/** `<repo>/<session>.pending.jsonl`, beside the commit spool. */
+export function pendingSpoolPath(home, key) {
+    const state = sessionStatePath(home, key);
+    if (state === null)
+        return null;
+    return state.replace(/\.json$/, ".pending.jsonl");
+}
+/**
+ * Record an uncorroborated observation. Returns whether it was written.
+ *
+ * ⚠ Deduped on sha, like `appendRewrites`: `post-commit` can fire twice for one
+ * commit (a manual invocation beside the real hook), and two lines for one sha
+ * would promote into two spool entries and two permanent rows —
+ * `capture_commits`' PK is `(org_id, capture_id, commit_sha)`, so two capture
+ * ids are two legal rows for one commit.
+ */
+export function appendPending(home, key, entry) {
+    const path = pendingSpoolPath(home, key);
+    if (path === null)
+        return false;
+    try {
+        const existing = readPending(home, key);
+        if (existing.some((e) => e.sha === entry.sha))
+            return false;
+        const kept = [...existing, entry].slice(-MAX_PENDING_SHAS);
+        mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+        writeFileSync(path, kept.map((e) => `${JSON.stringify(e)}\n`).join(""), { mode: 0o600 });
+        chmodSync(path, 0o600);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+/** Every uncorroborated entry for this session, oldest first. */
+export function readPending(home, key) {
+    const path = pendingSpoolPath(home, key);
+    if (path === null)
+        return [];
+    let raw;
+    try {
+        raw = readFileSync(path, "utf8");
+    }
+    catch {
+        return [];
+    }
+    const out = [];
+    for (const line of raw.split("\n")) {
+        const entry = parseEntry(line);
+        if (entry !== null)
+            out.push(entry);
+    }
+    return out;
+}
+/** Remove the pending file entirely. Used once its lines have been promoted. */
+export function clearPending(home, key) {
+    const path = pendingSpoolPath(home, key);
+    if (path === null)
+        return false;
+    try {
+        rmSync(path, { force: true });
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+/**
+ * ⛔ **PROMOTION — the half that makes the cold rung worth recording.**
+ *
+ * A pending line names the session the committing process reported. Once THAT
+ * session has a state file, the environment's claim is corroborated by exactly
+ * the evidence rung 1 requires, so the line is rewritten into the real spool as
+ * `env_session_id` and the pending file is cleared.
+ *
+ * ⚠ **The corroboration is the session's OWN state file, not any state file.**
+ * Promoting on "some session is live" would be `sole_live_session` wearing a
+ * stronger rung's name — the environment said WHO, and the whole value of rung 1
+ * over rung 2 is that it is a fact about the committing process rather than
+ * about there being nobody else it could have been (D5).
+ *
+ * Returns how many were promoted. Safe to call when there is nothing to do.
+ */
+export function promotePending(home, key, 
+/**
+ * ⛔ **THE CORROBORATION, AND IT IS A LITERAL TYPE ON PURPOSE** — the same
+ * device `TranscriptDialect.transport` uses. It cannot be satisfied by
+ * accident: a caller must type the claim, and the claim is that `key.sessionId`
+ * is the session whose hook is executing right now.
+ *
+ * ⚠ **A STATE FILE IS THE WRONG TEST AND I TRIED IT FIRST.** State files are
+ * never deleted, so `existsSync` promotes months later against a session that
+ * ended long ago; and gating on the 30-minute window instead FAILS THE ONLY
+ * CASE THIS RUNG EXISTS FOR — on a session's first `Stop` the state file has
+ * not been written yet (`deliver` saves it, after this runs), so nothing would
+ * ever promote on the turn that matters. MEASURED: the cold-start commit sat
+ * unpromoted with the delta carrying no commits.
+ *
+ * ⛔ Running the hook is STRONGER evidence than either: a state file proves a
+ * session ran once, an executing hook proves it is running NOW. And it closes
+ * the resurrect hazard by construction — a dead session never runs a hook, so
+ * a lingering exported `CLAUDE_CODE_SESSION_ID` accumulates pending lines that
+ * are never promoted and age out under `MAX_PENDING_SHAS`.
+ */
+corroboration) {
+    void corroboration;
+    const pending = readPending(home, key);
+    if (pending.length === 0)
+        return 0;
+    let promoted = 0;
+    for (const entry of pending) {
+        if (appendSpool(home, key, { ...entry, attribution: "env_session_id" }))
+            promoted += 1;
+    }
+    clearPending(home, key);
+    return promoted;
 }
 //# sourceMappingURL=spool.js.map

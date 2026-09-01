@@ -37,7 +37,7 @@ import { DEFAULT_AGENT_ID, dialectFor } from "../agents/registry.js";
 import { isProjectAllowed } from "../consent.js";
 import { gitProbe, headRef } from "../git.js";
 import { resolveProjectKeys } from "../project.js";
-import { activeSessionFor, appendSpool } from "../spool.js";
+import { activeSessionFor, appendPending, appendSpool } from "../spool.js";
 /**
  * Observe the commit that just happened, or do nothing.
  *
@@ -102,7 +102,13 @@ export function observe(ctx) {
     // immediately after one — so this is a git we could not read, not a case.
     if (head === null)
         return false;
-    return appendSpool(ctx.home, { repoKey: toplevel, sessionId: active.sessionId }, {
+    // ⛔ THE COLD RUNG GOES TO THE SIDECAR, NOT THE SPOOL (`CR-195`/D208).
+    // `capSpool` counts every taken line toward the truncation, so a non-wire line
+    // in `.spool.jsonl` is discarded by the next 2xx — the very post that could not
+    // carry it. `.pending.jsonl` gives it different retention without touching that
+    // truncation rule, whose `count`-not-`shas.length` semantics are load-bearing.
+    const write = active.attribution === "env_session_uncorroborated" ? appendPending : appendSpool;
+    return write(ctx.home, { repoKey: toplevel, sessionId: active.sessionId }, {
         sha: head.sha,
         branch: head.branch,
         at: committedAt(toplevel),

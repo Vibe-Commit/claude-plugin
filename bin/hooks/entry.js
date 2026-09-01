@@ -50,7 +50,7 @@ import { claimFiring, fireLockPath } from "./fire_lock.js";
 import { announcedSubagentFileKey, isInsideAny, subagentFileKey, subagentsDir, } from "../paths.js";
 import { resolveProjectKeys } from "../project.js";
 import { startSpawnBudget } from "../spawn_budget.js";
-import { capSpool, capSuccessors, readRewrites, readSpool } from "../spool.js";
+import { capSpool, capSuccessors, promotePending, readRewrites, readSpool } from "../spool.js";
 import { meetsNodeFloor } from "../runtime.js";
 import { renderNotice } from "../system_message.js";
 /**
@@ -635,6 +635,17 @@ async function hookBody(ctx, budgetMs, hookStartedAt) {
     // Commits OBSERVED since the last delivery. Capped, with the remainder left in
     // the spool for the next hook rather than dropped.
     const spoolKey = { repoKey: projectKey, sessionId: input.sessionId };
+    // ⛔ PROMOTE FIRST (`CR-195`/D208). A commit made during this session's FIRST
+    // turn was recorded uncorroborated, because `Stop` fires at the end of a turn
+    // and no state file existed when `post-commit` ran. By the time this hook is
+    // executing, that state file is this session's own — which is exactly the
+    // corroboration rung 1 requires — so the observation becomes deliverable now
+    // rather than being lost. Before this line, every first-turn commit was
+    // dropped: MEASURED as commit `f1608bc`, spooled nowhere.
+    // ⛔ The corroboration is THIS CALL SITE: `spoolKey.sessionId` is
+    // `input.sessionId`, the session whose hook is executing. See `promotePending`
+    // for why a state-file test is the wrong one and fails the first turn.
+    promotePending(ctx.home, spoolKey, "this-session-is-running");
     const spooled = capSpool(readSpool(ctx.home, spoolKey));
     // ⛔ REWRITES ARE THEIR OWN FILE WITH THEIR OWN CAP (`T5`). The units differ —
     // 41 bytes for a sha, 82 for an `ancestor:successor` pair — so one constant

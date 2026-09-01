@@ -16,8 +16,9 @@
  *   - every escape sequence comes from `src/term.ts` (DESIGN.md §13.2)
  *   - the hook contract is enforced by the entry, not by each verb
  */
-import { writeSync } from "node:fs";
+import { realpathSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline/promises";
 import { Writable } from "node:stream";
 import { resolveAgentId } from "./agents/registry.js";
@@ -331,8 +332,43 @@ function installPipeGuards() {
         });
     }
 }
-// Only run when executed as the binary, so tests can import the module freely.
-if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
+/**
+ * Are we being executed AS the binary, rather than imported?
+ *
+ * ⛔ THIS MUST COMPARE REAL PATHS, AND THE STRING COMPARISON THAT USED TO LIVE
+ * HERE MADE THE ENTIRE npm CLI INERT. `npm install -g` links
+ * `<prefix>/bin/vibecommit` as a SYMLINK to
+ * `<prefix>/lib/node_modules/@vibe-commit/capture/dist/index.js`. Node sets
+ * `process.argv[1]` to the path the user invoked — the symlink — while
+ * `import.meta.url` always resolves to the real file. So
+ * `import.meta.url === \`file://${process.argv[1]}\`` was FALSE for every
+ * globally-installed user, this block never ran, and `vibecommit auth`,
+ * `connect` and `status` all wrote NOTHING and exited 0. Shipped that way in
+ * `0.2.0` and `0.2.1`.
+ *
+ * ⚠ WHY NOTHING CAUGHT IT, WHICH IS THE PART WORTH KEEPING. The two paths that
+ * were exercised both bypass the symlink: the test suite imports this module
+ * directly (which is what the old comment here was protecting), and the plugin
+ * registers `node "${CLAUDE_PLUGIN_ROOT}/bin/index.js" hook` — an explicit real
+ * path. **Only `npm install -g` goes through a link, and nothing ever executed
+ * that path.** A symbol check on the published tarball passes, because the code
+ * is present and correct; it is the INVOCATION that was broken. `TODOS[133]`.
+ *
+ * `realpathSync` throws on a dangling path, so both sides are guarded — a
+ * failure to resolve means "not the binary", never a crash on import.
+ */
+function invokedAsBinary() {
+    const invoked = process.argv[1];
+    if (!invoked)
+        return false;
+    try {
+        return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(invoked);
+    }
+    catch {
+        return false;
+    }
+}
+if (invokedAsBinary()) {
     installPipeGuards();
     const argv = process.argv.slice(2);
     if (argv[0] === "post-commit") {
