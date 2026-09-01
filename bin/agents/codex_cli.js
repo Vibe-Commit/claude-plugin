@@ -11,7 +11,7 @@
  * measured by this task.** They are recorded as the brief stated them so a later
  * reader can check them against the product rather than against this file.
  */
-import { codexTranscriptRoot, isTranscriptFile } from "../paths.js";
+import { codexHooksPath, codexTranscriptRoot, isTranscriptFile } from "../paths.js";
 /**
  * `SessionEnd` is the tight one — 3 s registered, 2.2 s client.
  *
@@ -33,6 +33,26 @@ export const CODEX_CLI = {
     // shape to require here either. ⚠ CARRIED FROM THE BRIEF like the numbers
     // above: this task did not re-walk a Codex tree to confirm it.
     admitsFile: isTranscriptFile,
+    // ⛔ **IDENTITY — MEASURED, and it is the one member on this dialect that is
+    // no longer carried from the brief** (`CR-195`, D205). Read out of the native
+    // binary's embedded JSON schema, where every `hook_event_name` is a `const`:
+    // `PermissionRequest PostCompact PostToolUse PreCompact PreToolUse SessionEnd
+    // SessionStart Stop SubagentStart SubagentStop UserPromptSubmit`. All three of
+    // ours are present and spelled exactly as Claude Code spells them.
+    //
+    // ⚠ **The binary ALSO carries a snake_case enum** (`session_end`,
+    // `pre_compact`, …) beside a TOML-serialisation error string, and taking it
+    // for the config vocabulary was the near-miss of this unit. A differential run
+    // against three throwaway `CODEX_HOME`s settled it: `SessionEnd` is recognised
+    // and says so by clamping, while `session_end` and a bogus key produce NO
+    // diagnostic — a file that parses, registers nothing, and reports success.
+    eventNames: { Stop: "Stop", PreCompact: "PreCompact", SessionEnd: "SessionEnd" },
+    // ⛔ `~/.codex/hooks.json`, honouring `CODEX_HOME` — MEASURED, since every
+    // probe in this unit drove a real `codex` through a throwaway `CODEX_HOME`
+    // and it read the `hooks.json` there. The NESTED shape, also measured: a
+    // document in this form was parsed, its event recognised and its timeout
+    // clamped, which Codex can only do having read the inner entry.
+    hookConfig: { path: codexHooksPath, shape: "claude" },
     events: {
         Stop: {
             registeredTimeoutMs: CODEX_TURN_REGISTERED_MS,

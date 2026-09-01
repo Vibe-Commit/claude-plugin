@@ -19,7 +19,9 @@
 import { writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { createInterface } from "node:readline/promises";
+import { Writable } from "node:stream";
 import { resolveAgentId } from "./agents/registry.js";
+import { auth } from "./commands/auth.js";
 import { connect } from "./commands/connect.js";
 import { off, status } from "./commands/status.js";
 import { report } from "./commands/report.js";
@@ -31,7 +33,14 @@ import { runPostCommit } from "./hooks/post_commit.js";
 import { runPostRewrite } from "./hooks/post_rewrite.js";
 import { LABEL_GUTTER, renderErrorBlock, resolveColour, wrap } from "./term.js";
 import { CLIENT_VERSION } from "./version.js";
-const VERBS = ["connect", "status", "off", "why", "report"];
+// `CR-216/U2` adds `auth`, and adding it MOVES `test/help.golden.txt` — which
+// `CR-084d` and the `post-commit` note below were both careful not to do. The
+// difference is the point: those two are a FLAG and a HIDDEN verb, neither of
+// which a human types, so moving the golden file for them would have been noise.
+// `auth` is typed by a human on a new machine before anything else works, so a
+// help screen that omitted it would be the defect one layer up. The golden file
+// exists to make a change to that screen deliberate, not to make it impossible.
+const VERBS = ["auth", "connect", "status", "off", "why", "report"];
 export function isVerb(value) {
     return VERBS.includes(value);
 }
@@ -149,6 +158,14 @@ async function main(argv) {
     }
     const ctx = interactiveContext(argv);
     switch (verb) {
+        case "auth":
+            // `CR-216/U2`. Both readers are injected here rather than reached for
+            // inside the verb, the same way `why` takes its reader: the suite drives
+            // every arm, and neither a TTY nor a pipe can be typed into by a test.
+            return await auth(ctx, argv.slice(1), {
+                readSecret: readSecretFromTty,
+                readStdin,
+            });
         case "connect":
             // `--sign-in` (CR-084d) is a FLAG, not a verb: `VERBS` is what `renderHelp`
             // iterates, so a sixth verb would move `test/help.golden.txt`, and the
@@ -173,6 +190,41 @@ async function main(argv) {
             // argument parser this package deliberately does not have.
             return await report(ctx, argv.slice(1));
     }
+}
+/**
+ * Read a secret from the terminal WITHOUT ECHOING IT — `CR-216/U2`.
+ *
+ * `ctx.ask` is not reusable for this. It is the consent prompt: it echoes, which
+ * is correct for `y/N` and wrong for a long-lived credential, which would then
+ * sit in the terminal's scrollback to be scrolled back to, screenshotted into a
+ * bug report, or captured by a terminal logger.
+ *
+ * The mute is the ordinary readline technique: `output` receives the prompt
+ * first and is muted only for the keystrokes that follow, so the question is
+ * still visible and the answer never is. The trailing newline is ours to write —
+ * the user's own Return was swallowed with the rest, and without it whatever
+ * prints next lands on the prompt line.
+ *
+ * Nothing here holds the secret: `rl.question`'s resolved string goes straight to
+ * the caller, which wraps it in an `IngestCredential` before doing anything else
+ * with it.
+ */
+function readSecretFromTty(prompt) {
+    let muted = false;
+    const muffled = new Writable({
+        write(chunk, encoding, cb) {
+            if (!muted)
+                process.stdout.write(chunk, encoding);
+            cb();
+        },
+    });
+    const rl = createInterface({ input: process.stdin, output: muffled, terminal: true });
+    const answer = rl.question(prompt);
+    muted = true;
+    return answer.finally(() => {
+        rl.close();
+        process.stdout.write("\n");
+    });
 }
 function readStdin() {
     return new Promise((resolve) => {

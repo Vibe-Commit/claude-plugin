@@ -26,13 +26,13 @@
  */
 import { COMMANDS, CREDENTIAL, ERRORS, OFF, STATUS, URLS, relativeAge } from "../copy/index.js";
 import { isProjectAllowed, revokeProject } from "../consent.js";
-import { loadCredential } from "../credential.js";
+import { loadCredential, savedCredentialExists } from "../credential.js";
 import { EXIT } from "../exit.js";
 import { resolveRepoSlug } from "../git.js";
 import { emitJson } from "../json.js";
 import { resolveProjectKeys } from "../project.js";
 import { lastSendForRepo } from "../state.js";
-import { LABEL_GUTTER, WRAP_COLUMNS, glyph, labelled, paint, renderErrorBlock, truncatePath, wrap, } from "../term.js";
+import { LABEL_GUTTER, WRAP_COLUMNS, glyph, labelled, paint, renderErrorBlock, tildePath, truncatePath, wrap, } from "../term.js";
 import { writeLines } from "./context.js";
 /** §10.3 indents the gutter rows four columns under the state line. */
 const ROW_INDENT = 4;
@@ -89,6 +89,12 @@ export function status(ctx, argv = []) {
             toplevel: projectKey,
             last_send: lastSend === null ? null : { at_ms: lastSend.at, seq: lastSend.seq },
             dashboard: URLS.dashboard,
+            // `CR-216/U3`. A SOURCE NAME, never the credential — `IngestCredential.source`
+            // is documented safe to log for exactly this. `null` is "no credential",
+            // which is a different answer from either source and must not collapse into
+            // one. D98 detection 3 holds the key set; this key is a contract change and
+            // `json-read-verbs.test.ts` records it as one.
+            credential: load.kind === "ok" ? load.credential.source : null,
         });
         return on ? EXIT.ok : EXIT.notConnected;
     }
@@ -102,6 +108,13 @@ export function status(ctx, argv = []) {
     // credential has still recorded a session, and saying otherwise would be false.
     if (on && lastSend === null)
         lines.push("", ...wrap(STATUS.neverSent, 2));
+    // `CR-216/U3`. Same precedent as `neverSent` above: a SENTENCE, not a fifth
+    // gutter row — §10.3 draws four questions in a fixed order and the order is the
+    // feature. Only when the env var is actually overriding something: CI sets the
+    // variable deliberately with no file to shadow and must not be nagged for it.
+    if (load.kind === "ok" && load.credential.source === "env" && savedCredentialExists(ctx.home)) {
+        lines.push("", ...wrap(STATUS.credentialShadowed, 2));
+    }
     lines.push("", ...actionLines(ctx, on));
     writeLines(ctx.stdout, lines);
     return on ? EXIT.ok : EXIT.notConnected;
@@ -120,7 +133,7 @@ export function status(ctx, argv = []) {
  */
 function repoValue(ctx, toplevel) {
     const slug = resolveRepoSlug(toplevel);
-    const shown = tildify(toplevel, ctx.home);
+    const shown = tildePath(toplevel, ctx.home);
     const overhead = ROW_INDENT + LABEL_GUTTER + STATUS.repoToplevel(slug, "").length;
     let budget = Math.max(12, WRAP_COLUMNS - overhead);
     let value = STATUS.repoToplevel(slug, truncatePath(shown, budget));
@@ -136,13 +149,6 @@ function repoValue(ctx, toplevel) {
         value = STATUS.repoToplevel(slug, truncatePath(shown, budget));
     }
     return value;
-}
-/** `/Users/dev/code/x` -> `~/code/x`, as §10.3 draws it. */
-function tildify(path, home) {
-    if (home !== "" && (path === home || path.startsWith(`${home}/`))) {
-        return `~${path.slice(home.length)}`;
-    }
-    return path;
 }
 /**
  * The two trailing actions, aligned as one pair — §10.3 draws their values in a
@@ -206,7 +212,7 @@ function credentialProblem(load, colour) {
                         : CREDENTIAL.wrongClassFileWhy,
                 ],
                 fixLabel: CREDENTIAL.wrongClassFix,
-                fixes: [COMMANDS.connect],
+                fixes: [CREDENTIAL.wrongClassCommand],
             }, colour);
         case "insecure-file":
             return renderErrorBlock({
@@ -229,7 +235,7 @@ function credentialProblem(load, colour) {
                     CREDENTIAL.unreadableWhy,
                 ],
                 fixLabel: CREDENTIAL.unreadableFix,
-                fixes: [COMMANDS.connect],
+                fixes: [CREDENTIAL.unreadableCommand],
             }, colour);
     }
 }

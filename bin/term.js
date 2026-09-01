@@ -131,4 +131,18 @@ export function renderErrorBlock(block, colour) {
     }
     return out;
 }
+/**
+ * `/Users/dev/code/x` -> `~/code/x`, as §10.3 draws it.
+ *
+ * Lived in `status.ts` while the repo row was its only caller. `CR-216/U2` gives
+ * it a second one — `auth` names the file it wrote — and a second COPY of it
+ * would be a second thing to get wrong about `home === ""`, which is the value
+ * `index.ts` falls back to and the one case where the tilde must not be applied.
+ */
+export function tildePath(path, home) {
+    if (home !== "" && (path === home || path.startsWith(`${home}/`))) {
+        return `~${path.slice(home.length)}`;
+    }
+    return path;
+}
 //# sourceMappingURL=term.js.map

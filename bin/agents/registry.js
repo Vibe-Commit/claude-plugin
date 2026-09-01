@@ -30,7 +30,7 @@ import { isInside, isInsideAny } from "../paths.js";
 import { CLAUDE_CODE } from "./claude_code.js";
 import { CODEX_CLI } from "./codex_cli.js";
 import { CURSOR } from "./cursor.js";
-import { UNKNOWN_AGENT_ID, } from "./types.js";
+import { HOOK_EVENTS, UNKNOWN_AGENT_ID, } from "./types.js";
 /**
  * Every dialect, in registration order.
  *
@@ -99,6 +99,52 @@ export function resolveAgentId(argv) {
  */
 export function dialectFor(agentId) {
     return DIALECTS.find((dialect) => dialect.id === agentId) ?? CLAUDE_CODE;
+}
+/**
+ * ⛔ **WHICH OF THE THREE EVENTS IS THIS `hook_event_name`? — `CR-195`, D205.**
+ *
+ * Returns the canonical `HookEventName`, or `null` for a string that names none
+ * of them. `null` is a real answer and not a failure: Claude Code, Codex and
+ * Cursor between them fire far more events than the three this client registers,
+ * and a `SubagentStop` payload arriving here is ordinary rather than wrong.
+ *
+ * ## ⛔ The dialect's own table first, then a case-insensitive fallback
+ *
+ * The exact match is the answer whenever the agent spells events the way its
+ * dialect says it does. The fallback exists for the case that has already bitten
+ * this client once — ⚠ **a spelling nobody anticipated** — and the asymmetry is
+ * what justifies it:
+ *
+ *   - **failing to recognise `SessionEnd` costs the final turn, permanently.**
+ *     That event has no next invocation to pick up what was missed.
+ *   - **recognising one spuriously costs 150 ms of reserve and one settle.**
+ *
+ * Those are not the same size, so this resolves in the direction that captures.
+ * ⛔ It is D164 §D7's ruling applied to events rather than to agent ids — *"an
+ * unknown id falls back; it never stops capture … a misconfigured hook that
+ * captures NOTHING is a worse outcome than one that captures conservatively"* —
+ * and it is the same shape: a BEHAVIOUR fallback that rewrites nothing on the
+ * wire.
+ *
+ * ⚠ **The fallback can only ever ADD recognition, never redirect it.** It runs
+ * only after the exact match has already failed, so a dialect's own spelling
+ * always wins; and `HOOK_EVENTS` is unambiguous case-insensitively, so no
+ * canonical event can be resolved as a different canonical event.
+ * `test/dialect-events.test.ts` pins both directions, including the distinctness
+ * that makes the second claim true rather than merely currently true.
+ *
+ * ⚠ **NOT a widening of the confinement boundary and not adjacent to one.** The
+ * value read here decides how long to wait and whether to settle; it never
+ * reaches a path that decides what may be READ. That stays `transcriptRoots`.
+ */
+export function canonicalHookEvent(dialect, wireName) {
+    if (wireName === "")
+        return null;
+    const exact = HOOK_EVENTS.find((event) => dialect.eventNames[event] === wireName);
+    if (exact !== undefined)
+        return exact;
+    const folded = wireName.toLowerCase();
+    return HOOK_EVENTS.find((event) => event.toLowerCase() === folded) ?? null;
 }
 /**
  * Every transcript root, deduped — ⛔ **the confinement boundary, computed from
