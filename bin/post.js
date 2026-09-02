@@ -254,7 +254,13 @@ export async function send(url, headers, body, timeoutMs) {
         // The body read happens INSIDE the try and BEFORE the timer is cleared, so
         // the same `AbortController` that bounds the request also bounds the read.
         // A slow body cannot outlive the hook's wall-clock budget.
-        return { kind: "response", status: res.status, detail: await readErrorDetail(res) };
+        return {
+            kind: "response",
+            status: res.status,
+            detail: await readErrorDetail(res),
+            // `null` when the server does not send it at all — see `captureId` above.
+            captureId: res.headers.get("x-capture-id"),
+        };
     }
     catch {
         return { kind: "unreachable" };
@@ -346,10 +352,38 @@ export async function deliver(ctx, eof, readBody) {
             // and a HELD line is consumed without being sent — so truncating by the
             // number of shas on the wire would delete the held line at the head and
             // leave the delivered commit to be re-sent on every hook, forever.
-            if (ctx.commits !== undefined && ctx.commits.count > 0) {
+            //
+            // ⛔ AND ONLY WHEN THE SERVER SAYS THE COMMITS LANDED (D209 §3). A 200 is
+            // "the delta was accepted", not "your commit was bound": the server writes
+            // a `capture_commits` edge ONLY from a delta that SEALED A TURN, because
+            // the row's turn-hash columns are NOT NULL with RESTRICT FKs and a turnless
+            // delta has no turn to name. So a session's FIRST commit reached the
+            // server on a `Stop` that closed nothing, was discarded there, and was
+            // then deleted here by this very line. Measured in prd, session
+            // `a1ae7406`: three deltas, two of which wrote captures, and the sha never
+            // bound.
+            //
+            // ⚠ THE HOLD IS NARROW ON PURPOSE — two conditions, and dropping either
+            // one re-opens something:
+            //   • `captureId === ""` — PRESENT AND EMPTY. An ABSENT header is an old
+            //     server, and holding against one means holding forever.
+            //   • `shas.length > 0` — we actually put something on the wire. A batch
+            //     of nothing but HELD entries had nothing to bind, and those entries
+            //     can never become sendable (`capSpool`), so holding them would keep
+            //     re-reading a line with no future instead of draining it.
+            const nothingLanded = outcome.kind === "response" && outcome.captureId === "";
+            const holdForNextDelta = nothingLanded && (ctx.commits?.shas.length ?? 0) > 0;
+            if (ctx.commits !== undefined && ctx.commits.count > 0 && !holdForNextDelta) {
                 dropSpooled(ctx.home, key, ctx.commits.count);
             }
             // The rewrite spool is its own file with its own cap, so its own drop.
+            //
+            // ⛔ AND IT IS UNCONDITIONAL, UNLIKE THE COMMITS ABOVE — do not "fix" this
+            // to match. `tryRecordRewrites` on the server sits OUTSIDE the capture
+            // write and its comment says why: "Unconditional on the capture: a delta
+            // that sealed no turns still saw the rewrite, and the mapping is what
+            // keeps a squash-merged commit reachable." A `commit_sha_successors` row
+            // names no turn, so `X-Capture-Id` says nothing about whether it landed.
             if (ctx.rewrites !== undefined && ctx.rewrites.length > 0) {
                 dropRewrites(ctx.home, key, ctx.rewrites.length);
             }

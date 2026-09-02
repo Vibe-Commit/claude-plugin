@@ -18,16 +18,16 @@
   ],
   "capture": {
     "repo": "Vibe-Commit/vibecommit-capture",
-    "commit": "09a3ea297571803eed6c4b18a74c3c49cde91da2",
+    "commit": "2cc789c50b7ae96973393d91d57cf9956e813604",
     "npmPackage": "@vibe-commit/capture",
-    "npmVersion": "0.2.2"
+    "npmVersion": "0.2.3"
   },
   "bundle": {
     "root": "bin",
     "algorithm": "sha256",
-    "digest": "ee94566bfd368b442d4823a82a254559a9e9bc30c8e7cd0617cbf641ce034613",
+    "digest": "aff1c5c6f6857140346bc5bcca7377a7c52f947d32f546dbc2c9c69ac862bd50",
     "fileCount": 50,
-    "byteCount": 690829,
+    "byteCount": 693118,
     "files": {
       "agent_hooks.js": "2f06a5fcb78551ce8d7de33ac47395d9d993e1bca8610f8cc6488677966571fd",
       "agent_install.js": "40d665b2c07ee9e4312840b748b0c4529beba8586545bc23b753e8d2bab249cc",
@@ -69,7 +69,7 @@
       "oauth/token.js": "39a7c531d829faf2518482425a8c7251174388f9230b7f7bc480626d0be92c6d",
       "paths.js": "dad1f392b768a735f1fac09c427de1cfd86a1eec0b633e6e46a1026b8b1dbdd1",
       "policy.js": "e3bf07f2b5b467cddce2f339cbaf85e24bed2c6d997ce2659780519965cb4143",
-      "post.js": "100a7b56bc9878fcef7ddcdf67e4bde6bb7a2f1df5c0921025ac1512f70c6190",
+      "post.js": "65c818efd9ed3378dc74501865ee9b082cb0ca19222b1e7b26ff175dc3072563",
       "project.js": "1af9817a3d56b94ca248a40add12c3f80b7af3b2d43d6b5e2998886c13c293fd",
       "redact.js": "d7ea671191ad107d47d72c99a5350128a1ca941eeb189e38bfe08e80b0b1f5fa",
       "runtime.js": "b9b3b798b0736564843907658248f47638eec419e6ff7cd6ff6af55dad4859f9",
@@ -78,7 +78,7 @@
       "state.js": "241f31c9648b2c049bf966d5f8a31f888a46115bd5c5b26b40020a064c79b67a",
       "system_message.js": "dcd68a1c39cf30f9454d4d077ae392eab1af4e835d2d92c045fa79fdba9705c9",
       "term.js": "f47d76c06871c48b1f8c0a2c77bbc6c631406270651f04d4b85f0fa6e0791514",
-      "version.js": "4b0344838c212eb7a5b2ed73147ac16986f194ddce29965856d775c6be506289"
+      "version.js": "16c5eca8a5b359342b58341b20557a3ea6546f3f4647c4b52cb16663569434a5"
     }
   }
 }
