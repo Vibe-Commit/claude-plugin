@@ -59,8 +59,8 @@ Read/search tools:
   `query` (+ optional `filters.repo` / `filters.org`). Returns
   `{ items:[{ kind, id, repo_id, repository, created_at, snippet }],
   page, total_pages, total }`, most-recent-first. `repository` is
-  `{ id, slug, display_name }`, or null when that repository is outside your
-  readable set. ⚠ `repo_id` holds the SLUG and is deprecated: it is NOT the
+  `{ id, slug, display_name }`, null only while the server is mid-upgrade — it does
+  NOT mean you lack access. ⚠ `repo_id` holds the SLUG and is deprecated: it is NOT the
   `repository_id` that `commit_coverage` returns and `blame_commit` accepts.
   Pass `repository.slug` to a `repo` argument and `repository.id` to a
   `repository_id` one.
@@ -76,7 +76,9 @@ Read/search tools:
 - `commit_coverage` — how many commits in a repository have a capture
   recorded against them, broken down by edge grade, with the recorded
   successor mapping. Pass `repo` (the same slug `blame_commit` takes) and
-  `ref`, which is required and not defaulted. It returns the shas we hold
+  `ref`, which is OPTIONAL and never defaulted — omit it and the answer echoes
+  `ref: null` rather than guessing `main`. Omit the repository too and it reports
+  on every repository you can read. It returns the shas we hold
   an edge for and NOT a percentage: reachability from a ref is a local git
   question the server cannot answer, so compute any rate in the user's own
   clone.
