@@ -94,7 +94,15 @@ jobs:
         if: steps.vendor.outcome == 'success'
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ github.token }}
+          # ⛔ A REPO-SCOPED PAT, NOT `github.token`, and only for this step. The
+          # Vibe-Commit ORG forbids Actions from creating pull requests (measured:
+          # the repo-level PUT returns 409), and that stays off — one PAT scoped
+          # to this repo is narrower than letting every org workflow open PRs.
+          # The push inside the script still uses checkout's own token; only
+          # `gh pr list` / `gh pr create` read this. Missing, expired or revoked,
+          # `gh` fails, the script reports `pushed`, and the issue step below
+          # files the one-click link — which is why THAT step must not use it.
+          GH_TOKEN: ${{ secrets.REVENDOR_PR_TOKEN }}
           RELEASE_VERSION: ${{ github.event.client_payload.version }}
           BASE_SHA: ${{ github.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -123,6 +131,10 @@ jobs:
           steps.pr.outputs.result != 'exists' &&
           steps.pr.outputs.result != 'noop'
         env:
+          # ⛔ `github.token`, DELIBERATELY not the PAT above. This step exists for
+          # the case where the PR could not be opened — and an expired or revoked
+          # PAT is one of those cases. The org policy blocks PRs, not issues, and
+          # `issues: write` is granted above, so this token cannot fail the same way.
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ github.event.client_payload.version }}
           OUTCOME: ${{ steps.compare.outputs.outcome }}
