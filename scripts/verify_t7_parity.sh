@@ -1,14 +1,24 @@
 #!/usr/bin/env bash
 # verify_t7_parity.sh — CI-able parity check for M0-T14.
 #
-# Verifies that AGENTS.md, CLAUDE.md, and .claude/skills/vibecommit/SKILL.md
-# in this repo byte-match the canonical content produced by T7's
-# src/vendors/claude_code.ts + src/vendors/_shared/{agents_md,rules_body,managed_header}.ts.
+# Verifies that the MIRROR — the content rendered by vibecommit-mcp's (T7's)
+# src/vendors/claude_code.ts + src/vendors/_shared/{agents_md,rules_body,managed_header}.ts
+# — byte-matches the CANONICAL rules text in this repo: AGENTS.md, CLAUDE.md,
+# and .claude/skills/vibecommit/SKILL.md.
+#
+# ⛔ DIRECTION (D117 §2, D135 §4): THIS REPO IS CANONICAL. rules_body.ts IS THE
+# MIRROR. Byte equality is symmetric, so the check itself has no direction —
+# but its remediation does, and a diff cannot say which side is wrong. If the
+# plugin text is right, make vibecommit-mcp's rules_body.ts match it. If the
+# PLUGIN's text is what is wrong, fix it here first, merge, then mirror it.
+# Never edit a plugin file just to match the mirror.
+# (Until TODOS[156](b) this header named rules_body.ts the "source of truth",
+# which is the direction D117 §2 ruled out.)
 #
 # Strategy: run T7's TypeScript via Node (tsx/ts-node/node --input-type) to
 # extract the actual string values. If Node/tsx is unavailable, fall back to
 # a sed-based unescape of the template literal content. Either way, compare
-# the canonical output against the plugin files.
+# the mirror's rendered output against the canonical plugin files.
 #
 # Usage:
 #   # From the claude-plugin repo root:
@@ -18,10 +28,10 @@
 #   ./scripts/verify_t7_parity.sh
 #
 # Exit codes:
-#   0 — all files match T7 source of truth
-#   1 — one or more files differ (diff printed to stderr)
+#   0 — the mirror matches all three canonical files
+#   1 — one or more files differ (diff printed to stderr; the mirror follows the plugin)
 #
-# T7 source of truth (read-only):
+# The MIRROR this checks (read-only here — fix it in vibecommit-mcp):
 #   $T7_REPO/src/vendors/claude_code.ts
 #   $T7_REPO/src/vendors/_shared/agents_md.ts
 #   $T7_REPO/src/vendors/_shared/rules_body.ts
@@ -62,7 +72,7 @@ for f in \
 done
 
 # ---------------------------------------------------------------------------
-# Generate canonical content via Node/tsx (preferred) or via inline script
+# Render the mirror's content via Node/tsx (preferred) or via inline script
 #
 # We use Node to import T7's modules and serialize the exact runtime values.
 # This is the only fully correct approach — the TypeScript source contains
@@ -111,7 +121,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Extract canonical content from Node output or inline
+# Extract the mirror's content from Node output or inline
 # ---------------------------------------------------------------------------
 
 if [ "$EXTRACTION_MODE" = "node" ]; then
@@ -125,9 +135,9 @@ if [ "$EXTRACTION_MODE" = "node" ]; then
     ' "$TMPDIR_PARITY/output.txt"  # trailing newline is stripped by the $(...) capture below
   }
 
-  CANONICAL_AGENTS_MD="$(get_file_content "AGENTS.md")"
-  CANONICAL_CLAUDE_MD="$(get_file_content "CLAUDE.md")"
-  CANONICAL_SKILL_MD="$(get_file_content ".claude/skills/vibecommit/SKILL.md")"
+  MIRROR_AGENTS_MD="$(get_file_content "AGENTS.md")"
+  MIRROR_CLAUDE_MD="$(get_file_content "CLAUDE.md")"
+  MIRROR_SKILL_MD="$(get_file_content ".claude/skills/vibecommit/SKILL.md")"
 
 else
   # ---------------------------------------------------------------------------
@@ -191,7 +201,7 @@ else
   MANAGED_SECTION_END="<!-- vibecommit:managed:end -->"
 
   # CLAUDE.md = MANAGED_HEADER + "\n\n" + RULES_BODY
-  CANONICAL_CLAUDE_MD="${MANAGED_HEADER}
+  MIRROR_CLAUDE_MD="${MANAGED_HEADER}
 
 ${RULES_BODY}"
 
@@ -204,7 +214,7 @@ ${RULES_BODY}"
   # Strip leading blank lines, preserve internal structure, strip trailing newline
   AGENTS_MD_BODY_TRIMMED="$(printf '%s' "$AGENTS_MD_BODY" | awk 'NF{found=1} found')"
 
-  CANONICAL_AGENTS_MD="${MANAGED_SECTION_START}
+  MIRROR_AGENTS_MD="${MANAGED_SECTION_START}
 ${AGENTS_MD_BODY_TRIMMED}
 ${MANAGED_SECTION_END}"
 
@@ -213,7 +223,7 @@ ${MANAGED_SECTION_END}"
 name: vibecommit
 description: Capture this session into VibeCommit by calling the commit_conversation MCP tool after each meaningful chunk of work (and right after each commit). Refresh instructions by calling the setup tool.
 ---'
-  CANONICAL_SKILL_MD="${SKILL_FRONTMATTER}
+  MIRROR_SKILL_MD="${SKILL_FRONTMATTER}
 ${MANAGED_HEADER}
 
 ${RULES_BODY}"
@@ -221,7 +231,7 @@ ${RULES_BODY}"
 fi
 
 # ---------------------------------------------------------------------------
-# Compare plugin files against canonical content
+# Compare the mirror's rendered content against the canonical plugin files
 # ---------------------------------------------------------------------------
 
 ERRORS=0
@@ -229,7 +239,7 @@ ERRORS=0
 compare_file() {
   local label="$1"
   local plugin_file="$2"
-  local canonical="$3"
+  local mirror="$3"
 
   if [ ! -f "$plugin_file" ]; then
     echo "FAIL [$label]: file missing: $plugin_file" >&2
@@ -241,18 +251,19 @@ compare_file() {
   local plugin_content
   plugin_content="$(cat "$plugin_file")"
 
-  if [ "$plugin_content" = "$canonical" ]; then
+  if [ "$plugin_content" = "$mirror" ]; then
     echo "PASS [$label]: $plugin_file"
   else
-    echo "FAIL [$label]: $plugin_file differs from T7 canonical content" >&2
-    diff <(printf '%s\n' "$canonical") <(printf '%s\n' "$plugin_content") >&2 || true
+    echo "FAIL [$label]: the mirror rendered from \$T7_REPO differs from canonical $plugin_file (D117 §2: the mirror follows this file)" >&2
+    echo "  diff: '<' = mirror (rendered from \$T7_REPO), '>' = canonical ($plugin_file)" >&2
+    diff <(printf '%s\n' "$mirror") <(printf '%s\n' "$plugin_content") >&2 || true
     ERRORS=$((ERRORS + 1))
   fi
 }
 
-compare_file "CLAUDE.md" "$PLUGIN_ROOT/CLAUDE.md" "$CANONICAL_CLAUDE_MD"
-compare_file "AGENTS.md" "$PLUGIN_ROOT/AGENTS.md" "$CANONICAL_AGENTS_MD"
-compare_file "SKILL.md" "$PLUGIN_ROOT/.claude/skills/vibecommit/SKILL.md" "$CANONICAL_SKILL_MD"
+compare_file "CLAUDE.md" "$PLUGIN_ROOT/CLAUDE.md" "$MIRROR_CLAUDE_MD"
+compare_file "AGENTS.md" "$PLUGIN_ROOT/AGENTS.md" "$MIRROR_AGENTS_MD"
+compare_file "SKILL.md" "$PLUGIN_ROOT/.claude/skills/vibecommit/SKILL.md" "$MIRROR_SKILL_MD"
 
 # ---------------------------------------------------------------------------
 # Result
@@ -260,10 +271,12 @@ compare_file "SKILL.md" "$PLUGIN_ROOT/.claude/skills/vibecommit/SKILL.md" "$CANO
 
 if [ "$ERRORS" -eq 0 ]; then
   echo ""
-  echo "verify_t7_parity: ALL PASS — AGENTS.md + CLAUDE.md + SKILL.md byte-match T7 source of truth"
+  echo "verify_t7_parity: ALL PASS — the T7 mirror byte-matches canonical AGENTS.md + CLAUDE.md + SKILL.md"
   exit 0
 else
   echo "" >&2
-  echo "verify_t7_parity: FAILED ($ERRORS file(s) differ from T7 source of truth)" >&2
+  echo "verify_t7_parity: FAILED ($ERRORS file(s): the T7 mirror differs from the canonical plugin text)" >&2
+  echo "  The diff cannot say WHICH side is wrong. If the plugin text is right, change rules_body.ts to match it." >&2
+  echo "  If the plugin text is what is wrong, fix it here first, merge, then mirror it — plugin first, always (D117 §2)." >&2
   exit 1
 fi
