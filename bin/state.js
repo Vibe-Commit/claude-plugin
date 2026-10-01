@@ -39,7 +39,7 @@ import { chmodSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "
 import { dirname, join } from "node:path";
 import { repoSessionsDir, sessionStatePath } from "./paths.js";
 import { EMPTY_FILE_STATE } from "./policy.js";
-export const EMPTY_SESSION_STATE = { seq: 0, stop: null, files: {} };
+export const EMPTY_SESSION_STATE = { seq: 0, stop: null, files: {}, endHold: null };
 export function loadSessionState(home, key) {
     const path = sessionStatePath(home, key);
     // No repo, no key, no read. Falling back to a session-only file here is the
@@ -108,6 +108,97 @@ export function lastSendForRepo(home, repoKey) {
     }
     return best;
 }
+/**
+ * Every byte this repo's sessions WROTE OFF, across every session and file —
+ * `CR-228`, `TODOS[142]`.
+ *
+ * ⛔ **THE COUNTERS EXISTED; NOTHING READ THEM.** `markSkipped` and `enforceCaps`
+ * have always added to `gapBytes`/`gapCount`, and until this function no
+ * consumer anywhere did — so `status` printed "ok Capture is on" over a session
+ * whose 323,147 bytes were gone (`CR-227` Gate A). A written-off byte is never
+ * re-offered (`sentOffset` is already past it), so this is the only place the
+ * loss can ever be seen from this machine.
+ *
+ * ⛔ **NO `lastSentAt` FILTER, AND THAT IS THE POINT.** `lastSendForRepo` above
+ * skips every stream that never delivered, and `markSkipped` deliberately
+ * CARRIES `lastSentAt` — so a session that sent nothing and lost everything has
+ * `lastSentAt === 0` and `gapCount > 0`. That is the measured failure's own
+ * shape. A counter added inside that loop would read zero on exactly the case
+ * that motivated it (VD, reviewing this task).
+ *
+ * A scan for the same reason `lastSendForRepo` is one: `status` has no
+ * `session_id`, and a second index would be a second truth to go stale.
+ */
+export function writtenOffForRepo(home, repoKey) {
+    const none = { bytes: 0, gaps: 0, sessions: 0 };
+    const dir = repoSessionsDir(home, repoKey);
+    if (dir === null)
+        return none;
+    let entries;
+    try {
+        entries = readdirSync(dir);
+    }
+    catch {
+        return none;
+    }
+    let bytes = 0;
+    let gaps = 0;
+    let sessions = 0;
+    for (const entry of entries) {
+        if (!entry.endsWith(".json"))
+            continue;
+        const session = readStateAt(join(dir, entry));
+        let holes = 0;
+        for (const file of Object.values(session.files)) {
+            bytes += file.gapBytes;
+            holes += file.gapCount;
+        }
+        gaps += holes;
+        if (holes > 0)
+            sessions += 1;
+    }
+    return { bytes, gaps, sessions };
+}
+/**
+ * Bytes a `SessionEnd` HELD that have not since been delivered — `CR-228`.
+ *
+ * The other half of `writtenOffForRepo`, and the reason the hold is not the
+ * same defect with a longer fuse: a session that ended owing bytes is reported
+ * as owing them for as long as it does. ⚠ A resumed session drains its hold on
+ * its next successful send (measured — see `stampGaps`), and one never resumed
+ * never does; this machine cannot know which a given session will be. So this
+ * counts what is owed and claims nothing about recovery.
+ */
+export function heldAtEndForRepo(home, repoKey) {
+    const none = { bytes: 0, sessions: 0 };
+    const dir = repoSessionsDir(home, repoKey);
+    if (dir === null)
+        return none;
+    let entries;
+    try {
+        entries = readdirSync(dir);
+    }
+    catch {
+        return none;
+    }
+    let bytes = 0;
+    let sessions = 0;
+    for (const entry of entries) {
+        if (!entry.endsWith(".json"))
+            continue;
+        const session = readStateAt(join(dir, entry));
+        if (session.endHold === null)
+            continue;
+        let owed = 0;
+        for (const [fileKey, eof] of Object.entries(session.endHold.eof)) {
+            owed += Math.max(0, eof - fileState(session, fileKey).sentOffset);
+        }
+        bytes += owed;
+        if (owed > 0)
+            sessions += 1;
+    }
+    return { bytes, sessions };
+}
 /** Persist. Returns false on any failure — the caller must not throw from a hook. */
 export function saveSessionState(home, key, next) {
     const path = sessionStatePath(home, key);
@@ -163,7 +254,25 @@ function parseSessionState(parsed) {
                 files[key] = state;
         }
     }
-    return { seq: nonNegative(o.seq), stop: parseStop(o.stop), files };
+    return { seq: nonNegative(o.seq), stop: parseStop(o.stop), files, endHold: parseEndHold(o.endHold) };
+}
+/** Absent in every file written before `CR-228`, which reads as "held nothing". */
+function parseEndHold(value) {
+    if (value === null || typeof value !== "object" || Array.isArray(value))
+        return null;
+    const o = value;
+    const rawEof = o.eof;
+    if (rawEof === null || typeof rawEof !== "object" || Array.isArray(rawEof))
+        return null;
+    const eof = {};
+    for (const [key, size] of Object.entries(rawEof)) {
+        const n = nonNegative(size);
+        if (n > 0)
+            eof[key] = n;
+    }
+    if (Object.keys(eof).length === 0)
+        return null;
+    return { at: nonNegative(o.at), eof };
 }
 function parseStop(value) {
     if (value === null || typeof value !== "object" || Array.isArray(value))

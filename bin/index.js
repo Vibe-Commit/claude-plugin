@@ -23,6 +23,7 @@ import { createInterface } from "node:readline/promises";
 import { Writable } from "node:stream";
 import { resolveAgentId } from "./agents/registry.js";
 import { auth } from "./commands/auth.js";
+import { browserCredential } from "./commands/browser_credential.js";
 import { connect } from "./commands/connect.js";
 import { off, status } from "./commands/status.js";
 import { report } from "./commands/report.js";
@@ -166,12 +167,19 @@ async function main(argv) {
             return await auth(ctx, argv.slice(1), {
                 readSecret: readSecretFromTty,
                 readStdin,
+                // `CR-226`. The browser mint, first on a terminal; the two readers above
+                // stay the fallback. Injected HERE and nowhere else — the verb's default
+                // is paste-only, so this line is what makes the route reachable.
+                browser: browserCredential,
             });
         case "connect":
             // `--sign-in` (CR-084d) is a FLAG, not a verb: `VERBS` is what `renderHelp`
             // iterates, so a sixth verb would move `test/help.golden.txt`, and the
             // brief for this task is explicit that the golden file must not move.
-            return await connect(ctx, { signIn: argv.includes("--sign-in") });
+            // `CR-226`: the browser beat for a fresh machine. Same rule as `auth` —
+            // `connect`'s default never opens a browser, so without this argument the
+            // route is unreachable from the install path.
+            return await connect(ctx, { signIn: argv.includes("--sign-in") }, { browser: browserCredential });
         case "status":
             // `argv.slice(1)` for the same reason `why` and `report` take it: `status`
             // reads its own `--json` flag rather than this package acquiring an

@@ -19,27 +19,63 @@
  */
 import { cursorHooksPath, cursorTranscriptRoot, isCursorTranscript } from "../paths.js";
 /**
- * ⛔ **UNMEASURED, AND ADOPTED AS A FLOOR RATHER THAN GUESSED.**
+ * ⭐ **MEASURED. `D5`'s SECOND HALF IS ANSWERED (`TODOS[130]`), AND THE ANSWER IS
+ * THAT CURSOR IMPOSES NO NUMBER OF ITS OWN.**
  *
- * ⚠ **`D5` HAD TWO HALVES AND ONLY ONE OF THEM IS ANSWERED (D205).** It asked
- * for the exact `hook_event_name` strings Cursor sends *and* the timeouts its
- * `~/.cursor/hooks.json` registers. The STRINGS are now measured — see
- * `eventNames` below, read out of the shipped app bundle, which is what
- * discharged `CR-195`'s block. ⛔ **The TIMEOUTS below are still not measured**,
- * and are deliberately left as the floor they always were rather than quietly
- * promoted on the strength of the other half. Nothing installs a Cursor hook
- * today, so no Cursor hook has ever fired and these numbers remain unreachable
- * in production.
+ * `D5` asked for the exact `hook_event_name` strings Cursor sends *and* the
+ * timeouts its `~/.cursor/hooks.json` registers. D205 discharged the strings
+ * from the shipped app bundle. The timeouts are now read the same way, out of
+ * `workbench.desktop.main.js` — the validator `Fed` and the executor
+ * `_executeCommandHookScript`:
  *
- * ⚠ **The direction of safety is what picks them.** Too WIDE and the agent
- * kills the process before this client's watchdog fires — which loses the
- * exit-0/silent-stdout contract, the one outcome DESIGN.md §13.7 forbids. Too
- * TIGHT and an invocation sends less and the next one picks it up. So the
- * registry's tightest existing pair is taken as a FLOOR: it holds whatever
- * Cursor turns out to register, down to Codex's 3 s cap.
+ * | question | measured |
+ * |---|---|
+ * | is there a per-hook `timeout`? | **yes**, and it is in **SECONDS** |
+ * | is it clamped or capped? | **NO** — above `3600` Cursor only `console.warn`s |
+ * | rejected when? | non-number, or `<= 0`. Nothing else. |
+ * | default when omitted | **60 s** — `(t.timeout ?? ROi) * 1e3`, `ROi = 60` |
+ * | enforcement | real: killed, **exit code 124**, logged `timed out after Ns` |
+ * | on timeout | `failClosed: true` BLOCKS the tool; otherwise the step proceeds |
  *
- * ⛔ **This is a refusal to guess, not a measurement of Cursor**, and `CR-195`
- * owns the real numbers once `D5` comes back.
+ * ⛔ **SO THERE WAS NEVER A CURSOR NUMBER TO DISCOVER. Cursor honours whatever we
+ * register.** The old header said `CR-195` "owns the real numbers once `D5` comes
+ * back"; `D5` is back, and the real numbers are ours to choose.
+ *
+ * ## ⚠ THE NUMBERS BELOW DO NOT CHANGE — BUT THEIR JUSTIFICATION DOES
+ *
+ * They were a defensive floor against a cap that might exist. They are now a
+ * DELIBERATE PAIR, and the reasoning is no longer conditional:
+ *
+ *   - We register **3 s**, so Cursor kills the hook at 3 s and not before.
+ *   - Our own watchdog is **2.2 s**, so it always fires **800 ms FIRST**.
+ *
+ * That ordering is the whole point. `DESIGN.md §13.7` forbids one outcome — the
+ * agent killing us before we can exit 0 with silent stdout — and the old header
+ * could only *hope* the registered value held. It holds: the client watchdog
+ * leads the registered timeout by construction, on a value Cursor does not
+ * override.
+ *
+ * ⚠ And note the direction against Cursor's own default: **60 s**. Registering
+ * 3 s TIGHTENS by twenty-fold. An omitted `timeout` would leave a wedged hook
+ * stalling an agent step for a full minute, so writing this field is not
+ * ceremony — it is the difference between a 2.2 s worst case and a 60 s one.
+ *
+ * ## ⛔ WHAT THIS MEASUREMENT IS, AND WHAT IT IS NOT
+ *
+ * It is a reading of **shipped code**, not an observed firing — the same
+ * standing as D205's strings, and the same limit. It proves what Cursor's
+ * validator accepts and what its executor does with the value. It does **not**
+ * prove a hook of ours has been fired by a real Cursor session and killed at
+ * 3 s. That confirmation is cheap now that the signal is known — **exit code
+ * 124** and `Hook … timed out after 3s` in Cursor's log — and it is owed.
+ *
+ * ⚠ **Both clauses of the old header were false when it was written, which is
+ * why this row existed.** It said *"Nothing installs a Cursor hook today, so no
+ * Cursor hook has ever fired and these numbers remain unreachable in
+ * production."* `CURSOR` carries a `hookConfig`, so `installAgentHooks` writes
+ * `~/.cursor/hooks.json` on any machine with Cursor present — and that shipped
+ * in `0.2.0` and is live in `0.2.3`. The numbers were reachable, in users'
+ * hands, and documented as unreachable.
  */
 const CURSOR_REGISTERED_MS = 3_000;
 const CURSOR_CLIENT_MS = 2_200;

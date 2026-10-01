@@ -12,17 +12,21 @@
  *   - `CR-025` owns the ending: capture the current session and print the live
  *     `/app/commits/<sha>` URL. The seam is marked below.
  *
- * `CR-084d` lands the browser sign-in beat (PKCE loopback → a user-principal
- * token for the READ lane) behind `--sign-in`. It is opt-in and not part of the
- * default install for one reason: **sign-in does not produce an ingest
- * credential**, so it cannot replace the beat below. No route in
- * `vibecommit-mcp` mints a `vcik_` — `mintIngestCredential` exists and has no
- * call site outside that repo's own tests — so `VIBECOMMIT_TOKEN` remains the
- * supported path for capture, exactly as before.
+ * `CR-084d` landed the browser sign-in beat (PKCE loopback → a user-principal
+ * token for the READ lane) behind `--sign-in`, opt-in because sign-in did not
+ * produce an ingest credential.
  *
- * @provenance vibecommit-mcp src/oauth/ingest_credential.ts — no route mints one, verified
+ * ⚠ `CR-226` CHANGED THAT, AND THIS NOTE USED TO SAY THE OPPOSITE. The server
+ * now has a route in front of `mintIngestCredential`, so a fresh machine that
+ * reaches the credential beat with a human at the terminal signs in through the
+ * browser and mints its own credential there (`browser_credential.ts`) — browser
+ * FIRST, with the old warning pointing at `vibecommit auth` as the fallback when
+ * any step fails. `--sign-in` keeps its meaning (sign in for the read lane even
+ * when a credential exists), and `VIBECOMMIT_TOKEN` still wins over everything.
+ *
+ * @provenance vibecommit-mcp src/transport/server.ts — POST /oauth/ingest-credential now mints one, verified
  */
-import { CONNECT, COMMANDS, AGENT_HOOKS, COMMIT_HOOK, ERRORS, HELP, PATH_CLASH, RUNTIME, SIGNIN, URLS, } from "../copy/index.js";
+import { AUTH, CONNECT, COMMANDS, AGENT_HOOKS, COMMIT_HOOK, ERRORS, HELP, PATH_CLASH, RUNTIME, URLS, } from "../copy/index.js";
 import { dialectFor } from "../agents/registry.js";
 import { grantProject, isAffirmative, isProjectAllowed } from "../consent.js";
 import { loadCredential } from "../credential.js";
@@ -31,15 +35,14 @@ import { resolveRepoSlug } from "../git.js";
 import { confinementRoots, readSpan, DEFAULT_HOOK_BUDGET_MS } from "../hooks/entry.js";
 import { installAgentHooks } from "../agent_install.js";
 import { classifyInstall, installPostCommitHook } from "../install.js";
-import { mcpUrl } from "../oauth/discovery.js";
-import { loadSession } from "../oauth/session.js";
-import { openBrowser, signIn } from "../oauth/signin.js";
 import { CAPTURE_NOT_APPROVED, deliver, ingestUrl, } from "../post.js";
 import { resolveProjectKeys } from "../project.js";
 import { meetsNodeFloor, NODE_FLOOR_TEXT } from "../runtime.js";
-import { paint, renderErrorBlock, truncatePath, wrap } from "../term.js";
+import { credentialsPath } from "../paths.js";
+import { paint, renderErrorBlock, tildePath, truncatePath, wrap } from "../term.js";
 import { writeLines } from "./context.js";
-export async function connect(ctx, options = {}) {
+import { signInBeat } from "./browser_credential.js";
+export async function connect(ctx, options = {}, deps = {}) {
     // (1) The runtime floor refuses LOUDLY here, unlike in the hook: the user is
     // watching and can act, and D57 §DX11 asks for exactly that asymmetry.
     if (!meetsNodeFloor(ctx.nodeVersion)) {
@@ -72,7 +75,7 @@ export async function connect(ctx, options = {}) {
     }
     if (isProjectAllowed(ctx.home, keys.consent)) {
         writeLines(ctx.stdout, wrap(CONNECT.alreadyConnected, 2));
-        return await afterConsent(ctx, keys, options);
+        return await afterConsent(ctx, keys, options, deps);
     }
     // (3) The disclosure, then the gate.
     writeLines(ctx.stdout, disclosure(ctx));
@@ -97,7 +100,7 @@ export async function connect(ctx, options = {}) {
         return EXIT.ok;
     }
     grantProject(ctx.home, keys.consent, ctx.now());
-    return await afterConsent(ctx, keys, options);
+    return await afterConsent(ctx, keys, options, deps);
 }
 /**
  * Consent is settled. Sign in if asked, then do the credential beat.
@@ -108,81 +111,13 @@ export async function connect(ctx, options = {}) {
  * A failure in one says nothing about the other — which is why a failed sign-in
  * returns here rather than falling through to report the install as fine.
  */
-async function afterConsent(ctx, keys, options) {
+async function afterConsent(ctx, keys, options, deps) {
     if (options.signIn === true) {
-        const code = await signInBeat(ctx);
+        const code = await signInBeat(ctx, { retry: "sign-in" });
         if (code !== EXIT.ok)
             return code;
     }
-    return await credentialBeat(ctx, keys);
-}
-/**
- * The browser sign-in beat — `CR-084d`.
- *
- * Reachable only behind `--sign-in`. That is deliberate and not timidity: an
- * unconditional beat here would open a browser during every `connect`, including
- * the ones run by a wrapper, and sign-in cannot mint the credential the rest of
- * `connect` is about. When a read verb lands (`why` — `CR-086`; `report` —
- * `CR-108`) it calls `readWithSession`, which drives the same session and needs
- * no beat here at all.
- */
-async function signInBeat(ctx) {
-    if (loadSession(ctx.home).kind === "ok") {
-        writeLines(ctx.stdout, wrap(SIGNIN.alreadySignedIn, 2));
-        return EXIT.ok;
-    }
-    const endpoint = mcpUrl(ctx.env);
-    if (endpoint === null) {
-        writeLines(ctx.stderr, signInError(ctx, SIGNIN.noServerWhat, SIGNIN.noServerRefusedWhy));
-        return EXIT.failure;
-    }
-    const outcome = await signIn({
-        home: ctx.home,
-        mcpEndpoint: endpoint,
-        fetch,
-        nowMs: () => ctx.now().getTime(),
-        openBrowser,
-        onAuthorizeUrl: (url, opened) => {
-            writeLines(ctx.stdout, [
-                "",
-                ...wrap(opened ? SIGNIN.opening : SIGNIN.manualLabel, 2),
-                // `accent` on a URL is §13.1's one exception, and the line carries no
-                // second colour. Printed on BOTH paths: a user who wants to open it in a
-                // different browser than the default should not have to guess it.
-                `  ${paint(ctx.colour, "accent", url)}`,
-                ...(opened ? wrap(SIGNIN.waiting, 2) : []),
-            ]);
-        },
-        page: { done: SIGNIN.browserDone, refused: SIGNIN.browserRefused },
-    });
-    if (outcome.kind === "ok") {
-        writeLines(ctx.stdout, ["", ...wrap(SIGNIN.done, 2)]);
-        return EXIT.ok;
-    }
-    writeLines(ctx.stderr, ["", ...signInFailure(ctx, outcome)]);
-    return EXIT.failure;
-}
-/** §13.6's shape for a sign-in failure. One renderer, six outcomes. */
-function signInFailure(ctx, outcome) {
-    switch (outcome.kind) {
-        case "no-server":
-            return signInError(ctx, SIGNIN.noServerWhat, outcome.detail === "unreachable"
-                ? SIGNIN.noServerUnreachableWhy
-                : SIGNIN.noServerMalformedWhy, SIGNIN.noServerFix);
-        case "denied":
-            return signInError(ctx, SIGNIN.deniedWhat, SIGNIN.deniedWhy, SIGNIN.deniedFix);
-        case "timeout":
-            return signInError(ctx, SIGNIN.timeoutWhat, SIGNIN.timeoutWhy, SIGNIN.timeoutFix);
-        case "rejected":
-            return signInError(ctx, SIGNIN.rejectedWhat, SIGNIN.rejectedWhy, SIGNIN.rejectedFix);
-        case "unreachable":
-            return signInError(ctx, SIGNIN.unreachableWhat, SIGNIN.unreachableWhy, SIGNIN.unreachableFix);
-        case "malformed":
-            return signInError(ctx, SIGNIN.malformedWhat, SIGNIN.malformedWhy, SIGNIN.malformedFix);
-    }
-}
-function signInError(ctx, what, why, fixLabel = SIGNIN.noServerFix) {
-    return renderErrorBlock({ kind: "bad", what, why: [why], fixLabel, fixes: [COMMANDS.signIn] }, ctx.colour);
+    return await credentialBeat(ctx, keys, deps);
 }
 /**
  * The disclosure block — `CR-111d`, style guide §10.2 transcribed.
@@ -242,10 +177,32 @@ function disclosure(ctx) {
  * name, and on npm >= 7 the clash surfaces as EEXIST during the first install of
  * exactly the population that installs commit tooling.
  */
-async function credentialBeat(ctx, keys) {
+async function credentialBeat(ctx, keys, deps) {
     const load = loadCredential({ env: ctx.env, home: ctx.home });
     if (load.kind === "ok") {
         return await captureBeat(ctx, keys, load.credential);
+    }
+    // ⛔ ONLY FOR `absent`, AND ONLY WITH A HUMAN AT THE TERMINAL (`CR-226`).
+    //   - `absent`: a credential that is present but wrong-class, unreadable or
+    //     insecure is a FAULT, and a fault's fix is `vibecommit auth` (D206 §5,
+    //     `credential-fix-copy.test.ts`). Minting over it would hide the fault.
+    //   - `stdinIsTty`: a wrapper or a CI job runs `connect` too, and a browser
+    //     opened there waits five minutes for nobody. The old warning is the
+    //     right answer for them, and it is what they still get.
+    if (load.kind === "absent" && ctx.stdinIsTty && deps.browser !== undefined) {
+        const minted = await deps.browser(ctx, "connect");
+        if (minted.kind === "saved") {
+            writeLines(ctx.stdout, [
+                "",
+                ...renderErrorBlock({
+                    kind: "ok",
+                    what: AUTH.savedWhat,
+                    why: [AUTH.savedWhy(tildePath(credentialsPath(ctx.home), ctx.home))],
+                }, ctx.colour),
+            ]);
+            return await captureBeat(ctx, keys, minted.credential);
+        }
+        // Failed: the reason is already on stderr. Fall through to the paste path.
     }
     writeLines(ctx.stderr, renderErrorBlock({
         kind: "warn",
@@ -267,8 +224,10 @@ async function credentialBeat(ctx, keys) {
  *     the client may render but may not analyze (D60 §D6). It is not obtainable
  *     from the server either: `send()` returns a status and discards the body,
  *     so no id, sha or count exists on this side of the wire.
- *   - **`Opening your browser to sign in...`.** That beat is the oauth lane's.
- *     Until PKCE lands, `VIBECOMMIT_TOKEN` is the supported path.
+ *   - **`Opening your browser to sign in...`.** That beat runs BEFORE this one
+ *     now (`credentialBeat` → `browser_credential.ts`, `CR-226`), and only when
+ *     there was no credential to start with — by the time this function runs,
+ *     the credential exists however it arrived.
  */
 async function captureBeat(ctx, keys, credential) {
     // ⚠ EVERY USE BELOW BUT ONE IS THE TOPLEVEL ROLE — locating the transcript,

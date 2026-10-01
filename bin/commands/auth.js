@@ -36,29 +36,38 @@
  * that discipline theatre. It is refused loudly rather than quietly ignored,
  * because a user who typed it needs to be told it is now in their history.
  *
- * ## What this verb is NOT
+ * ## ⚠ Browser FIRST since `CR-226`; the paste is the fallback, not gone
  *
- * It is not sign-in, and it does not mint. `mintIngestCredential` exists in
- * `vibecommit-mcp` with no route in front of it, so on this side of the wire the
- * plaintext still comes from the web app's `POST /api/ingest-credentials`, shown
- * once, and the human carries it here. Putting a route in front of the minter is
- * the PKCE work `connect.ts` defers; this verb makes the paste path first-class,
- * it does not remove the paste.
+ * This note used to say the verb "is not sign-in, and it does not mint", because
+ * `mintIngestCredential` in `vibecommit-mcp` had no route in front of it and the
+ * only plaintext producer was the web app's `POST /api/ingest-credentials`. The
+ * route now exists (`POST /oauth/ingest-credential`), so on a terminal this verb
+ * signs in through the browser and mints the credential there
+ * (`browser_credential.ts`). The paste below is unchanged and still reached:
  *
- * @provenance vibecommit-mcp src/oauth/ingest_credential.ts — no route mints one, re-verified
- * @provenance vibecommit-web app/api/ingest-credentials/route.ts — the only producer, verified
+ *   - `--stdin`, or no TTY — the CI shape. Never a browser, exactly as before.
+ *   - `--paste` — a human who already holds a credential from the dashboard.
+ *   - any browser step failing — its reason is printed, then the prompt runs.
+ *
+ * ⚠ So there is no path on which `CR-226` makes the pre-existing flow worse:
+ * every failure lands on the prompt that was the whole verb before it.
+ *
+ * @provenance vibecommit-mcp src/transport/server.ts — POST /oauth/ingest-credential is the mint route, verified
+ * @provenance vibecommit-web app/api/ingest-credentials/route.ts — the dashboard producer the paste path still serves, verified
  */
 import { AUTH, URLS } from "../copy/index.js";
 import { writeLines } from "./context.js";
 import { EXIT } from "../exit.js";
 import { INGEST_TOKEN_PREFIX, IngestCredential, saveCredential } from "../credential.js";
 import { credentialsPath } from "../paths.js";
-import { renderErrorBlock, tildePath } from "../term.js";
+import { paint, renderErrorBlock, tildePath, wrap } from "../term.js";
 /**
  * `--stdin` forces the pipe even on a terminal — the CI shape, where a job may
  * well have a TTY attached and must not start prompting because of it.
  */
 const STDIN_FLAG = "--stdin";
+/** `CR-226`. Skip the browser and go straight to the prompt. */
+const PASTE_FLAG = "--paste";
 export async function auth(ctx, argv, deps = {}) {
     // ⛔ THE ARGV REFUSAL COMES FIRST, before stdin is read, resumed or opened.
     // Anything else would mean the secret in `argv` had already been accepted by
@@ -75,6 +84,21 @@ export async function auth(ctx, argv, deps = {}) {
         return EXIT.usage;
     }
     const piped = argv.includes(STDIN_FLAG) || !ctx.stdinIsTty;
+    // ── `CR-226`: the browser, first, on a terminal only. ──────────────────────
+    if (!piped && !argv.includes(PASTE_FLAG) && deps.browser !== undefined) {
+        const minted = await deps.browser(ctx, "auth");
+        if (minted.kind === "saved")
+            return saved(ctx);
+        // The reason is already on stderr. The documented fallback is the paste
+        // this verb has always had, with the page that mints one named first.
+        writeLines(ctx.stdout, [
+            "",
+            ...wrap(AUTH.pasteInsteadLabel, 2),
+            // `accent` on a URL — §13.1's one exception, one colour on the line.
+            `  ${paint(ctx.colour, "accent", URLS.settings)}`,
+            "",
+        ]);
+    }
     const raw = piped
         ? await (deps.readStdin ?? (() => Promise.resolve("")))()
         : await (deps.readSecret ?? (() => Promise.resolve("")))(AUTH.prompt);
@@ -107,6 +131,10 @@ export async function auth(ctx, argv, deps = {}) {
         return EXIT.failure;
     }
     saveCredential(ctx.home, new IngestCredential(secret, "file"));
+    return saved(ctx);
+}
+/** The one confirmation, whichever path wrote the file. */
+function saved(ctx) {
     writeLines(ctx.stdout, renderErrorBlock({
         kind: "ok",
         what: AUTH.savedWhat,

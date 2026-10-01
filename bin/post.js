@@ -22,7 +22,7 @@ import { agentForTranscript } from "./agents/registry.js";
 import { UNKNOWN_AGENT_ID } from "./agents/types.js";
 import { classify, markDelivered, markHeld, markSkipped, nextSpan, resolveCaps, } from "./policy.js";
 import { fileState, isStopped, loadSessionState, saveSessionState, withFileState, } from "./state.js";
-import { dropRewrites, dropSpooled } from "./spool.js";
+import { dropRewrites, dropSpooled, isFullSha, settleSpooled } from "./spool.js";
 import { CLIENT_VERSION, CLIENT_VERSION_HEADER } from "./version.js";
 /** Production data plane. Overridable for tests and for a self-hosted server. */
 export const DEFAULT_INGEST_URL = "https://api.vibecommit.ai/ingest/v1/session";
@@ -226,6 +226,19 @@ async function readErrorDetail(res) {
     return { code: error, ownersNotified };
 }
 /**
+ * `X-Commits-Retry` → the shas to keep, or `null` when the header is absent.
+ * **NEVER THROWS** — the same hot-path property `readErrorDetail` keeps. Only
+ * full-width shas survive: anything else could never match a spool line.
+ */
+function parseCommitsRetry(raw) {
+    if (raw === null)
+        return null;
+    return raw
+        .split(",")
+        .map((s) => s.trim().toLowerCase())
+        .filter((s) => isFullSha(s));
+}
+/**
  * One attempt. No retry, no backoff, no classification — `CR-018` owns all three.
  *
  * The timeout is mandatory rather than optional: a hook has a wall-clock budget
@@ -260,6 +273,7 @@ export async function send(url, headers, body, timeoutMs) {
             detail: await readErrorDetail(res),
             // `null` when the server does not send it at all — see `captureId` above.
             captureId: res.headers.get("x-capture-id"),
+            commitsRetry: parseCommitsRetry(res.headers.get("x-commits-retry")),
         };
     }
     catch {
@@ -371,10 +385,23 @@ export async function deliver(ctx, eof, readBody) {
             //     of nothing but HELD entries had nothing to bind, and those entries
             //     can never become sendable (`capSpool`), so holding them would keep
             //     re-reading a line with no future instead of draining it.
+            //
+            // ⭐ AND WHEN THE SERVER NAMES WHAT TO KEEP, THAT ANSWER WINS (`CR-222`,
+            // D209 §4). `X-Capture-Id` is about the capture, not about our shas: a
+            // capture can be written while a sha's edge insert fails, which the rule
+            // above reads as "drop". `X-Commits-Retry` is the per-sha answer, so it
+            // decides line by line and the prefix drop is only the fallback for a
+            // server that predates it.
+            const retry = outcome.kind === "response" ? outcome.commitsRetry : null;
             const nothingLanded = outcome.kind === "response" && outcome.captureId === "";
             const holdForNextDelta = nothingLanded && (ctx.commits?.shas.length ?? 0) > 0;
-            if (ctx.commits !== undefined && ctx.commits.count > 0 && !holdForNextDelta) {
-                dropSpooled(ctx.home, key, ctx.commits.count);
+            if (ctx.commits !== undefined && ctx.commits.count > 0) {
+                if (retry !== null) {
+                    settleSpooled(ctx.home, key, ctx.commits.count, new Set(retry));
+                }
+                else if (!holdForNextDelta) {
+                    dropSpooled(ctx.home, key, ctx.commits.count);
+                }
             }
             // The rewrite spool is its own file with its own cap, so its own drop.
             //

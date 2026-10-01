@@ -40,32 +40,9 @@
  */
 import { existsSync } from "node:fs";
 import { dirname } from "node:path";
-import { writeAgentHooks } from "./agent_hooks.js";
+import { hookCommand, writeAgentHooks, } from "./agent_hooks.js";
 import { DIALECTS } from "./agents/registry.js";
 import { HOOK_EVENTS } from "./agents/types.js";
-/**
- * The command an agent's config invokes.
- *
- * ⛔ **`hook` LEADS, AND THE FLAG NEVER DOES.** `invocationMode` returns `"hook"`
- * only when `argv[0] === "hook"`, so a registered command whose first argument
- * is `--agent=` runs the binary INTERACTIVELY — inside a hook, printing to a
- * stream the agent reads back into the user's turn. `registry.ts` names this as
- * the trap the wave was most likely to ship, and `test/agent-registry.test.ts`
- * holds both arms.
- *
- * ⚠ **The flag is passed explicitly for every agent, Claude Code included**,
- * even though `DEFAULT_AGENT_ID` makes it redundant there. A config that names
- * its own agent is self-describing, and — since Cursor reads Claude Code's
- * settings and maps them onto its own events — it is the only thing that tells
- * the two invocations apart when both fire.
- */
-export function hookCommand(binPath, agentId) {
-    return `${quote(binPath)} hook --agent=${agentId}`;
-}
-/** Double-quote for the shells these configs are read by. */
-function quote(value) {
-    return `"${value.replace(/(["\\$`])/g, "\\$1")}"`;
-}
 /** Every event this client registers, in one agent's own vocabulary. */
 export function registrationsFor(dialect, binPath) {
     return HOOK_EVENTS.map((event) => ({

@@ -73,6 +73,11 @@ export const USAGE = {
     unknownCommand: (verb) => `Unknown command: ${verb}`,
 };
 /** `vibecommit status` (CR-021). */
+/**
+ * `323,147`. The locale is PINNED: the host's would make the same state render
+ * two ways on two machines, and a byte count is a number a user may paste.
+ */
+const BYTE_COUNT = new Intl.NumberFormat("en-US");
 export const STATUS = {
     onForRepo: "Capture is on for this repository.",
     offForRepo: "Capture is off for this repository.",
@@ -100,6 +105,26 @@ export const STATUS = {
      * two is correct — the client cannot know that.
      */
     credentialShadowed: "VIBECOMMIT_TOKEN is set and takes precedence over the credential saved on this machine. Unset it to use the saved one.",
+    /**
+     * `CR-228`, `TODOS[142]` — bytes the client ADVANCED PAST without delivering.
+     *
+     * ⛔ Not an absence state, so not `ABSENCE`'s sixth: this reports something
+     * that happened, with a number, rather than something that has not happened
+     * yet. Written off means never re-offered — the sentence says so rather than
+     * implying a retry. It names no cause because the counter records none.
+     */
+    writtenOff: (bytes, sessions) => `${BYTE_COUNT.format(bytes)} ${bytes === 1 ? "byte" : "bytes"} of transcript from ` +
+        `${sessions === 1 ? "1 session" : `${sessions} sessions`} could not be sent and ` +
+        "were skipped. They will not be sent later.",
+    /**
+     * `CR-228` — bytes a session ENDED still owing, which `SessionEnd` now keeps
+     * instead of skipping. ⚠ Claims no recovery: whether this session's hooks
+     * will fire again is not something the client can know, so the sentence says
+     * what is true now and promises nothing about later.
+     */
+    heldAtEnd: (bytes, sessions) => `${BYTE_COUNT.format(bytes)} ${bytes === 1 ? "byte" : "bytes"} of transcript from ` +
+        `${sessions === 1 ? "1 session that has" : `${sessions} sessions that have`} ended ` +
+        "could not be sent and have not been sent since.",
     fixCommandLabel: "To reconnect, run",
     /** §10.3's two trailing actions, rendered as an aligned pair. */
     turnOffLabel: "Turn capture off for this repo",
@@ -1181,6 +1206,27 @@ export const AUTH = {
     argvFix: "Read it from the terminal, or from a pipe:",
     argvFixPrompt: "vibecommit auth",
     argvFixStdin: 'printf %s "$TOKEN" | vibecommit auth --stdin',
+    // --- `CR-226`: the browser mint, and the paste it falls back to. ---
+    /**
+     * Printed before the request, naming the label the credential will carry in
+     * `/app/settings` — the list a user revokes from, so the name they will look
+     * for there is the name they see here.
+     */
+    minting: (label) => `Creating this machine's credential, labelled "${label}"…`,
+    /** Every mint failure shares the `what`; the `why` names which step refused. */
+    mintFailedWhat: "No credential was created through the browser.",
+    /** `not-authorized`, or a 401 that survived one refresh. */
+    mintSessionWhy: "The sign-in on this machine could not be used to create one. It may have ended or been revoked. Nothing was written.",
+    mintNotMemberWhy: "The account that signed in is not a member of the workspace its sign-in names. Nothing was written.",
+    mintRateLimitedWhy: "Too many credentials were created for this account in the last hour. Nothing was written.",
+    mintRefusedWhy: "The service refused the request. Nothing was written.",
+    mintUnreachableWhy: "The service did not answer. Nothing was written.",
+    mintMalformedWhy: "The service answered in a form this version cannot use. Nothing was written.",
+    /**
+     * The documented fallback (FOUNDER_OAUTH_PROPOSAL decision 2): the paste path
+     * that worked before this, unchanged. `auth` prints this and then prompts.
+     */
+    pasteInsteadLabel: "Paste one instead. Create it here, then paste it below:",
 };
 /**
  * The Node floor (D57 plan §DX11). `NODE_FLOOR_TEXT` and the running version are
@@ -1260,7 +1306,12 @@ export const REDACTION = {
 /** Commands the copy points at. One definition, so a rename cannot half-land. */
 export const COMMANDS = {
     connect: "vibecommit connect",
-    /** `CR-216/U2`. The only verb that writes this machine's ingest credential. */
+    /**
+     * `CR-216/U2`. The only verb a credential FAULT's fix line may name — it can
+     * replace the credential from any state. `CR-226` lets `connect` mint one
+     * too, but only on a machine with NO credential and a human at the terminal,
+     * so `connect` is never the fix for a fault (`credential-fix-copy.test.ts`).
+     */
     auth: "vibecommit auth",
     /** `CR-084d`. A FLAG, not a verb — `--help`'s verb list and its golden file do not move. */
     signIn: "vibecommit connect --sign-in",

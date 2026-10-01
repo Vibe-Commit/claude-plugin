@@ -31,7 +31,7 @@ import { EXIT } from "../exit.js";
 import { resolveRepoSlug } from "../git.js";
 import { emitJson } from "../json.js";
 import { resolveProjectKeys } from "../project.js";
-import { lastSendForRepo } from "../state.js";
+import { heldAtEndForRepo, lastSendForRepo, writtenOffForRepo } from "../state.js";
 import { LABEL_GUTTER, WRAP_COLUMNS, glyph, labelled, paint, renderErrorBlock, tildePath, truncatePath, wrap, } from "../term.js";
 import { writeLines } from "./context.js";
 /** §10.3 indents the gutter rows four columns under the state line. */
@@ -53,7 +53,21 @@ export function status(ctx, argv = []) {
     // `status` still keyed on the toplevel would tell that user they are
     // disconnected while their session was being captured.
     const on = isProjectAllowed(ctx.home, keys.consent);
-    const kind = on ? "ok" : "warn";
+    // ⛔ `ok` IS A HEALTH CLAIM, NOT ONLY A CONSENT ONE (`CR-228`, `TODOS[142]`).
+    // The line beside the glyph is consent state and stays so; the glyph is what a
+    // user reads as "fine". It printed `ok` over a session that had written off
+    // 323,147 bytes, beside "No session has been recorded yet." — a sentence a
+    // freshly connected repo prints too, so it told the user nothing. And a repo
+    // that delivered SOMETHING first prints a `last sent` age instead: no hint at
+    // all (VD). So the loss is reported as a byte count, which day one cannot
+    // produce. Repo identity, like the send scan below, so the worktree toplevel.
+    const writtenOff = writtenOffForRepo(ctx.home, projectKey);
+    // ⛔ AND A HOLD AT `SessionEnd` IS NOT `ok` EITHER (`CR-228` part 1). Without
+    // this line the fix would only move the failure: Gate A's session now ends
+    // with `gapCount: 0` and its bytes HELD, and a glyph that read only the gap
+    // counter would print `ok` over it again — the same defect with a longer fuse.
+    const heldAtEnd = heldAtEndForRepo(ctx.home, projectKey);
+    const kind = on && writtenOff.gaps === 0 && heldAtEnd.bytes === 0 ? "ok" : "warn";
     const lines = [
         `  ${paint(ctx.colour, kind, glyph(ctx.colour, kind))} ${paint(ctx.colour, "strong", on ? STATUS.onForRepo : STATUS.offForRepo)}`,
         labelled(ROW_INDENT, STATUS.repoLabel, repoValue(ctx, projectKey)),
@@ -95,6 +109,15 @@ export function status(ctx, argv = []) {
             // one. D98 detection 3 holds the key set; this key is a contract change and
             // `json-read-verbs.test.ts` records it as one.
             credential: load.kind === "ok" ? load.credential.source : null,
+            // `CR-228`. Always an object, zeros included: unlike `last_send`, "nothing
+            // written off" is a measured answer and not an absence. ⛔ A contract
+            // change, recorded in `json-read-verbs.test.ts` beside `credential`'s.
+            written_off: {
+                bytes: writtenOff.bytes,
+                gaps: writtenOff.gaps,
+                sessions: writtenOff.sessions,
+            },
+            held_at_end: { bytes: heldAtEnd.bytes, sessions: heldAtEnd.sessions },
         });
         return on ? EXIT.ok : EXIT.notConnected;
     }
@@ -108,6 +131,16 @@ export function status(ctx, argv = []) {
     // credential has still recorded a session, and saying otherwise would be false.
     if (on && lastSend === null)
         lines.push("", ...wrap(STATUS.neverSent, 2));
+    // `CR-228`. After `neverSent`, deliberately: in the measured failure both are
+    // true at once, and "nothing recorded" followed by why is the order that reads
+    // as one account. Shown OFF as well — consent withdrawn later does not undo a
+    // loss that happened while it was on.
+    if (writtenOff.gaps > 0) {
+        lines.push("", ...wrap(STATUS.writtenOff(writtenOff.bytes, writtenOff.sessions), 2));
+    }
+    if (heldAtEnd.bytes > 0) {
+        lines.push("", ...wrap(STATUS.heldAtEnd(heldAtEnd.bytes, heldAtEnd.sessions), 2));
+    }
     // `CR-216/U3`. Same precedent as `neverSent` above: a SENTENCE, not a fifth
     // gutter row — §10.3 draws four questions in a fixed order and the order is the
     // feature. Only when the env var is actually overriding something: CI sets the

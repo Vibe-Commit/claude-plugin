@@ -28,6 +28,7 @@ import { discover } from "./discovery.js";
 import { listenForCallback } from "./loopback.js";
 import { REFRESH_REQUEST_TIMEOUT_MS, withRefreshLock } from "./lock.js";
 import { generatePkce, generateState } from "./pkce.js";
+import { mintUrl, requestMint } from "./mint.js";
 import { callTool } from "./read.js";
 import { isFresh, loadSession, saveSession } from "./session.js";
 import { buildAuthorizeUrl, exchangeCode, refreshGrant } from "./token.js";
@@ -221,5 +222,34 @@ export async function readWithSession(mcpEndpoint, name, args, deps) {
     if (second.kind !== "ok")
         return { kind: "not-authorized", authorized: second };
     return await callTool(mcpEndpoint, second.access, name, args, deps.read);
+}
+/**
+ * Buy this machine's ingest credential with the signed-in user's token —
+ * `CR-226`. Refresh ONCE, retry ONCE, exactly `readWithSession`'s shape and for
+ * the same reason: two statements and no loop, so a server that keeps refusing
+ * cannot walk this client into a family revoke.
+ *
+ * ⚠ `wrong-client` is retried alongside `unauthorized`, and that is not a
+ * convenience. A session signed in before the server began stamping a client
+ * claim holds an access token without one, which the mint route refuses; the
+ * refresh grant re-issues it WITH the claim, because the claim comes from the
+ * family's row. Without this, every CLI signed in before the route shipped would
+ * be refused its first mint for up to fifteen minutes.
+ *
+ * ⚠ Both retried outcomes are refusals that happen BEFORE the server writes, so
+ * retrying cannot mint twice.
+ */
+export async function mintWithSession(mcpEndpoint, label, deps) {
+    const endpoint = mintUrl(mcpEndpoint);
+    const first = await authorizedAccessToken(deps);
+    if (first.kind !== "ok")
+        return { kind: "not-authorized", authorized: first };
+    const outcome = await requestMint(endpoint, first.access, label, deps.mint);
+    if (outcome.kind !== "unauthorized" && outcome.kind !== "wrong-client")
+        return outcome;
+    const second = await rotateUnderLock(deps, first.refresh);
+    if (second.kind !== "ok")
+        return { kind: "not-authorized", authorized: second };
+    return await requestMint(endpoint, second.access, label, deps.mint);
 }
 //# sourceMappingURL=signin.js.map
