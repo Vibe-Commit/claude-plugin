@@ -19,14 +19,27 @@ name: capture-release
 # ⚠ `repository_dispatch` only ever triggers the workflow file on the DEFAULT
 # branch. This cannot be observed running from a pull request; it goes live when
 # it merges.
+#
+# ⭐ IT OPENS THE PULL REQUEST ITSELF (CR-225). Until CR-225 it filed an issue
+# and stopped — and issues #20, #21 and #22 each quoted the exact remediation
+# within ~16s of a release and all three sat open through a night while two
+# sessions re-derived their contents by hand. A gate is done when something
+# downstream ACTS on it (RUNBOOK §14). The issue is still filed whenever the PR
+# is not opened, so the signal can move forward but never disappear.
 
 on:
   repository_dispatch:
     types: [capture-release]
 
 permissions:
-  contents: read
-  issues: write
+  contents: write       # push this version's vendor/ branch
+  pull-requests: write  # open the PR
+  issues: write         # the fallback, when the PR cannot be opened
+
+# Two dispatches for one version must not race each other to the same branch.
+concurrency:
+  group: capture-release-${{ github.event.client_payload.version }}
+  cancel-in-progress: false
 
 jobs:
   refresh-bundle:
@@ -49,38 +62,114 @@ jobs:
           RELEASE_VERSION: ${{ github.event.client_payload.version }}
         run: |
           set +e
-          node scripts/check_npm_bundle.mjs --version "$RELEASE_VERSION" > result.txt 2>&1
+          node scripts/check_npm_bundle.mjs --version "$RELEASE_VERSION" > "$RUNNER_TEMP/result.txt" 2>&1
           code=$?
           set -e
-          cat result.txt
+          cat "$RUNNER_TEMP/result.txt"
           echo "code=$code" >> "$GITHUB_OUTPUT"
           {
             echo "outcome<<__EOF__"
-            cat result.txt
+            cat "$RUNNER_TEMP/result.txt"
             echo "__EOF__"
           } >> "$GITHUB_OUTPUT"
+
+      # Only a MISMATCH is re-vendorable: the release is published and bin/ is not
+      # it. 2 (the registry could not be reached) and 3 (not published) have no
+      # tarball to vendor from, and go straight to the issue as before.
+      #
+      # ⚠ The "cannot rebuild" note above still holds — this does not rebuild. It
+      # copies the PUBLIC, registry-signed tarball's emitted tree, the same bytes
+      # check_npm_bundle.mjs already treats as ground truth, and refuses to finish
+      # unless that check then passes on the result (signature included).
+      - name: Re-vendor bin/ from the published tarball
+        id: vendor
+        if: steps.compare.outputs.code == '1'
+        continue-on-error: true
+        env:
+          RELEASE_VERSION: ${{ github.event.client_payload.version }}
+        run: scripts/vendor_capture_from_npm.sh --version "$RELEASE_VERSION"
+
+      - name: Open the re-vendor pull request
+        id: pr
+        if: steps.vendor.outcome == 'success'
+        continue-on-error: true
+        env:
+          # ⛔ A REPO-SCOPED PAT, NOT `github.token`, and only for this step. The
+          # Vibe-Commit ORG forbids Actions from creating pull requests (measured:
+          # the repo-level PUT returns 409), and that stays off — one PAT scoped
+          # to this repo is narrower than letting every org workflow open PRs.
+          # The push inside the script still uses checkout's own token; only
+          # `gh pr list` / `gh pr create` read this. Missing, expired or revoked,
+          # `gh` fails, the script reports `pushed`, and the issue step below
+          # files the one-click link — which is why THAT step must not use it.
+          GH_TOKEN: ${{ secrets.REVENDOR_PR_TOKEN }}
+          RELEASE_VERSION: ${{ github.event.client_payload.version }}
+          BASE_SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: scripts/open_revendor_pr.sh
+
+      - name: Report the pull request
+        if: steps.pr.outputs.result == 'opened' || steps.pr.outputs.result == 'exists' || steps.pr.outputs.result == 'noop'
+        env:
+          RESULT: ${{ steps.pr.outputs.result }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+          RELEASE_VERSION: ${{ github.event.client_payload.version }}
+        run: |
+          echo "### capture ${RELEASE_VERSION}: re-vendor ${RESULT} ${PR_URL}" >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=re-vendor ${RESULT}::capture ${RELEASE_VERSION} ${PR_URL}"
 
       # ⚠ NEVER A SILENT SKIP. On the PR gate, "not published" is a truthful
       # pass — nothing changed and nobody promised anything. Here a release just
       # happened and the bundle we ship to every plugin user is now, by default,
-      # the OLD client. So every outcome except a clean match files an issue and
-      # fails the run: an unactioned notification is the same as no receiver.
+      # the OLD client. So every outcome except a clean match OR AN OPEN PR files
+      # an issue and fails the run: an unactioned notification is the same as no
+      # receiver.
       - name: File the drift issue
-        if: steps.compare.outputs.code != '0'
+        if: >-
+          steps.compare.outputs.code != '0' &&
+          steps.pr.outputs.result != 'opened' &&
+          steps.pr.outputs.result != 'exists' &&
+          steps.pr.outputs.result != 'noop'
         env:
+          # ⛔ `github.token`, DELIBERATELY not the PAT above. This step exists for
+          # the case where the PR could not be opened — and an expired or revoked
+          # PAT is one of those cases. The org policy blocks PRs, not issues, and
+          # `issues: write` is granted above, so this token cannot fail the same way.
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ github.event.client_payload.version }}
           OUTCOME: ${{ steps.compare.outputs.outcome }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          VENDOR_OUTCOME: ${{ steps.vendor.outcome }}
+          PR_RESULT: ${{ steps.pr.outputs.result }}
+          PR_DETAIL: ${{ steps.pr.outputs.detail }}
+          PR_BRANCH: ${{ steps.pr.outputs.branch }}
+          COMPARE_URL: ${{ github.server_url }}/${{ github.repository }}/compare/main...${{ steps.pr.outputs.branch }}?expand=1
         # The body is built with printf into a file rather than an inline
         # heredoc: the check output it quotes is arbitrary text, and one stray
         # backtick in a shell string is the difference between an issue and a
         # step that dies before filing one.
         run: |
           {
+            # The branch is already built and pushed; only the PR could not be
+            # opened. Say THAT first — it turns the remediation into one click.
+            if [ "$PR_RESULT" = "pushed" ]; then
+              printf '%s\n' "⭐ **The re-vendor is already built, corroborated and pushed** as \`${PR_BRANCH}\`."
+              printf '%s\n' "Only opening the pull request failed. Open it here: ${COMPARE_URL}"
+              printf '\n%s\n' "Why it could not be opened: \`${PR_DETAIL}\`"
+              printf '\n%s\n' "---"
+              printf '\n%s\n' "The manual route, unchanged:"
+              printf '\n'
+            elif [ -n "$PR_DETAIL" ]; then
+              printf '%s\n' "The automatic re-vendor did not finish: \`${PR_DETAIL}\`"
+              printf '\n'
+            elif [ "$VENDOR_OUTCOME" = "failure" ]; then
+              printf '%s\n' "The automatic re-vendor from the registry tarball failed, so nothing was"
+              printf '%s\n' "pushed. Its log is in the workflow run linked below."
+              printf '\n'
+            fi
             printf '%s\n' "\`vibecommit-capture\` published **${RELEASE_VERSION}**, and this repo"
             printf '%s\n' "ships \`bin/\` as committed, vendored output — so it is now behind."
-            printf '\n%s\n' "**This cannot be automated from here.** Rebuilding needs the private"
+            printf '\n%s\n' "**Rebuilding cannot be automated from here.** It needs the private"
             printf '%s\n' "capture source, and a cross-org read credential in a public MIT repo's"
             printf '%s\n' "CI would invert the licensing boundary (D64 / D20). Re-vendor from a"
             printf '%s\n' "checkout where that source is legitimately in reach:"
@@ -95,7 +184,16 @@ jobs:
             printf '%s\n' '```'
             printf '%s\n' "</details>"
             printf '\n%s\n' "[workflow run](${RUN_URL})"
-          } > issue.md
-          gh issue create --title "capture ${RELEASE_VERSION} released — re-vendor bin/" --body-file issue.md
+          } > "$RUNNER_TEMP/issue.md"
+          TITLE="capture ${RELEASE_VERSION} released — re-vendor bin/"
+          # A re-run must not file a second issue for the same release; it comments.
+          # `|| true`: a failed LOOKUP must fall through to filing, never stop it.
+          existing="$(gh issue list --state open --search "in:title \"${TITLE}\"" --json number,title \
+            --jq "map(select(.title == \"${TITLE}\"))[0].number // empty" || true)"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file "$RUNNER_TEMP/issue.md"
+          else
+            gh issue create --title "$TITLE" --body-file "$RUNNER_TEMP/issue.md"
+          fi
           echo "::error title=bin/ is stale::capture ${RELEASE_VERSION} released and the vendored bundle was not corroborated. See the issue filed by this run."
           exit 1
