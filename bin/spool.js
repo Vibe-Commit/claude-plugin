@@ -170,6 +170,43 @@ export function dropSpooled(home, key, count) {
     }
 }
 /**
+ * Settle the first `count` lines against the server's `X-Commits-Retry`
+ * (`CR-222`, D209 §4): KEEP a line only if it went on the wire and the server
+ * named its sha; drop every other consumed line. Kept lines stay at the head, in
+ * order, so they ride the next delta first. Returns false on any failure.
+ *
+ * ⛔ **NOT `dropSpooled` WITH A SMALLER N.** `dropSpooled` removes a PREFIX, and
+ * the lines to keep need not be one: a batch can bind its first sha and not its
+ * second. Truncating by any count would either delete the unbound sha or keep a
+ * BOUND one — and a bound sha resent into a sealed turn is a second, permanent
+ * edge (`cr071:157`). Only the per-line decision is right.
+ *
+ * ⚠ THE SAME LINE ARITHMETIC AS `dropSpooled`, deliberately: it works on raw
+ * non-empty lines, because `count` was computed from them via `capSpool`. A line
+ * that does not parse, or carries a rung that never goes on the wire, is dropped
+ * exactly as `dropSpooled` would drop it — the server cannot have named it.
+ *
+ * ⚠ The residual race `dropSpooled` documents applies here unchanged.
+ */
+export function settleSpooled(home, key, count, keep) {
+    const path = spoolPath(home, key);
+    if (path === null || count <= 0)
+        return false;
+    try {
+        const lines = readFileSync(path, "utf8").split("\n").filter((l) => l.trim() !== "");
+        const kept = lines.slice(0, count).filter((line) => {
+            const entry = parseEntry(line);
+            return entry !== null && WIRE_RUNGS.includes(entry.attribution) && keep.has(entry.sha);
+        });
+        writeFileSync(path, [...kept, ...lines.slice(count)].map((l) => `${l}\n`).join(""), { mode: 0o600 });
+        chmodSync(path, 0o600);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+/**
  * Which session, if any, is live for this repo right now — ⛔ **AND HOW WE KNOW.**
  *
  * ## The defect this replaces

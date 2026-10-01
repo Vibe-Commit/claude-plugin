@@ -175,6 +175,11 @@ const MAX_SUBAGENT_FILES = 8;
  * elapsed time since `runHook` armed the watchdog and charges it, so the reserve
  * is measured against the deadline that can actually end the process.
  *
+ * ⚠ **Since `CR-228` the reserve pays for a HOLD record too.** A held stream is
+ * no longer stamped, but `SessionState.endHold` is written for it — and a hook
+ * cut off before that write leaves the bytes held with nothing saying the
+ * session ended owing them, which `status` cannot see. Same reserve, same cost.
+ *
  * ⚠ **Still a mitigation, not a guarantee.** Enough scheduler pressure defeats
  * any fixed reserve, exactly as it defeats the watchdog itself — a timer cannot
  * fire while the event loop is blocked. What changed is that the reserve now
@@ -705,7 +710,7 @@ async function hookBody(ctx, budgetMs, hookStartedAt) {
     // `transcript_path` never names: ~16% of transcript volume, and the work a
     // reviewer most wants attributed. MAIN WENT FIRST, deliberately (D95) — the
     // content most likely to matter is the content most likely to fit.
-    const delegated = await deliverSubagents({
+    const subagents = await deliverSubagents({
         ctx,
         input,
         url,
@@ -731,8 +736,14 @@ async function hookBody(ctx, budgetMs, hookStartedAt) {
     // existing. `eof`, not a fresh `statSync`: the gap records what this
     // invocation COMMITTED to sending and could not, which is exactly what
     // `SubagentFile.size` is for the delegated streams.
+    //
+    // ⛔ AND `CR-228` (`TODOS[142]`): it writes off only what nothing explains.
+    // `held` is whether ANY delivery in this invocation ended `later`/`fatal`, or
+    // was refused by a standing stop — the main one or a delegated one. When it
+    // did, every stream still behind is behind because of THAT, not because D95's
+    // budget ran out against a server that was answering.
     if (isSessionEnd) {
-        stampGaps(ctx, input, projectKey, [{ fileKey: "main", size: eof }, ...delegated]);
+        stampGaps(ctx, input, projectKey, [{ fileKey: "main", size: eof }, ...subagents.files], endedHeld(delivery) || subagents.held, Date.now());
     }
     // The three classes are decided in `policy.ts` and applied in `post.ts`. Two
     // of the four outcomes reach a human.
@@ -778,6 +789,10 @@ async function hookBody(ctx, budgetMs, hookStartedAt) {
  * is the CALLER's, not this function's (`CR-182`) — it covers the main
  * transcript too, and must therefore happen whether or not this ran.
  *
+ * ⛔ **Only when nothing explains the shortfall (`CR-228`).** If any send this
+ * loop made ended held, the files it never reached are behind because of that
+ * failure, not because of the budget — and `held` is how the caller learns it.
+ *
  * Serial, never `Promise.all`: each `deliver()` does load-modify-save on one
  * JSON file and claims `session.seq + 1`, so concurrent calls would lose seq
  * updates to each other and the server would read a replay.
@@ -799,7 +814,7 @@ async function deliverSubagents(opts) {
         ...announcedSubagentFiles(ctx, input),
     ];
     if (files.length === 0)
-        return files;
+        return { files, held: false };
     // ⚠ SKIP WHAT HAS NOTHING PENDING, BEFORE THE CAP APPLIES — and this is not an
     // optimisation, it is what stops the tail starving.
     //
@@ -815,12 +830,13 @@ async function deliverSubagents(opts) {
     const before = loadSessionState(ctx.home, key);
     const pending = files.filter((f) => fileState(before, f.fileKey).sentOffset < f.size);
     if (pending.length === 0)
-        return files;
+        return { files, held: false };
+    let held = false;
     for (const file of pending.slice(0, MAX_SUBAGENT_FILES)) {
         const consumedMs = Date.now() - startedAt;
         if (sendBudget - consumedMs < MIN_SUBAGENT_BUDGET_MS)
             break;
-        await deliver({
+        const delivery = await deliver({
             home: ctx.home,
             env: ctx.env,
             url,
@@ -841,17 +857,30 @@ async function deliverSubagents(opts) {
         // `/cso` finding 1's confinement both apply. A delegated agent reading a
         // third party's file is exactly as out-of-tree as the main thread doing it.
         (from, to) => readSpan(file.path, from, to, redactionRoots, ctx.home, ctx.env));
+        if (endedHeld(delivery))
+            held = true;
     }
-    return files;
+    return { files, held };
 }
 /**
- * On `SessionEnd`, record what could not be sent rather than losing it quietly.
+ * Did this delivery end with the failure policy KEEPING its bytes?
  *
- * Covers both the files never started and the ones whose send was held: after
- * this event there is no invocation to retry either, so both are permanently
- * undelivered and both deserve the same honest hole.
+ * `later` and `fatal` both `markHeld` (`post.ts`), and `stopped` is a `fatal`
+ * from earlier in the session refusing to try. ⚠ `never` is deliberately not
+ * here: it already advanced past its own span, and a server that answered `400`
+ * or `413` was answering — which is D95's premise for writing the rest off.
+ */
+function endedHeld(delivery) {
+    if (delivery.kind === "stopped")
+        return true;
+    return (delivery.kind === "attempted" &&
+        (delivery.disposition === "later" || delivery.disposition === "fatal"));
+}
+/**
+ * On `SessionEnd`, decide — per stream still behind — between writing it off and
+ * HOLDING it, and record either way so neither is silent.
  *
- * ## The MAIN transcript is one of them now — `CR-182`
+ * ## The MAIN transcript is one of them — `CR-182`
  *
  * D95 scoped this to `subagents/` and its own note recorded the cost: *"the main
  * transcript's own failed send on `SessionEnd` is equally permanent and stamps
@@ -860,29 +889,82 @@ async function deliverSubagents(opts) {
  * cannot finish — so the widest, most-read stream was the one going quietly
  * short.
  *
- * ⚠ **WHAT THIS COSTS, stated rather than smuggled.** `stampGaps` decides on
- * `sentOffset < size` and cannot tell WHY a stream is behind, so the main
- * transcript now inherits both cases D99 §1 measured for delegated streams: a
- * `403 capture_not_approved` — which means org-approval-PENDING, i.e. later —
- * and a `401` `fatal`, whose own comment in `post.ts` says the offset does not
- * advance because *"these bytes are fine"*. On `SessionEnd` neither has a next
- * invocation to be right about, so both are written off. Whether a refusal
- * should stamp at all is `TODOS[93]`, still open and still not decided here;
- * what changed is only that it now reaches `main` as well.
+ * ## ⛔ `CR-228` (`TODOS[142]`): it no longer decides on `sentOffset < size` alone
+ *
+ * Until `CR-228` every stream behind was written off. That overrode the failure
+ * policy on the one event with no next invocation to be right about: `later`
+ * (`5xx`, `429`, `403` approval-pending, no response at all) and `fatal` (`401`,
+ * whose own comment in `post.ts` says *"these bytes are fine"*) both HOLD bytes
+ * on purpose, and this function discarded them on a byte comparison. MEASURED in
+ * `CR-227` Gate A: an unreachable endpoint, 323,147 bytes, `gapCount: 1`, exit 0,
+ * nothing on stderr, zero later network calls — and `status` said `ok`.
+ * (`CR-182` widened that blind spot to `main`. This docblock used to point at
+ * `TODOS[93]` for the open question; D168 records that pointer as wrong.)
+ *
+ * A stream is now HELD — `FileState` untouched, its EOF recorded in
+ * `SessionState.endHold` — when either:
+ *   - its own backlog is non-empty: the policy already decided to keep it, on
+ *     this turn or an earlier one; or
+ *   - any delivery in THIS invocation ended held. A stream the loop never
+ *     reached has no backlog to explain it, but if the sends that DID run were
+ *     failing, the budget did not run out against a server that was answering.
+ *
+ * Otherwise it is written off as before. That remainder is exactly D95's ruling
+ * — the server answered, and there was not time for every file — unchanged.
+ *
+ * ⭐ **A HOLD DRAINS ON RESUME — MEASURED, not assumed** (VD, `CR-227`, on the
+ * real `claude` binary). `--resume <id>` and `--continue` both fire this
+ * session's hooks again under the SAME `session_id`, and the resumed run's first
+ * firing saw the transcript at exactly the size the previous `SessionEnd` saw.
+ * So the next `Stop` loads this state, `nextSpan` returns `{ heldOffset, newEof }`,
+ * and the held bytes go out in the same request as the new ones.
+ *
+ * ⚠ **THE TWO LIMITS, stated here rather than discovered later:**
+ *   - A session that is NEVER resumed never drains — a one-shot `claude -p` is
+ *     the common case. Its bytes stay held (not shed: `enforceCaps` runs only
+ *     inside `markHeld`, i.e. on a FAILED send) and `status` reports them as
+ *     owed (`heldAtEndForRepo`). Reported and recoverable, not delivered.
+ *   - If a resume's first send FAILS and the held span is older than the
+ *     backlog's 24-hour age cap, `markHeld` → `enforceCaps` sheds it as a gap,
+ *     as for any held span. A resume whose first send succeeds delivers it
+ *     whatever its age — `markDelivered` applies no cap.
+ *
+ * ⚠ `SessionEnd` cannot tell which of these is coming: its `reason` was
+ * `"other"` both for a session later resumed and for one that was not. The
+ * discriminator is the NEXT `SessionStart`'s `source` (`"resume"`), so nothing
+ * here branches on it.
  */
-function stampGaps(ctx, input, projectKey, files) {
+function stampGaps(ctx, input, projectKey, files, 
+/** A delivery in THIS invocation ended held — see `endedHeld`. */
+heldThisInvocation, nowMs) {
     const key = { repoKey: projectKey, sessionId: input.sessionId };
+    const owed = {};
     // Re-read per file rather than once: each `deliver()` above saved, so a
     // snapshot taken before the loop would stamp gaps over work that succeeded.
     for (const file of files) {
         const session = loadSessionState(ctx.home, key);
         const current = fileState(session, file.fileKey);
-        // The offset is the only thing that decides this, which is why no record of
-        // what was attempted is needed: a file the loop never reached and one whose
-        // send was held are both simply behind, and both are equally permanent now.
         if (current.sentOffset >= file.size)
             continue;
+        // ⛔ `CR-228`: BEHIND IS NOT ENOUGH. A span the failure policy HELD — now or
+        // on an earlier turn — keeps its offset, and so does every stream left
+        // behind in an invocation whose own sends were held. `FileState` is left
+        // exactly as the policy left it: no `markSkipped`, and no `markHeld` either,
+        // whose `enforceCaps` would make this a write-off on a 24-hour fuse.
+        if (heldThisInvocation || current.backlog.length > 0) {
+            owed[file.fileKey] = file.size;
+            continue;
+        }
+        // D95's case, unchanged: the server was answering and the BUDGET ran out.
         saveSessionState(ctx.home, key, withFileState(session, file.fileKey, markSkipped(current, current.sentOffset, file.size)));
+    }
+    // The positive record. Written when there is a hold to state OR an old one to
+    // clear — a `SessionEnd` that owes nothing must not leave a previous one's
+    // claim standing, and one that never held anything need not touch the file.
+    const session = loadSessionState(ctx.home, key);
+    const endHold = Object.keys(owed).length > 0 ? { at: nowMs, eof: owed } : null;
+    if (endHold !== null || session.endHold !== null) {
+        saveSessionState(ctx.home, key, { ...session, endHold });
     }
 }
 /**
