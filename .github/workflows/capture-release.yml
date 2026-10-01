@@ -45,11 +45,30 @@ jobs:
   refresh-bundle:
     name: is bin/ still the client?
     runs-on: ubuntu-latest
+    env:
+      # Every npm call in this job revalidates against the registry. This job runs
+      # seconds after a publish, which is exactly when a cached package listing is
+      # stale (TODOS[150]: `npm pack` said `notarget` while `npm view` showed it).
+      npm_config_prefer_online: "true"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "22.15.0"
+
+      # ⛔ "NOT YET" IS NOT "NEVER" (TODOS[150]). This dispatch fires the moment
+      # `npm publish` returns. On 0.3.0 the compare below ran 61 s later, the
+      # registry answered E404, and the run reported "not published (D64)" — a
+      # true statement about the registry and a false one about the release. One
+      # E404 cannot tell those apart; a bounded wait can. If the window closes
+      # still E404, the compare runs anyway and its SKIPPED becomes the issue,
+      # now measured after the wait instead of during the lag.
+      - name: Wait for the registry to show the release
+        id: visible
+        continue-on-error: true
+        env:
+          RELEASE_VERSION: ${{ github.event.client_payload.version }}
+        run: scripts/wait_for_npm_version.sh --version "$RELEASE_VERSION"
 
       # WHAT THIS CANNOT DO, AND WHY IT DOES NOT PRETEND OTHERWISE. It cannot
       # rebuild the bundle: that needs the private capture source, and giving
@@ -73,9 +92,35 @@ jobs:
             echo "__EOF__"
           } >> "$GITHUB_OUTPUT"
 
+      # ⛔ THE BYTES CAN MATCH A RELEASE THAT DOES NOT RUN (TODOS[150]). 0.2.0 and
+      # 0.2.1 passed every byte and symbol check, and `vibecommit --version`
+      # printed NOTHING and exited 0 — their main-module guard never matched
+      # through npm's bin symlink. The plugin lane runs the file directly and never
+      # meets that symlink, so only the npm lane can show it, and only by running
+      # it. A failure here also BLOCKS the re-vendor below: copying a release that
+      # does not run into bin/ would ship the same defect down the second channel.
+      - name: Execute the published command
+        id: runs
+        if: steps.visible.outcome == 'success'
+        env:
+          RELEASE_VERSION: ${{ github.event.client_payload.version }}
+        run: |
+          set +e
+          node scripts/check_npm_bin_runs.mjs --version "$RELEASE_VERSION" > "$RUNNER_TEMP/runs.txt" 2>&1
+          code=$?
+          set -e
+          cat "$RUNNER_TEMP/runs.txt"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          {
+            echo "outcome<<__EOF__"
+            cat "$RUNNER_TEMP/runs.txt"
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
       # Only a MISMATCH is re-vendorable: the release is published and bin/ is not
       # it. 2 (the registry could not be reached) and 3 (not published) have no
-      # tarball to vendor from, and go straight to the issue as before.
+      # tarball to vendor from, and go straight to the issue as before. And only
+      # a release whose command RAN: anything else is not a release to copy.
       #
       # ⚠ The "cannot rebuild" note above still holds — this does not rebuild. It
       # copies the PUBLIC, registry-signed tarball's emitted tree, the same bytes
@@ -83,7 +128,7 @@ jobs:
       # unless that check then passes on the result (signature included).
       - name: Re-vendor bin/ from the published tarball
         id: vendor
-        if: steps.compare.outputs.code == '1'
+        if: steps.compare.outputs.code == '1' && steps.runs.outputs.code == '0'
         continue-on-error: true
         env:
           RELEASE_VERSION: ${{ github.event.client_payload.version }}
@@ -123,13 +168,16 @@ jobs:
       # happened and the bundle we ship to every plugin user is now, by default,
       # the OLD client. So every outcome except a clean match OR AN OPEN PR files
       # an issue and fails the run: an unactioned notification is the same as no
-      # receiver.
+      # receiver. A published command that did not run (or was never executed,
+      # because the registry never showed it) files one too — even when the bytes
+      # match, since matching a release that does not run is no comfort.
       - name: File the drift issue
         if: >-
-          steps.compare.outputs.code != '0' &&
+          (steps.compare.outputs.code != '0' &&
           steps.pr.outputs.result != 'opened' &&
           steps.pr.outputs.result != 'exists' &&
-          steps.pr.outputs.result != 'noop'
+          steps.pr.outputs.result != 'noop') ||
+          steps.runs.outputs.code != '0'
         env:
           # ⛔ `github.token`, DELIBERATELY not the PAT above. This step exists for
           # the case where the PR could not be opened — and an expired or revoked
@@ -144,15 +192,63 @@ jobs:
           PR_DETAIL: ${{ steps.pr.outputs.detail }}
           PR_BRANCH: ${{ steps.pr.outputs.branch }}
           COMPARE_URL: ${{ github.server_url }}/${{ github.repository }}/compare/main...${{ steps.pr.outputs.branch }}?expand=1
+          COMPARE_CODE: ${{ steps.compare.outputs.code }}
+          VISIBLE_OUTCOME: ${{ steps.visible.outcome }}
+          RUNS_CODE: ${{ steps.runs.outputs.code }}
+          RUNS_OUTCOME: ${{ steps.runs.outputs.outcome }}
         # The body is built with printf into a file rather than an inline
         # heredoc: the check output it quotes is arbitrary text, and one stray
         # backtick in a shell string is the difference between an issue and a
         # step that dies before filing one.
         run: |
           {
+            # A release whose command does not run outranks everything below:
+            # the remedy is a new capture release, and re-vendoring THIS one
+            # would ship the defect to every plugin user too.
+            if [ "$RUNS_CODE" = "1" ]; then
+              printf '%s\n' "⛔ **The published \`vibecommit\` command does not run.** \`npm install -g\` of"
+              printf '%s\n' "**${RELEASE_VERSION}** linked it, and \`vibecommit --version\` did not print the version."
+              if [ "$COMPARE_CODE" = "0" ]; then
+                printf '\n%s\n' "⚠ \`bin/\` already matches this release byte for byte, so the plugin ships the same defect."
+              else
+                printf '\n%s\n' "**Do not re-vendor this release** — \`bin/\` was left on the previous one on purpose."
+              fi
+              printf '%s\n' "The fix is a new capture release; its own dispatch re-runs this check."
+              printf '\n%s\n' "<details><summary>What the execution check said</summary>"
+              printf '\n%s\n' '```'
+              printf '%s\n' "$RUNS_OUTCOME"
+              printf '%s\n' '```'
+              printf '%s\n' "</details>"
+              printf '\n%s\n' "---"
+              printf '\n'
+            elif [ "$RUNS_CODE" = "2" ]; then
+              printf '%s\n' "The published command could not be checked (the install did not complete)."
+              printf '%s\n' "Nothing was re-vendored, because a release that was not executed is not one to copy."
+              printf '\n%s\n' "<details><summary>What the execution check said</summary>"
+              printf '\n%s\n' '```'
+              printf '%s\n' "$RUNS_OUTCOME"
+              printf '%s\n' '```'
+              printf '%s\n' "</details>"
+              printf '\n'
+            elif [ "$VISIBLE_OUTCOME" != "success" ]; then
+              printf '%s\n' "The registry did not show **${RELEASE_VERSION}** within the bounded wait after"
+              printf '%s\n' "the dispatch, so its command was never executed and nothing was re-vendored."
+              printf '%s\n' "This is no longer the few-minute publish lag: check the capture tag build."
+              printf '\n'
+            fi
+            # Not executed is not "runs": whoever re-vendors by hand runs it first.
+            if [ "$RUNS_CODE" != "0" ] && [ "$RUNS_CODE" != "1" ]; then
+              printf '%s\n' "Before any re-vendor below, prove the release runs:"
+              printf '\n%s\n' '```'
+              printf '%s\n' "node scripts/check_npm_bin_runs.mjs --version ${RELEASE_VERSION}"
+              printf '%s\n' '```'
+              printf '\n'
+            fi
             # The branch is already built and pushed; only the PR could not be
             # opened. Say THAT first — it turns the remediation into one click.
-            if [ "$PR_RESULT" = "pushed" ]; then
+            if [ "$RUNS_CODE" = "1" ]; then
+              :
+            elif [ "$PR_RESULT" = "pushed" ]; then
               printf '%s\n' "⭐ **The re-vendor is already built, corroborated and pushed** as \`${PR_BRANCH}\`."
               printf '%s\n' "Only opening the pull request failed. Open it here: ${COMPARE_URL}"
               printf '\n%s\n' "Why it could not be opened: \`${PR_DETAIL}\`"
@@ -167,17 +263,21 @@ jobs:
               printf '%s\n' "pushed. Its log is in the workflow run linked below."
               printf '\n'
             fi
-            printf '%s\n' "\`vibecommit-capture\` published **${RELEASE_VERSION}**, and this repo"
-            printf '%s\n' "ships \`bin/\` as committed, vendored output — so it is now behind."
-            printf '\n%s\n' "**Rebuilding cannot be automated from here.** It needs the private"
-            printf '%s\n' "capture source, and a cross-org read credential in a public MIT repo's"
-            printf '%s\n' "CI would invert the licensing boundary (D64 / D20). Re-vendor from a"
-            printf '%s\n' "checkout where that source is legitimately in reach:"
-            printf '\n%s\n' '```'
-            printf '%s\n' "VC_COMMIT=<the sha tagged v${RELEASE_VERSION}> scripts/vendor_capture_bin.sh"
-            printf '%s\n' '```'
-            printf '\n%s\n' "That rewrites \`bin/\` **and** \`capture-bundle.json\` together;"
-            printf '%s\n' "\`check_bundle_pin.mjs\` fails a PR that moves one without the other."
+            # The re-vendor remediation is for a release that RUNS. Offering it
+            # for one that does not is the instruction that would spread it.
+            if [ "$RUNS_CODE" != "1" ]; then
+              printf '%s\n' "\`vibecommit-capture\` published **${RELEASE_VERSION}**, and this repo"
+              printf '%s\n' "ships \`bin/\` as committed, vendored output — so it is now behind."
+              printf '\n%s\n' "**Rebuilding cannot be automated from here.** It needs the private"
+              printf '%s\n' "capture source, and a cross-org read credential in a public MIT repo's"
+              printf '%s\n' "CI would invert the licensing boundary (D64 / D20). Re-vendor from a"
+              printf '%s\n' "checkout where that source is legitimately in reach:"
+              printf '\n%s\n' '```'
+              printf '%s\n' "VC_COMMIT=<the sha tagged v${RELEASE_VERSION}> scripts/vendor_capture_bin.sh"
+              printf '%s\n' '```'
+              printf '\n%s\n' "That rewrites \`bin/\` **and** \`capture-bundle.json\` together;"
+              printf '%s\n' "\`check_bundle_pin.mjs\` fails a PR that moves one without the other."
+            fi
             printf '\n%s\n' "<details><summary>What the corroboration check said</summary>"
             printf '\n%s\n' '```'
             printf '%s\n' "$OUTCOME"
@@ -185,7 +285,11 @@ jobs:
             printf '%s\n' "</details>"
             printf '\n%s\n' "[workflow run](${RUN_URL})"
           } > "$RUNNER_TEMP/issue.md"
-          TITLE="capture ${RELEASE_VERSION} released — re-vendor bin/"
+          if [ "$RUNS_CODE" = "1" ]; then
+            TITLE="capture ${RELEASE_VERSION} released — its vibecommit command does not run"
+          else
+            TITLE="capture ${RELEASE_VERSION} released — re-vendor bin/"
+          fi
           # A re-run must not file a second issue for the same release; it comments.
           # `|| true`: a failed LOOKUP must fall through to filing, never stop it.
           existing="$(gh issue list --state open --search "in:title \"${TITLE}\"" --json number,title \
@@ -195,5 +299,9 @@ jobs:
           else
             gh issue create --title "$TITLE" --body-file "$RUNNER_TEMP/issue.md"
           fi
-          echo "::error title=bin/ is stale::capture ${RELEASE_VERSION} released and the vendored bundle was not corroborated. See the issue filed by this run."
+          if [ "$RUNS_CODE" = "1" ]; then
+            echo "::error title=published command does not run::capture ${RELEASE_VERSION}: vibecommit --version did not print the version. See the issue filed by this run."
+          else
+            echo "::error title=bin/ is stale::capture ${RELEASE_VERSION} released and the vendored bundle was not corroborated. See the issue filed by this run."
+          fi
           exit 1
