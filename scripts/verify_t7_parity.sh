@@ -3,8 +3,12 @@
 #
 # Verifies that the MIRROR — the content rendered by vibecommit-mcp's (T7's)
 # src/vendors/claude_code.ts + src/vendors/_shared/{agents_md,rules_body,managed_header}.ts
-# — byte-matches the CANONICAL rules text in this repo: AGENTS.md, CLAUDE.md,
+# — matches the CANONICAL rules text in this repo: AGENTS.md, CLAUDE.md,
 # and .claude/skills/vibecommit/SKILL.md.
+#
+# ⚠ NOT A RAW-BYTE COMPARISON. Both sides pass through `$(...)`, which strips
+# trailing newlines, so a trailing-newline difference PASSES here. vibecommit-mcp's
+# scripts/t7_byte_parity.ts (run by its t7_parity_gate.sh) compares raw bytes.
 #
 # ⛔ DIRECTION (D117 §2, D135 §4): THIS REPO IS CANONICAL. rules_body.ts IS THE
 # MIRROR. Byte equality is symmetric, so the check itself has no direction —
@@ -254,8 +258,8 @@ compare_file() {
   if [ "$plugin_content" = "$mirror" ]; then
     echo "PASS [$label]: $plugin_file"
   else
-    echo "FAIL [$label]: the mirror rendered from \$T7_REPO differs from canonical $plugin_file (D117 §2: the mirror follows this file)" >&2
-    echo "  diff: '<' = mirror (rendered from \$T7_REPO), '>' = canonical ($plugin_file)" >&2
+    echo "FAIL [$label]: the mirror rendered from $T7_REPO differs from canonical $plugin_file (D117 §2: the mirror follows this file)" >&2
+    echo "  diff: '<' = mirror (rendered from $T7_REPO), '>' = canonical ($plugin_file)" >&2
     diff <(printf '%s\n' "$mirror") <(printf '%s\n' "$plugin_content") >&2 || true
     ERRORS=$((ERRORS + 1))
   fi
@@ -271,7 +275,7 @@ compare_file "SKILL.md" "$PLUGIN_ROOT/.claude/skills/vibecommit/SKILL.md" "$MIRR
 
 if [ "$ERRORS" -eq 0 ]; then
   echo ""
-  echo "verify_t7_parity: ALL PASS — the T7 mirror byte-matches canonical AGENTS.md + CLAUDE.md + SKILL.md"
+  echo "verify_t7_parity: ALL PASS — the T7 mirror matches canonical AGENTS.md + CLAUDE.md + SKILL.md"
   exit 0
 else
   echo "" >&2
