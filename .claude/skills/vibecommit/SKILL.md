@@ -70,10 +70,14 @@ Read/search tools:
   the way `git blame` names a commit for a line. Name the repository with
   EITHER `repo` (the slug — `owner/name`, `host/owner/name`, or
   `local:<12 hex>` for a tree with no usable remote) OR `repository_id`,
-  supplying exactly one, and pass `commit_sha`. If a squash, rebase or amend
+  supplying exactly one, and pass `commit_sha`. FEWER than 40 hex is resolved as
+  a prefix, the way `git` expands an abbreviation; an ambiguous prefix is REFUSED
+  with the candidates named rather than guessed. If a squash, rebase or amend
   rewrote the sha, the
   response reports the commit the capture is actually recorded against, so
-  the two are never confused. Resolution is at the COMMIT grain — `file_path`
+  the two are never confused — and `superseded_by` lists what REPLACED the sha
+  you asked about, which is present even when we hold no capture for that sha, so
+  a stale note is still answerable. Resolution is at the COMMIT grain — `file_path`
   is accepted but does not narrow the result.
 - `commit_coverage` — how many commits in a repository have a capture
   recorded against them, broken down by edge grade, with the recorded
