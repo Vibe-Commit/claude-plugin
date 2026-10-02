@@ -14,8 +14,11 @@
 # means "not yet", and a 404 that outlives this window is the anomaly worth an issue.
 # "Not yet" must never read as "never".
 #
-# ⛔ READY MEANS THE NEXT STEP WILL WORK, NOT THAT ONE QUERY ANSWERS. Two probes,
-# because the steps after this one resolve the release two different ways:
+# ⛔ READY MEANS THE NEXT STEPS CAN RESOLVE IT, NOT THAT ONE QUERY ANSWERS. Two
+# probes, because the steps after this one resolve the release two different ways.
+# ⚠ Neither probe IS the install: (2) resolves and fetches but links no bin. That
+# residue is why check_npm_bin_runs.mjs retries its own install on not-found —
+# do not drop those retries on the strength of this wait.
 #   1. `npm view <spec> version` — the full package document, which the compare
 #      and the vendor script read (`dist.tarball`, `gitHead`).
 #   2. `npm pack <spec> --dry-run` — the resolver `npm pack` and `npm install`
@@ -67,10 +70,20 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 ERR="$WORK/err"
 
-# coreutils `timeout` is on every GitHub ubuntu runner. Without it (a bare macOS
-# shell) a probe is bounded only by npm, and the step's `timeout-minutes` remains.
+# coreutils `timeout` is on every GitHub ubuntu runner. It is NOT in macOS base:
+# it resolves only when Homebrew's coreutils is on PATH, so the same script is
+# bounded for one person and not for the next (measured: absent on a stock PATH,
+# where the script still runs). Without it a probe is bounded only by npm, which
+# does not cover the TCP connect — so say so once instead of degrading silently.
+# In CI the step's `timeout-minutes` remains either way.
+if command -v timeout >/dev/null 2>&1; then
+  HAVE_TIMEOUT=1
+else
+  HAVE_TIMEOUT=0
+  echo "warning: no \`timeout\` on PATH — this script does not bound its probes; a dead registry holds each one until the OS connect timeout (~75 s on macOS)." >&2
+fi
 bounded() {
-  if command -v timeout >/dev/null 2>&1; then
+  if [ "$HAVE_TIMEOUT" -eq 1 ]; then
     timeout "$PROBE_SECS" "$@"
   else
     "$@"

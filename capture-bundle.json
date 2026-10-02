@@ -13,8 +13,9 @@
     "and this file together from a named capture commit.",
     "",
     "capture.npmVersion is the client version this bundle corresponds to. It is",
-    "what scripts/check_npm_bundle.mjs would compare bin/ against — which it",
-    "cannot do yet, because @vibe-commit/capture has never been published (D64)."
+    "what scripts/check_npm_bundle.mjs compares bin/ against, byte for byte and",
+    "with the registry signature, on every pull request and on every release —",
+    "and it SKIPS, loudly (exit 3), when the registry does not show that version."
   ],
   "capture": {
     "repo": "Vibe-Commit/vibecommit-capture",
