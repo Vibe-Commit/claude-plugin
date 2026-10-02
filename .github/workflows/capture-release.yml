@@ -178,7 +178,7 @@ jobs:
           echo "### capture ${RELEASE_VERSION}: re-vendor ${RESULT} ${PR_URL}" >> "$GITHUB_STEP_SUMMARY"
           echo "::notice title=re-vendor ${RESULT}::capture ${RELEASE_VERSION} ${PR_URL}"
 
-      # ⚠ NEVER A SILENT SKIP. On the PR gate, "not published" is a truthful
+      # ⚠ NEVER A SILENT SKIP. On the PR gate, "not on the registry" is a truthful
       # pass — nothing changed and nobody promised anything. Here a release just
       # happened and the bundle we ship to every plugin user is now, by default,
       # the OLD client. So every outcome except a clean match OR AN OPEN PR files

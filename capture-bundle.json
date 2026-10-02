@@ -14,7 +14,8 @@
     "",
     "capture.npmVersion is the client version this bundle corresponds to. It is",
     "what scripts/check_npm_bundle.mjs compares bin/ against, byte for byte and",
-    "with the registry signature, on every pull request and on every release."
+    "with the registry signature, on every pull request and on every release —",
+    "and it SKIPS, loudly (exit 3), when the registry does not show that version."
   ],
   "capture": {
     "repo": "Vibe-Commit/vibecommit-capture",
