@@ -66,6 +66,9 @@ jobs:
       - name: Wait for the registry to show the release
         id: visible
         continue-on-error: true
+        # The script bounds its window and each probe; this bounds the step even
+        # if a probe hangs where `timeout` cannot reach.
+        timeout-minutes: 8
         env:
           RELEASE_VERSION: ${{ github.event.client_payload.version }}
         run: scripts/wait_for_npm_version.sh --version "$RELEASE_VERSION"
@@ -86,10 +89,13 @@ jobs:
           set -e
           cat "$RUNNER_TEMP/result.txt"
           echo "code=$code" >> "$GITHUB_OUTPUT"
+          # A RANDOM delimiter: the value quotes npm's output, and a line equal to a
+          # fixed delimiter would end it early and let the rest be read as outputs.
+          delim="EOF_$(openssl rand -hex 16)"
           {
-            echo "outcome<<__EOF__"
+            echo "outcome<<${delim}"
             cat "$RUNNER_TEMP/result.txt"
-            echo "__EOF__"
+            echo "${delim}"
           } >> "$GITHUB_OUTPUT"
 
       # ⛔ THE BYTES CAN MATCH A RELEASE THAT DOES NOT RUN (TODOS[150]). 0.1.0,
@@ -102,6 +108,7 @@ jobs:
       - name: Execute the published command
         id: runs
         if: steps.visible.outcome == 'success'
+        timeout-minutes: 6
         env:
           RELEASE_VERSION: ${{ github.event.client_payload.version }}
         run: |
@@ -111,16 +118,24 @@ jobs:
           set -e
           cat "$RUNNER_TEMP/runs.txt"
           echo "code=$code" >> "$GITHUB_OUTPUT"
+          # ⛔ A RANDOM delimiter, not a fixed one: this value quotes the output of
+          # the program UNDER TEST. A fixed delimiter would let it print that
+          # delimiter followed by `code=0` and overwrite its own verdict.
+          delim="EOF_$(openssl rand -hex 16)"
           {
-            echo "outcome<<__EOF__"
+            echo "outcome<<${delim}"
             cat "$RUNNER_TEMP/runs.txt"
-            echo "__EOF__"
+            echo "${delim}"
           } >> "$GITHUB_OUTPUT"
 
       # Only a MISMATCH is re-vendorable: the release is published and bin/ is not
       # it. 2 (the registry could not be reached) and 3 (not published) have no
       # tarball to vendor from, and go straight to the issue as before. And only
       # a release whose command RAN: anything else is not a release to copy.
+      # "Could not check" (2) blocks exactly like "does not run" (1): re-vendoring
+      # is the direction that ships to every plugin user, so an undetermined
+      # answer must not open it. The two get different issue bodies, not
+      # different actions.
       #
       # ⚠ The "cannot rebuild" note above still holds — this does not rebuild. It
       # copies the PUBLIC, registry-signed tarball's emitted tree, the same bytes
@@ -172,12 +187,18 @@ jobs:
       # because the registry never showed it) files one too — even when the bytes
       # match, since matching a release that does not run is no comfort.
       - name: File the drift issue
+        # ⛔ `!cancelled()` is load-bearing. Without a status function this `if:`
+        # also carries an implicit "no earlier step failed", which holds only
+        # while every step above swallows its own failure. One ordinary step
+        # added above would make a failing run skip its own issue: clean by
+        # not running. Not `always()`, or a cancelled run files a bogus issue.
         if: >-
+          !cancelled() && (
           (steps.compare.outputs.code != '0' &&
           steps.pr.outputs.result != 'opened' &&
           steps.pr.outputs.result != 'exists' &&
           steps.pr.outputs.result != 'noop') ||
-          steps.runs.outputs.code != '0'
+          steps.runs.outputs.code != '0')
         env:
           # ⛔ `github.token`, DELIBERATELY not the PAT above. This step exists for
           # the case where the PR could not be opened — and an expired or revoked
@@ -229,6 +250,10 @@ jobs:
               printf '%s\n' "$RUNS_OUTCOME"
               printf '%s\n' '```'
               printf '%s\n' "</details>"
+              printf '\n'
+            elif [ "$COMPARE_CODE" = "2" ]; then
+              printf '%s\n' "The corroboration check **could not be made** (exit 2: registry or pack error),"
+              printf '%s\n' "so whether \`bin/\` matches ${RELEASE_VERSION} is unknown. Its output is in the details below."
               printf '\n'
             elif [ "$VISIBLE_OUTCOME" != "success" ]; then
               printf '%s\n' "The registry did not show **${RELEASE_VERSION}** within the bounded wait after"
@@ -292,7 +317,9 @@ jobs:
           fi
           # A re-run must not file a second issue for the same release; it comments.
           # `|| true`: a failed LOOKUP must fall through to filing, never stop it.
-          existing="$(gh issue list --state open --search "in:title \"${TITLE}\"" --json number,title \
+          # No `--search`: the search index lags writes, so a quick re-run would
+          # find nothing and file a duplicate. List and match the title exactly.
+          existing="$(gh issue list --state open --limit 200 --json number,title \
             --jq "map(select(.title == \"${TITLE}\"))[0].number // empty" || true)"
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --body-file "$RUNNER_TEMP/issue.md"

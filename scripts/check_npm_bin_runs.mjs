@@ -8,8 +8,10 @@
  * shipped a `dist/index.js` (16,709 / 19,191 / 19,191 bytes — not empty) that is
  * fine when run as `node dist/index.js` and does NOTHING when run as `vibecommit`:
  * 0 bytes of output and exit 0 on every verb. Its main-module guard compared
- * `import.meta.url` (the resolved file) against `process.argv[1]` (the npm bin
- * SYMLINK), never matched, and the process exited 0 with no output. Measured:
+ * `import.meta.url` (the RESOLVED file) TEXTUALLY against `process.argv[1]` (the
+ * path as invoked), so any symlink on the way broke it: npm's bin link, a shim,
+ * even a symlinked parent directory (macOS `/var` -> `/private/var`; VC, measured).
+ * It never matched, and the process exited 0 with no output. Measured:
  *
  *   node <prefix>/lib/node_modules/@vibe-commit/capture/dist/index.js --version  ->  0.2.1
  *   <prefix>/bin/vibecommit --version                                             ->  (nothing), exit 0
@@ -43,6 +45,11 @@ const PIN_FILE = "capture-bundle.json";
 // package.json: a release that renamed its bin would pass a check that asked it.
 const COMMAND = "vibecommit";
 const RUN_TIMEOUT_MS = 30_000;
+const INSTALL_TIMEOUT_MS = 120_000;
+// The wait step already confirmed `npm pack` resolves the release; these retries
+// cover the residue of the publish lag, and ONLY a not-found answer is retried.
+const INSTALL_RETRY_DELAYS_MS = [10_000, 20_000];
+const NOT_FOUND = /E404|404 Not Found|is not in this registry|ETARGET|notarget|No matching version/i;
 
 const EXIT_OK = 0;
 const EXIT_FAILED = 1;
@@ -62,7 +69,10 @@ if (!pkg || !version || !/^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$/.test(versi
   console.error("usage: check_npm_bin_runs.mjs --version <x.y.z>  (package from capture-bundle.json)");
   process.exit(EXIT_ERROR);
 }
-const spec = `${pkg}@${version}`;
+// VC_NPM_SPEC installs something else (a local tarball) under the same checks.
+// Only ever set for a red/green proof of this script — the same role as
+// check_npm_bundle.mjs's VC_NPM_SUBDIR. The expected output is still --version.
+const spec = process.env.VC_NPM_SPEC || `${pkg}@${version}`;
 
 /** Stdout, and the CI job summary when there is one. */
 const say = (line) => {
@@ -88,23 +98,34 @@ try {
 
 function check() {
   const prefix = join(work, "prefix");
-  // A throwaway HOME for the program we are about to run: this executes freshly
-  // downloaded code, and a defective build must not be able to touch the runner's
-  // (or a developer's) real config while it is being judged.
+  // A throwaway HOME, and an ALLOWLISTED environment, for the program we are about
+  // to run: this executes freshly downloaded code, and a defective build must not
+  // be able to read the runner's credentials or touch its (or a developer's) real
+  // config while it is being judged. The env is where credentials live, so it is
+  // built from nothing rather than filtered from `process.env`.
   const home = join(work, "home");
   mkdirSync(home);
 
   // `-g --prefix` is what creates the bin SYMLINK — the one thing under test. A
   // local install into node_modules/.bin would test a different path.
   // `--ignore-scripts` still links bins; it only refuses install-time scripts.
-  const install = spawnSync(
-    "npm",
-    ["install", "-g", "--prefix", prefix, "--ignore-scripts", "--no-audit", "--no-fund", "--prefer-online", spec],
-    { encoding: "utf8" },
-  );
+  let install;
+  for (let attempt = 0; ; attempt++) {
+    install = spawnSync(
+      "npm",
+      ["install", "-g", "--prefix", prefix, "--ignore-scripts", "--no-audit", "--no-fund", "--prefer-online", spec],
+      { encoding: "utf8", timeout: INSTALL_TIMEOUT_MS },
+    );
+    const said = `${install.stdout ?? ""}${install.stderr ?? ""}`;
+    if (install.status === 0 || attempt >= INSTALL_RETRY_DELAYS_MS.length || !NOT_FOUND.test(said)) break;
+    const ms = INSTALL_RETRY_DELAYS_MS[attempt];
+    console.log(`check:npm-bin — ${spec} not resolvable yet; retrying the install in ${ms / 1000}s`);
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  }
   if (install.status !== 0) {
+    const why = install.error ? `${install.error.code ?? install.error.message}` : clip(`${install.stdout ?? ""}${install.stderr ?? ""}`);
     console.error(`check:npm-bin — npm install ${spec} failed. This is not a pass.`);
-    console.error(clip(`${install.stdout ?? ""}${install.stderr ?? ""}`));
+    console.error(why);
     return EXIT_ERROR;
   }
 
@@ -124,7 +145,8 @@ function check() {
   const run = spawnSync(bin, ["--version"], {
     encoding: "utf8",
     timeout: RUN_TIMEOUT_MS,
-    env: { ...process.env, HOME: home, XDG_CONFIG_HOME: join(home, ".config") },
+    // PATH only so the shebang's `/usr/bin/env node` finds node.
+    env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, XDG_CONFIG_HOME: join(home, ".config") },
   });
   if (run.error) {
     return fail(`\`${COMMAND} --version\` could not be run: ${run.error.code ?? run.error.message}`);
