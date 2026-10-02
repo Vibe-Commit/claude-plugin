@@ -80,7 +80,7 @@ if command -v timeout >/dev/null 2>&1; then
   HAVE_TIMEOUT=1
 else
   HAVE_TIMEOUT=0
-  echo "warning: no \`timeout\` on PATH — each probe is UNBOUNDED (a dead registry can hold one ~75 s)." >&2
+  echo "warning: no \`timeout\` on PATH — this script does not bound its probes; a dead registry holds each one until the OS connect timeout (~75 s on macOS)." >&2
 fi
 bounded() {
   if [ "$HAVE_TIMEOUT" -eq 1 ]; then
