@@ -72,8 +72,11 @@ Read/search tools:
   rewrote the sha, the
   response reports the commit the capture is actually recorded against, so
   the two are never confused — and `superseded_by` lists what REPLACED the sha
-  you asked about, which is present even when we hold no capture for that sha, so
-  a stale note is still answerable. Resolution is at the COMMIT grain — `file_path`
+  you asked about, even when we hold no capture for that sha. ⚠ Read it WITH
+  `repository_successor_rows`: an empty list and 0 there means this repository has
+  never recorded a rewrite, NOT that your sha is current. Rewrites are recorded
+  only if the hook ran at the time, so empty is the common case.
+  Resolution is at the COMMIT grain — `file_path`
   is accepted but does not narrow the result.
 - `commit_coverage` — how many commits in a repository have a capture
   recorded against them, broken down by edge grade, with the recorded
