@@ -129,7 +129,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       # Only a MISMATCH is re-vendorable: the release is published and bin/ is not
-      # it. 2 (the registry could not be reached) and 3 (not published) have no
+      # it. 2 (the registry could not be reached) and 3 (not on the registry) have no
       # tarball to vendor from, and go straight to the issue as before. And only
       # a release whose command RAN: anything else is not a release to copy.
       # "Could not check" (2) blocks exactly like "does not run" (1): re-vendoring
@@ -178,7 +178,7 @@ jobs:
           echo "### capture ${RELEASE_VERSION}: re-vendor ${RESULT} ${PR_URL}" >> "$GITHUB_STEP_SUMMARY"
           echo "::notice title=re-vendor ${RESULT}::capture ${RELEASE_VERSION} ${PR_URL}"
 
-      # ⚠ NEVER A SILENT SKIP. On the PR gate, "not published" is a truthful
+      # ⚠ NEVER A SILENT SKIP. On the PR gate, "not on the registry" is a truthful
       # pass — nothing changed and nobody promised anything. Here a release just
       # happened and the bundle we ship to every plugin user is now, by default,
       # the OLD client. So every outcome except a clean match OR AN OPEN PR files
