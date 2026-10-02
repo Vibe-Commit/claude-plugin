@@ -19,14 +19,15 @@
  * registry signature (`npm audit signatures`) is the integrity baseline D64
  * named when it dropped `--provenance` for private-source builds.
  *
- * ⚠ AND IT CANNOT RUN TODAY. The package has NEVER been published: D64 says
- * plainly "do not publish to npm: the scope is unclaimed and the package is a
- * stub", and `npm view @vibe-commit/capture version` returns a 404. So this
- * check SKIPS — and the whole design of the skip is that it is LOUD, names its
- * reason, and is distinguishable from a pass. A check that silently no-ops when
- * its subject is absent is the empty-result-reads-as-clean failure this project
- * has hit repeatedly; an absent package is a KNOWN state, a registry outage is
- * NOT, and the two exit differently below.
+ * ⚠ A VERSION THE REGISTRY DOES NOT SHOW SKIPS — LOUDLY. When this was written
+ * the package had never been published (D64), and every run skipped. It has been
+ * published since 0.1.0 (2026-09-01). A 404 now means one of two things this
+ * check cannot tell apart from one answer: that version was never published, or
+ * it was published moments ago and has not propagated (TODOS[150]). The release
+ * dispatch waits out the second case before calling this
+ * (scripts/wait_for_npm_version.sh). Either way the skip is LOUD, names its
+ * reason, and is distinguishable from a pass: an absent version is a KNOWN state,
+ * a registry outage is NOT, and the two exit differently below.
  *
  * Usage:
  *   node scripts/check_npm_bundle.mjs                       # pinned package + version
@@ -38,7 +39,7 @@
  *   0  corroborated — the tarball's emitted tree is byte-identical to bin/
  *   1  MISMATCH — it is published and it does not match, or its signature failed
  *   2  the check could not be made (registry error, bad usage) — NOT a skip
- *   3  SKIPPED — that package@version is not published (D64). Loud, and truthful.
+ *   3  SKIPPED — the registry does not show that package@version. Loud, and truthful.
  */
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
@@ -103,10 +104,10 @@ function walkJs(dir) {
 const digestTree = (dir) =>
   Object.fromEntries(walkJs(dir).map((rel) => [rel, sha256(readFileSync(join(dir, rel)))]));
 
-// ------------------------------------------------- is it published at all?
+// ------------------------------------------------ does the registry show it?
 //
-// The one distinction that matters: E404 means "not published", which is a
-// known, declared state (D64). Anything else — a network failure, a registry
+// The one distinction that matters: E404 means "the registry does not show this
+// version" — never published, or not yet propagated. Anything else — a network failure, a registry
 // outage, an auth wall — means the check DID NOT RUN, and that must not wear
 // the same face as a skip.
 
@@ -124,16 +125,15 @@ if (view.status !== 0) {
   say("");
   say(`- pinned capture commit: \`${pin.capture?.commit ?? "?"}\``);
   say(`- would compare against: \`${spec}\``);
-  say(`- **why it skipped**: \`${pkg}\` is **not published to npm**. D64 says plainly *"do not`);
-  say('  publish to npm: the scope is unclaimed and the package is a stub"*, so there is no');
-  say("  tarball to compare against — and this repo may not read the private source to build");
-  say("  one itself (D64 / D20).");
+  say(`- **why it skipped**: the registry does **not show** \`${spec}\` (E404). Either that`);
+  say("  version was never published, or it was published moments ago and has not propagated —");
+  say("  one answer cannot tell those apart (TODOS[150]). Either way there is no tarball to");
+  say("  compare against, and this repo may not read the private source to build one (D64 / D20).");
   say("- **what is therefore UNVERIFIED**: that `bin/` is the emitted output of the pinned");
   say("  capture commit. The self-consistency gates still hold; byte-identity against the");
-  say("  client does not, and nothing in this repo can currently establish it.");
-  say("- this check turns itself on the day the package is published — no edit required.");
+  say("  client does not, until the registry shows this version.");
   console.log("");
-  console.log(`check:npm-bundle SKIPPED — ${spec} is not published (D64). Not verified, not failed.`);
+  console.log(`check:npm-bundle SKIPPED — the registry does not show ${spec}. Not verified, not failed.`);
   process.exit(EXIT_SKIPPED);
 }
 

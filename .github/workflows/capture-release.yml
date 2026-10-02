@@ -129,7 +129,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       # Only a MISMATCH is re-vendorable: the release is published and bin/ is not
-      # it. 2 (the registry could not be reached) and 3 (not published) have no
+      # it. 2 (the registry could not be reached) and 3 (not on the registry) have no
       # tarball to vendor from, and go straight to the issue as before. And only
       # a release whose command RAN: anything else is not a release to copy.
       # "Could not check" (2) blocks exactly like "does not run" (1): re-vendoring

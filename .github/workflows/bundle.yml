@@ -76,15 +76,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22.15.0"
-      # ⚠ THIS ONE SKIPS TODAY, AND THE SKIP IS THE POINT. `@vibe-commit/capture`
-      # has never been published (D64: "do not publish to npm: the scope is
-      # unclaimed and the package is a stub"), so there is no tarball to compare
-      # `bin/` against. The check is wired anyway and turns itself on the day of
-      # the first publish, with no edit here.
+      # It compares `bin/` against the pinned `capture.npmVersion` on the registry.
+      # When this was written the package had never been published (D64) and it
+      # always skipped; it has run for real since 0.1.0. It still SKIPS (3) when
+      # the registry does not show the pinned version, and says so.
       #
       # The three outcomes are kept distinct on purpose, because "the subject is
       # absent" and "the check did not run" are the same shade of green to a
-      # careless gate: 0 corroborated, 1 published-and-different, 3 not published,
+      # careless gate: 0 corroborated, 1 published-and-different, 3 not on the registry,
       # anything else (registry unreachable, bad tarball) an error that FAILS.
       - name: check:npm-bundle
         run: |
@@ -94,6 +93,6 @@ jobs:
           set -e
           case "$code" in
             0) echo "bundle corroborated against the published client" ;;
-            3) echo "::warning title=Bundle not corroborated::@vibe-commit/capture is not published (D64), so byte-identity between bin/ and the capture client is UNVERIFIED. The self-consistency gates still hold." ;;
+            3) echo "::warning title=Bundle not corroborated::the registry does not show the pinned capture version, so byte-identity between bin/ and the capture client is UNVERIFIED. The self-consistency gates still hold." ;;
             *) echo "::error title=Bundle corroboration failed::check_npm_bundle.mjs exited $code"; exit "$code" ;;
           esac
