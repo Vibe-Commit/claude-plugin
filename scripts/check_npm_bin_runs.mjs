@@ -4,9 +4,10 @@
  * does, and EXECUTE the `vibecommit` command it links (TODOS[150]).
  *
  * WHY THE BYTES ARE NOT ENOUGH. check_npm_bundle.mjs proves bin/ is byte-identical
- * to the tarball, which is exactly as good as the tarball. 0.2.0 and 0.2.1 shipped
- * a 19,191-byte `dist/index.js` that is fine when run as `node dist/index.js` and
- * does NOTHING when run as `vibecommit`: its main-module guard compared
+ * to the tarball, which is exactly as good as the tarball. 0.1.0, 0.2.0 and 0.2.1
+ * shipped a `dist/index.js` (16,709 / 19,191 / 19,191 bytes — not empty) that is
+ * fine when run as `node dist/index.js` and does NOTHING when run as `vibecommit`:
+ * 0 bytes of output and exit 0 on every verb. Its main-module guard compared
  * `import.meta.url` (the resolved file) against `process.argv[1]` (the npm bin
  * SYMLINK), never matched, and the process exited 0 with no output. Measured:
  *

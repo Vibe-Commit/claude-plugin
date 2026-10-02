@@ -92,9 +92,9 @@ jobs:
             echo "__EOF__"
           } >> "$GITHUB_OUTPUT"
 
-      # ⛔ THE BYTES CAN MATCH A RELEASE THAT DOES NOT RUN (TODOS[150]). 0.2.0 and
-      # 0.2.1 passed every byte and symbol check, and `vibecommit --version`
-      # printed NOTHING and exited 0 — their main-module guard never matched
+      # ⛔ THE BYTES CAN MATCH A RELEASE THAT DOES NOT RUN (TODOS[150]). 0.1.0,
+      # 0.2.0 and 0.2.1 passed every byte and symbol check, and every
+      # `vibecommit` verb printed NOTHING and exited 0 — their main-module guard never matched
       # through npm's bin symlink. The plugin lane runs the file directly and never
       # meets that symlink, so only the npm lane can show it, and only by running
       # it. A failure here also BLOCKS the re-vendor below: copying a release that
