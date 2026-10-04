@@ -96,6 +96,24 @@ All notable changes to this plugin will be documented here.
   server's `setup` tool. `scripts/check_install_claims.mjs` (run in CI) fails on the old
   wording, with a self-check that its detector fires on the known-false sentences.
 
+- **The capture instructions are conditional, and the search description is true (`TODOS[171]` D1, D6).**
+  The rules said "Capture your work with `commit_conversation` … ALWAYS right after you make a
+  git commit" and told the agent to send `commit_sha_successor` itself, while the server says
+  capture runs automatically from git and editor hooks and `commit_conversation` is the
+  fallback (and capture 0.3.0's post-rewrite hook already records rewrites). The text is now
+  one conditional paragraph for every vendor: with VibeCommit's hooks installed (Claude Code
+  after `vibecommit connect`) capture is automatic and the agent must not call
+  `commit_conversation` or send `commit_sha_successor`; with no hooks it captures with
+  `commit_conversation` as before; and an agent that is unsure asks `blame_commit` about a
+  commit it made EARLIER in the session (`cold_start` / `no_edge` = nothing captured it).
+  The SKILL.md frontmatter description (always on in the skills listing) says the same.
+  `search_history` is described as what it is — a most-recent-first list of commits with
+  `filters.repo` (a slug) / `filters.org`; a free-text `query` returns an error — and the
+  typical flow goes through a commit sha (`search_history` → `blame_commit` →
+  `get_conversation` by that sha → `diff_conversation`). `get_conversation` can now be opened
+  by `commit_sha` plus `repo` / `repository_id`. Canonical here; `vibecommit-mcp`'s
+  `rules_body.ts` and `claude_code.ts` mirror it (D117 §2), held byte-equal by `t7-parity`.
+
 - **`CLAUDE.md` is now a sentinel-delimited managed section, not a whole-file
   overwrite (`TODOS[170]`).** It is the USER's project-instructions file, and
   `setup` used to replace it wholesale. It now carries exactly the same bytes as

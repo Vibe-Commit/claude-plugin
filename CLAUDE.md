@@ -15,8 +15,13 @@ You have a VibeCommit MCP server. On every coding task:
    refresh these instructions. It is idempotent — on the common path you get
    back only a list of already-current files, one cheap round-trip.
 
-2. **Capture your work with `commit_conversation`.** Call it after each
-   meaningful chunk of work, and ALWAYS right after you make a git commit.
+2. **Capture.** If VibeCommit's git and editor hooks are installed (Claude Code
+   after `vibecommit connect`), capture is automatic: do NOT call
+   `commit_conversation` to record your work, and do not send
+   `commit_sha_successor` — the post-rewrite hook records rewrites.
+   If your client has no VibeCommit hooks, capture with `commit_conversation`:
+   call it after each meaningful chunk of work, and ALWAYS right after you make
+   a git commit.
    - Send `transcript_records`: your session transcript (Claude Code JSONL)
      parsed into an array of record objects, INLINE. Do NOT send
      `transcript_file_location` to the hosted server — it cannot read your disk.
@@ -38,6 +43,10 @@ You have a VibeCommit MCP server. On every coding task:
      touching more than one file, so it will NOT match. Send `null` for a
      merge, an empty commit, or a sha your clone does not have.
 
+   Not sure whether the hooks are installed? Ask `blame_commit` about a commit
+   you made earlier in this session: `cold_start` or `no_edge` means nothing
+   captured it, so call `commit_conversation`.
+
    Re-capturing the same conversation is a FREE no-op, so call it freely. The
    response includes a `provenance_url` — mention it to the user. If it reports
    `uncaptured_commits`, capture those too.
@@ -55,10 +64,11 @@ history. Use them when the user asks to find, review, summarize, compare,
 or replay past work. Reach for them yourself — do not make the user dig.
 
 Read/search tools:
-- `search_history` — full-text search of YOUR captured history. Pass
-  `query` (+ optional `filters.repo` / `filters.org`). Returns
+- `search_history` — list YOUR captured commits, most-recent-first. Narrow
+  with optional `filters.repo` (a repository SLUG) / `filters.org`. A free-text
+  `query` is NOT supported yet and returns an error: omit it. Returns
   `{ items:[{ kind, id, repo_id, repository, created_at, snippet }],
-  page, total_pages, total }`, most-recent-first. `repository` is
+  page, total_pages, total }`. `repository` is
   `{ id, slug, display_name }`, null only while the server is mid-upgrade — it does
   NOT mean you lack access. ⚠ `repo_id` holds the SLUG and is deprecated: it is NOT the
   `repository_id` that `commit_coverage` returns and `blame_commit` accepts.
@@ -93,9 +103,10 @@ Read/search tools:
   an edge for and NOT a percentage: reachability from a ref is a local git
   question the server cannot answer, so compute any rate in the user's own
   clone.
-- `get_conversation` — open ONE captured conversation by
-  `conversation_id`: its captures and, per capture, the ordered turns
-  with reconstructed `content`.
+- `get_conversation` — open ONE captured conversation, by `conversation_id`
+  OR by `commit_sha` plus `repo`/`repository_id` (the sha you hold from
+  `blame_commit` or git): its captures and, per capture, the ordered turns with
+  `content` (the work only: roles, text, tool calls and results).
 - `diff_conversation` — compare two branches/runs of one conversation.
   Pass `conversation_id` plus `left` and `right`, each exactly one of
   `ref` (e.g. `"main"`) OR `capture_id`. Returns
@@ -103,12 +114,12 @@ Read/search tools:
   (`truncated: true` means a long side was tail-trimmed — the diff is
   partial; say so).
 
-Typical flow: `search_history` → `get_conversation` →
-`diff_conversation`, or `blame_commit` when the user starts from a commit.
+Typical flow: `search_history` to list commits → `blame_commit` for one →
+`get_conversation` (by that sha) → `diff_conversation`.
 
 Render results in chat:
-- **Search:** a ranked list — each result's SHA/id in `monospace` with a
-  one-line context (the `snippet` or repo/date).
+- **Search:** a list of commits, most-recent-first — each SHA in `monospace`
+  with its repo and date.
 - **Blame:** name the commit the capture is recorded against, and say so
   explicitly when it differs from the sha the user asked about.
 - **Coverage:** always give the ref alongside the count — a coverage number
