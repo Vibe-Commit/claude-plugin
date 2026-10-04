@@ -86,6 +86,16 @@ All notable changes to this plugin will be documented here.
 
 ### Changed
 
+- **The docs no longer claim the plugin installs the rules files (`TODOS[171]` D9).**
+  `README.md`, `.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json` said the
+  plugin delivers `AGENTS.md`, `CLAUDE.md` and `SKILL.md` to your project and that Claude
+  Code then calls `setup` and `commit_conversation` on its own. It does not: Claude Code
+  loads skills from `skills/` (or a `skills` key) and does not load a plugin-root
+  `CLAUDE.md` / `AGENTS.md` as context, and this plugin has neither, so a plugin install
+  contributes hooks and the MCP config only. The rules files reach a project through the
+  server's `setup` tool. `scripts/check_install_claims.mjs` (run in CI) fails on the old
+  wording, with a self-check that its detector fires on the known-false sentences.
+
 - **`CLAUDE.md` is now a sentinel-delimited managed section, not a whole-file
   overwrite (`TODOS[170]`).** It is the USER's project-instructions file, and
   `setup` used to replace it wholesale. It now carries exactly the same bytes as
