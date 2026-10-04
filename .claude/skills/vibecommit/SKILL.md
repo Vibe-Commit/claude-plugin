@@ -120,4 +120,4 @@ Render results in chat:
 
 These instructions are managed by the VibeCommit setup tool. Do not edit
 them locally — your edits will be overwritten on the next `setup` call.
-Custom rules go in a separate file alongside this one.
+Your own rules belong outside this managed content.

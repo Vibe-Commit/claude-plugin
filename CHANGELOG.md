@@ -99,6 +99,11 @@ All notable changes to this plugin will be documented here.
   check `superseded_by` on EVERY state, and `resolved_sha` is a prefix
   expansion, never evidence of a rewrite. Canonical here; `vibecommit-mcp`'s
   `rules_body.ts` mirrors it (D117 §2) and `t7-parity` holds them byte-equal.
+  The section's last line changed from "Custom rules go in a separate file
+  alongside this one." to "Your own rules belong outside this managed content.":
+  the old line contradicted the header ("Content OUTSIDE those markers is yours")
+  inside a user's CLAUDE.md. `setup`'s legacy-file rule matches the OLD line, so
+  the new text deliberately differs from it.
 - **The three rules files no longer teach retired tools (`CR-079e`).**
   `AGENTS.md`, `CLAUDE.md` and `.claude/skills/vibecommit/SKILL.md` are
   delivered into a user's project on install and read by their agent on every
