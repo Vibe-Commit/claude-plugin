@@ -12,28 +12,31 @@ for capture at the moment of commit — see [below](#optional-capture-on-every-c
 /plugin install vibecommit@vibecommit-capture
 ```
 
-That's it. Claude Code now automatically:
+That's it. Claude Code now:
 - Fires Claude Code hooks on `Stop`, `PreCompact`, and `SessionEnd` that invoke
   the bundled capture client directly — capture that does not depend on the
   agent calling a tool
-- Calls `setup` once per session to load the capture rules
-- Calls `commit_conversation` to capture your work — after each meaningful chunk
-  and right after every commit — and shares the provenance URL with you
+- Connects the VibeCommit MCP server, so your agent can search, blame and diff
+  your captured history (`search_history`, `blame_commit`, `commit_coverage`,
+  `get_conversation`, `diff_conversation`)
 
 ## What gets installed
 
-The plugin delivers three rules files to your project and configures the MCP server:
+The plugin installs hooks and the MCP server config:
 
-| File | Purpose |
+| Component | Purpose |
 |---|---|
-| `AGENTS.md` | Cross-vendor anchor — every agent framework reads this |
-| `CLAUDE.md` | Claude Code project instructions with the capture protocol |
-| `.claude/skills/vibecommit/SKILL.md` | Claude Code skill for explicit `/vibecommit` invocation |
+| `hooks/hooks.json` | `Stop`, `PreCompact` and `SessionEnd` hooks that run the bundled capture client |
+| `bin/` | The vendored capture client those hooks invoke |
 | `.mcp.json` | MCP server config pointing at `https://api.vibecommit.ai/mcp` |
 
-All rules files carry the cooperation-rate-load-bearing capture protocol: call
-`setup` at session start, call `commit_conversation` after each chunk of work and
-right after every commit, surface the `provenance_url` to the user.
+**The rules files are not installed by the plugin.** `AGENTS.md`, `CLAUDE.md` and
+`.claude/skills/vibecommit/SKILL.md` in this repository are the canonical rules text,
+but Claude Code does not load a plugin's root `CLAUDE.md` or `AGENTS.md` as context,
+and this plugin has no `skills/` directory, so installing the plugin alone gives your
+agent no rules text. The rules files reach your project through the VibeCommit
+server's `setup` tool, which writes them into your repository as a managed section
+(content outside the managed markers stays yours).
 
 ## Cross-vendor users
 
@@ -44,16 +47,17 @@ experience across vendors — use the VibeCommit setup tool instead:
 **https://www.vibecommit.ai/install**
 
 The install page has one-liner MCP blocks for every supported agent. The `setup`
-MCP tool delivers the same rules files the plugin ships, so you get byte-identical
-content either way.
+MCP tool is how the rules files reach ANY project, Claude Code included: its content is
+the canonical text kept in this repository, and the plugin install does not deliver it.
 
 ## How it works
 
 Capture happens two ways, and both write to the same history: Claude Code hooks
 (`Stop`/`PreCompact`/`SessionEnd`, installed automatically with this plugin)
 invoke the bundled capture client directly, and the MCP server below is called
-cooperatively by your agent per the rules files. Re-capturing the same
-conversation through either path is a free no-op, so the two never double-record.
+cooperatively by your agent when it has the rules text (delivered by `setup`, not
+by this plugin install). Re-capturing the same conversation through either path is
+a free no-op, so the two never double-record.
 
 VibeCommit's MCP server is at `https://api.vibecommit.ai/mcp`. The tools the
 cooperative flow relies on:

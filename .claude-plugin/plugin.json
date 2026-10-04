@@ -1,7 +1,7 @@
 {
   "name": "vibecommit",
   "displayName": "VibeCommit",
-  "description": "Capture your Claude Code sessions into VibeCommit: installs deterministic hooks (Stop, PreCompact, SessionEnd), the AGENTS.md + CLAUDE.md + SKILL.md rules files, and MCP read tools to search, blame, and diff your history.",
+  "description": "Capture your Claude Code sessions into VibeCommit: installs deterministic hooks (Stop, PreCompact, SessionEnd) and the MCP read tools to search, blame, and diff your history. The rules files (AGENTS.md, CLAUDE.md, SKILL.md) are delivered by the server's setup tool, not by this plugin install.",
   "version": "1.0.0",
   "author": {
     "name": "VibeCommit",

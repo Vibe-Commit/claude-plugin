@@ -1,0 +1,16 @@
+name: install-claims
+# TODOS[171] D9 — the docs must not claim the plugin installs the rules files (it does not; see
+# scripts/check_install_claims.mjs). Runs the lint, which self-checks that its detector fires.
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  install-claims:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: node scripts/check_install_claims.mjs .
