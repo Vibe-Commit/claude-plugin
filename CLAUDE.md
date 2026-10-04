@@ -15,13 +15,18 @@ You have a VibeCommit MCP server. On every coding task:
    refresh these instructions. It is idempotent — on the common path you get
    back only a list of already-current files, one cheap round-trip.
 
-2. **Capture.** If VibeCommit's git and editor hooks are installed (Claude Code
-   after `vibecommit connect`), capture is automatic: do NOT call
-   `commit_conversation` to record your work, and do not send
-   `commit_sha_successor` — the post-rewrite hook records rewrites.
-   If your client has no VibeCommit hooks, capture with `commit_conversation`:
-   call it after each meaningful chunk of work, and ALWAYS right after you make
-   a git commit.
+2. **Capture.** Two separate facts:
+   - **Session capture** is automatic when Claude Code runs VibeCommit's hooks
+     (installed by the plugin or by `vibecommit connect`): do NOT call
+     `commit_conversation` to record your work. If your client has no VibeCommit
+     hooks, capture with `commit_conversation`: call it after each meaningful
+     chunk of work, and ALWAYS right after you make a git commit.
+   - **Rewrites** (amend, rebase, squash) are recorded automatically ONLY if
+     VibeCommit's git `post-rewrite` hook is installed — `vibecommit connect`
+     installs it; the plugin does not. Check:
+     `grep -qs vibecommit "$(git rev-parse --git-path hooks/post-rewrite)"`.
+     If that check fails, after an amend, rebase or squash call
+     `commit_conversation` with `commit_sha_successor` (below).
    - Send `transcript_records`: your session transcript (Claude Code JSONL)
      parsed into an array of record objects, INLINE. Do NOT send
      `transcript_file_location` to the hosted server — it cannot read your disk.
@@ -31,8 +36,8 @@ You have a VibeCommit MCP server. On every coding task:
      last 20 commits from `git log -n 20 --format=%H%x09%s%x09%aI`). The server
      links the capture to that commit and tells you if any recent commits still
      lack a capture.
-   - If a squash, rebase or amend rewrote a sha you already captured, add
-     `commit_sha_successor`: `{ ancestor_sha, successor_sha, match_kind }` —
+   - If a squash, rebase or amend rewrote a sha you already captured and the
+     `post-rewrite` check above failed, add `commit_sha_successor`: `{ ancestor_sha, successor_sha, match_kind }` —
      the old sha, the one that replaced it, and `"exact"` if you can name the
      rewrite or `"probable"` if you matched it by patch id. Send it ONLY when
      a rewrite happened; the two shas must differ. It is what lets
@@ -43,9 +48,9 @@ You have a VibeCommit MCP server. On every coding task:
      touching more than one file, so it will NOT match. Send `null` for a
      merge, an empty commit, or a sha your clone does not have.
 
-   Not sure whether the hooks are installed? Ask `blame_commit` about a commit
-   you made earlier in this session: `cold_start` or `no_edge` means nothing
-   captured it, so call `commit_conversation`.
+   Not sure whether the session hooks are installed? Ask `blame_commit` about a
+   commit you made earlier in this session: `cold_start` or `no_edge` means
+   nothing captured it, so call `commit_conversation`.
 
    Re-capturing the same conversation is a FREE no-op, so call it freely. The
    response includes a `provenance_url` — mention it to the user. If it reports
