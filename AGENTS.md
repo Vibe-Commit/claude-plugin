@@ -1,8 +1,8 @@
 <!-- vibecommit:managed:start -->
 <!--
 # vibecommit:managed — do not hand-edit the section below; re-run setup to update
-The section delimited by <!-- vibecommit:managed:start --> and
-<!-- vibecommit:managed:end --> is managed by the VibeCommit MCP server's
+The section between the vibecommit:managed:start and vibecommit:managed:end
+marker comments is managed by the VibeCommit MCP server's
 setup tool. Content OUTSIDE those markers is yours to edit and is preserved
 across setup re-runs. Edits inside the managed section will be overwritten.
 -->
@@ -70,11 +70,15 @@ Read/search tools:
   `local:<12 hex>` for a tree with no usable remote) OR `repository_id`,
   supplying exactly one, and pass `commit_sha`. FEWER than 40 hex is resolved as
   a prefix, the way `git` expands an abbreviation; an ambiguous prefix is REFUSED
-  with the candidates named rather than guessed. If a squash, rebase or amend
-  rewrote the sha, the
-  response reports the commit the capture is actually recorded against, so
-  the two are never confused — and `superseded_by` lists what REPLACED the sha
-  you asked about, even when we hold no capture for that sha. ⚠ Read it WITH
+  with the candidates named rather than guessed. `recorded_sha` is not a rewrite
+  flag: it is null on an ordinary hit and on a stale sha with its own capture. Ask
+  by argument instead — `superseded_by` lists what REPLACED the sha you asked
+  about, `squashed_from` what it REPLACED. Check `superseded_by` on EVERY
+  state: a rewritten sha usually keeps the capture it was made in, so it often
+  answers `turns` with a non-empty `superseded_by`. `recorded_sha` is the
+  pre-rewrite ancestor whose turns are shown, set only when your sha has no capture
+  of its own; `resolved_sha` is a prefix expansion, never evidence of a rewrite.
+  ⚠ Read `superseded_by` WITH
   `repository_successor_rows`: an empty list and 0 there means this repository has
   never recorded a rewrite, NOT that your sha is current. Rewrites are recorded
   only if the hook ran at the time, so empty is the common case.
@@ -114,5 +118,5 @@ Render results in chat:
 
 These instructions are managed by the VibeCommit setup tool. Do not edit
 them locally — your edits will be overwritten on the next `setup` call.
-Custom rules go in a separate file alongside this one.
+Your own rules belong outside this managed content.
 <!-- vibecommit:managed:end -->
