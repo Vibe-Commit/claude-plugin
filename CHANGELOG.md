@@ -86,6 +86,19 @@ All notable changes to this plugin will be documented here.
 
 ### Changed
 
+- **`CLAUDE.md` is now a sentinel-delimited managed section, not a whole-file
+  overwrite (`TODOS[170]`).** It is the USER's project-instructions file, and
+  `setup` used to replace it wholesale. It now carries exactly the same bytes as
+  `AGENTS.md` — only the section between the `vibecommit:managed` markers is
+  VibeCommit's; everything outside it is preserved across `setup` re-runs. The
+  managed-section header no longer quotes the literal marker strings in its
+  prose (the first end marker after the start used to sit inside the header, so
+  extract/replace cut the section there). The `blame_commit` paragraph now
+  teaches the direction-specific rule: `recorded_sha` is not a rewrite flag,
+  `superseded_by` = what REPLACED the sha, `squashed_from` = what it REPLACED,
+  check `superseded_by` on EVERY state, and `resolved_sha` is a prefix
+  expansion, never evidence of a rewrite. Canonical here; `vibecommit-mcp`'s
+  `rules_body.ts` mirrors it (D117 §2) and `t7-parity` holds them byte-equal.
 - **The three rules files no longer teach retired tools (`CR-079e`).**
   `AGENTS.md`, `CLAUDE.md` and `.claude/skills/vibecommit/SKILL.md` are
   delivered into a user's project on install and read by their agent on every
