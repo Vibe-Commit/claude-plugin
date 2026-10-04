@@ -13,10 +13,12 @@ import { join, resolve } from "node:path";
 const FILES = ["README.md", ".claude-plugin/plugin.json", ".claude-plugin/marketplace.json"];
 // Phrases that claim the plugin delivers/installs the rules files, or that an install makes the agent call setup/commit_conversation.
 const FALSE_CLAIMS = [
-  /delivers three rules files/i,
+  /delivers\s+three\s+rules\s+files/i,
   /installs(?:(?!\. [A-Z])[^\n"])*?\brules files\b/i, // within ONE sentence (a ". " + capital ends it; dots inside file names do not)
-  /Calls `setup` once per session/i,
-  /Calls `commit_conversation` to capture your work/i,
+  /Calls\s+`setup`\s+once\s+per\s+session/i,
+  /Calls\s+`commit_conversation`\s+to\s+capture\s+your\s+work/i,
+  /delivers\s+the\s+same\s+rules\s+files\s+the\s+plugin\s+ships/i,
+  /byte-identical\s+content\s+either\s+way/i,
 ];
 const REQUIRED_IN_README = [/rules files are not installed by the plugin/i];
 
@@ -30,6 +32,7 @@ const PRE_FIX = [
   "installs deterministic hooks (Stop, PreCompact, SessionEnd), the AGENTS.md + CLAUDE.md + SKILL.md rules files, and MCP read tools",
   "- Calls `setup` once per session to load the capture rules",
   "- Calls `commit_conversation` to capture your work — after each meaningful chunk",
+  "The `setup` MCP tool delivers the same rules files the plugin ships, so you get byte-identical content either way.",
 ];
 for (const s of PRE_FIX) {
   if (findFalseClaims(s).length === 0) {

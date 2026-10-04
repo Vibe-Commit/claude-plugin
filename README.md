@@ -47,8 +47,8 @@ experience across vendors — use the VibeCommit setup tool instead:
 **https://www.vibecommit.ai/install**
 
 The install page has one-liner MCP blocks for every supported agent. The `setup`
-MCP tool delivers the same rules files the plugin ships, so you get byte-identical
-content either way.
+MCP tool is how the rules files reach ANY project, Claude Code included: its content is
+the canonical text kept in this repository, and the plugin install does not deliver it.
 
 ## How it works
 
