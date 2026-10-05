@@ -96,6 +96,38 @@ All notable changes to this plugin will be documented here.
   server's `setup` tool. `scripts/check_install_claims.mjs` (run in CI) fails on the old
   wording, with a self-check that its detector fires on the known-false sentences.
 
+- **The capture instructions are two independent conditional facts, and the search description is true (`TODOS[171]` D1, D6).**
+  The rules said "Capture your work with `commit_conversation` … ALWAYS right after you make a
+  git commit" and told the agent to send `commit_sha_successor` itself, while the server says
+  capture runs automatically from hooks and `commit_conversation` is the fallback. They are now
+  two facts. (i) **Session capture** is automatic when Claude Code runs VibeCommit's hooks —
+  from this plugin OR from `vibecommit connect` — so the agent must not call `commit_conversation`
+  to record its work; with no hooks it captures with `commit_conversation` as before. (ii)
+  **Rewrites** (amend, rebase, squash) are recorded automatically ONLY if the git `post-rewrite`
+  hook is installed. `vibecommit connect` installs it; **this plugin does not** (it registers
+  Claude Code hooks only), and a session-only install writes derived edges for a commit and its
+  amend and no successor row (measured). The agent checks
+  `grep -qs vibecommit "$(git rev-parse --git-path hooks/post-rewrite)"` (which respects
+  `core.hooksPath`) and, if it fails, sends `commit_sha_successor` after a rewrite as before.
+  An agent that is unsure whether the session hooks are installed asks `blame_commit` about a commit
+  it made in an EARLIER TURN of the session (`cold_start` / `no_edge` = nothing captured it; the
+  current turn's commit is not sealed yet and reads `no_edge` on a healthy install). The SKILL.md
+  frontmatter description (always on in the skills listing) names both facts. After a real-agent
+  run (VG, 12 runs): "so call it freely" is gone (the no-op fact stays); when the git check fails
+  the agent first tells the user that rewrites are not being recorded and that `vibecommit connect`
+  installs the hook, and sends `commit_sha_successor` only with its real transcript — never an
+  empty or reconstructed `transcript_records` (the server rejects empty records, and reconstructed
+  ones are a fabricated capture); the check is stated to test the GIT hook only, not session
+  capture; `connect` refuses under a custom `core.hooksPath` (e.g. husky), where the check
+  then correctly fails; and the no-empty / no-reconstructed rule is also on the generic
+  `transcript_records` bullet, which every capture path uses.
+  `search_history` is described as what it is — a most-recent-first list of commits with
+  `filters.repo` (a slug) / `filters.org`; a free-text `query` returns an error — and the
+  typical flow goes through a commit sha (`search_history` → `blame_commit` →
+  `get_conversation` by that sha → `diff_conversation`). `get_conversation` can now be opened
+  by `commit_sha` plus `repo` / `repository_id`. Canonical here; `vibecommit-mcp`'s
+  `rules_body.ts` and `claude_code.ts` mirror it (D117 §2), held byte-equal by `t7-parity`.
+
 - **`CLAUDE.md` is now a sentinel-delimited managed section, not a whole-file
   overwrite (`TODOS[170]`).** It is the USER's project-instructions file, and
   `setup` used to replace it wholesale. It now carries exactly the same bytes as
