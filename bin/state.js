@@ -37,6 +37,7 @@
  */
 import { chmodSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { pendingFileExpired } from "./pending_prune.js";
 import { repoSessionsDir, sessionStatePath } from "./paths.js";
 import { EMPTY_FILE_STATE } from "./policy.js";
 export const EMPTY_SESSION_STATE = {
@@ -209,10 +210,13 @@ export function heldAtEndForRepo(home, repoKey) {
     return { bytes, sessions };
 }
 /** Commit lines waiting in a session's spool or pending file. */
-function commitLinesFor(dir, stem) {
+function commitLinesFor(dir, stem, nowMs) {
     let n = 0;
     for (const suffix of [".spool.jsonl", ".pending.jsonl"]) {
         try {
+            // `TODOS[175]`: an EXPIRED pending file (older than 7 days, nobody can claim it) is not "waiting"; spool lines always are.
+            if (suffix === ".pending.jsonl" && pendingFileExpired(join(dir, `${stem}${suffix}`), nowMs))
+                continue;
             n += readFileSync(join(dir, `${stem}${suffix}`), "utf8")
                 .split("\n")
                 .filter((l) => l.trim() !== "").length;
@@ -233,7 +237,7 @@ function commitLinesFor(dir, stem) {
  * the caller already finalized, or whose newest delivery sealed something, is not listed. A header the
  * server did not send (`sealed: null`, an older server) is unknown, and unknown is not reported.
  */
-export function openTailForRepo(home, repoKey) {
+export function openTailForRepo(home, repoKey, nowMs = Date.now()) {
     const none = { ids: [] };
     const dir = repoSessionsDir(home, repoKey);
     if (dir === null)
@@ -256,7 +260,7 @@ export function openTailForRepo(home, repoKey) {
             continue;
         if (session.finalized !== null && session.finalized.at >= r.at)
             continue;
-        if (r.everSealed && commitLinesFor(dir, stem) === 0)
+        if (r.everSealed && commitLinesFor(dir, stem, nowMs) === 0)
             continue;
         found.push({ id: stem, endedAt: session.endedAt });
     }
@@ -264,7 +268,7 @@ export function openTailForRepo(home, repoKey) {
     return { ids: found.map((f) => f.id) };
 }
 /** Commit lines this repo is holding because no turn has closed over them yet. */
-export function commitsWaitingForRepo(home, repoKey) {
+export function commitsWaitingForRepo(home, repoKey, nowMs = Date.now()) {
     const dir = repoSessionsDir(home, repoKey);
     if (dir === null)
         return 0;
@@ -280,6 +284,8 @@ export function commitsWaitingForRepo(home, repoKey) {
         if (!entry.endsWith(".spool.jsonl") && !entry.endsWith(".pending.jsonl"))
             continue;
         try {
+            if (entry.endsWith(".pending.jsonl") && pendingFileExpired(join(dir, entry), nowMs))
+                continue; // `TODOS[175]`
             n += readFileSync(join(dir, entry), "utf8").split("\n").filter((l) => l.trim() !== "").length;
         }
         catch {

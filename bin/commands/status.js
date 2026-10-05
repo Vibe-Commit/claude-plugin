@@ -30,6 +30,7 @@ import { loadCredential, savedCredentialExists } from "../credential.js";
 import { EXIT } from "../exit.js";
 import { resolveRepoSlug } from "../git.js";
 import { emitJson } from "../json.js";
+import { readPruneTally } from "../pending_prune.js";
 import { resolveProjectKeys } from "../project.js";
 import { commitsWaitingForRepo, heldAtEndForRepo, lastReceiptForRepo, lastSendForRepo, openTailForRepo, writtenOffForRepo, } from "../state.js";
 import { LABEL_GUTTER, WRAP_COLUMNS, glyph, labelled, paint, renderErrorBlock, tildePath, truncatePath, wrap, } from "../term.js";
@@ -71,8 +72,10 @@ export function status(ctx, argv = []) {
     // The delivery "succeeded" (nothing is held, nothing is written off), the server accepted every byte, and
     // nothing can ever bind: the glyph used to read `ok` over exactly that. Only the two losses are raised (a
     // one-shot session that sealed nothing, or commits still waiting) — see `openTailForRepo`.
-    const openTail = openTailForRepo(ctx.home, projectKey);
-    const waiting = commitsWaitingForRepo(ctx.home, projectKey);
+    const openTail = openTailForRepo(ctx.home, projectKey, ctx.now().getTime());
+    const waiting = commitsWaitingForRepo(ctx.home, projectKey, ctx.now().getTime());
+    // `TODOS[175]`: counts of orphan waiting lines discarded in the last 7 days (null = none).
+    const discarded = readPruneTally(ctx.home, projectKey, ctx.now().getTime());
     const receipt = lastReceiptForRepo(ctx.home, projectKey);
     const kind = on && writtenOff.gaps === 0 && heldAtEnd.bytes === 0 && openTail.ids.length === 0 ? "ok" : "warn";
     const lines = [
@@ -130,6 +133,8 @@ export function status(ctx, argv = []) {
             // has been delivered. ⛔ A contract change, recorded in `json-read-verbs.test.ts`.
             last_receipt: receipt === null ? null : { at_ms: receipt.at, sealed: receipt.sealed },
             commits_waiting: waiting,
+            // `TODOS[175]`. Always an object, zeros included. ⛔ A contract change, recorded in `json-read-verbs.test.ts`.
+            discarded_stale: { lines: discarded?.lines ?? 0, files: discarded?.files ?? 0 },
             open_tail: { sessions: openTail.ids.length, ids: openTail.ids },
         });
         return on ? EXIT.ok : EXIT.notConnected;
@@ -161,6 +166,9 @@ export function status(ctx, argv = []) {
     }
     else if (waiting > 0) {
         lines.push("", ...wrap(STATUS.commitsWaiting(waiting), 2));
+    }
+    if (discarded !== null && discarded.lines > 0) {
+        lines.push("", ...wrap(STATUS.discardedStale(discarded.lines), 2));
     }
     // `CR-216/U3`. Same precedent as `neverSent` above: a SENTENCE, not a fifth
     // gutter row — §10.3 draws four questions in a fixed order and the order is the

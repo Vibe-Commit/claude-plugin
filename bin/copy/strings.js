@@ -140,6 +140,12 @@ export const STATUS = {
      */
     commitsWaiting: (commits) => `${commits} ${commits === 1 ? "commit is" : "commits are"} waiting for a turn to close before ` +
         `${commits === 1 ? "it can" : "they can"} be recorded.`,
+    /**
+     * `TODOS[175]` — waiting commit lines that nobody could claim and that were discarded after 7 days. A COUNT only:
+     * never a sha, never a session id. Shown for up to 7 days after the last discard, so a delete is not a non-event.
+     */
+    discardedStale: (lines) => `${lines} waiting commit ${lines === 1 ? "line" : "lines"} older than 7 days ${lines === 1 ? "was" : "were"} ` +
+        `discarded (no session claimed ${lines === 1 ? "it" : "them"}).`,
     fixCommandLabel: "To reconnect, run",
     /** §10.3's two trailing actions, rendered as an aligned pair. */
     turnOffLabel: "Turn capture off for this repo",
