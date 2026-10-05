@@ -23,10 +23,18 @@ You have a VibeCommit MCP server. On every coding task:
      chunk of work, and ALWAYS right after you make a git commit.
    - **Rewrites** (amend, rebase, squash) are recorded automatically ONLY if
      VibeCommit's git `post-rewrite` hook is installed — `vibecommit connect`
-     installs it; the plugin does not. Check:
+     installs it, unless `core.hooksPath` sends hooks elsewhere (e.g. husky);
+     then connect refuses and the check below correctly fails. The plugin does
+     not install it. Check:
      `grep -qs vibecommit "$(git rev-parse --git-path hooks/post-rewrite)"`.
-     If that check fails, after an amend, rebase or squash call
-     `commit_conversation` with `commit_sha_successor` (below).
+     This tests the GIT hook only; it says nothing about whether session
+     capture is on.
+     If that check fails, after an amend, rebase or squash: FIRST tell the user
+     that rewrites are not being recorded and that `vibecommit connect`
+     installs the hook. THEN call `commit_conversation` with
+     `commit_sha_successor` (below), and ONLY with your REAL session transcript
+     as `transcript_records`. Hard rule:
+     never send an empty or reconstructed transcript_records.
    - Send `transcript_records`: your session transcript (Claude Code JSONL)
      parsed into an array of record objects, INLINE. Do NOT send
      `transcript_file_location` to the hosted server — it cannot read your disk.
@@ -49,10 +57,11 @@ You have a VibeCommit MCP server. On every coding task:
      merge, an empty commit, or a sha your clone does not have.
 
    Not sure whether the session hooks are installed? Ask `blame_commit` about a
-   commit you made earlier in this session: `cold_start` or `no_edge` means
-   nothing captured it, so call `commit_conversation`.
+   commit you made in an EARLIER TURN of this session (the current turn's commit
+   is not sealed yet and reads `no_edge` on a healthy install): `cold_start` or
+   `no_edge` means nothing captured it, so call `commit_conversation`.
 
-   Re-capturing the same conversation is a FREE no-op, so call it freely. The
+   Re-capturing the same conversation is a FREE no-op. The
    response includes a `provenance_url` — mention it to the user. If it reports
    `uncaptured_commits`, capture those too.
 

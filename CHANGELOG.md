@@ -110,8 +110,16 @@ All notable changes to this plugin will be documented here.
   `grep -qs vibecommit "$(git rev-parse --git-path hooks/post-rewrite)"` (which respects
   `core.hooksPath`) and, if it fails, sends `commit_sha_successor` after a rewrite as before.
   An agent that is unsure whether the session hooks are installed asks `blame_commit` about a commit
-  it made EARLIER in the session (`cold_start` / `no_edge` = nothing captured it). The SKILL.md
-  frontmatter description (always on in the skills listing) names both facts.
+  it made in an EARLIER TURN of the session (`cold_start` / `no_edge` = nothing captured it; the
+  current turn's commit is not sealed yet and reads `no_edge` on a healthy install). The SKILL.md
+  frontmatter description (always on in the skills listing) names both facts. After a real-agent
+  run (VG, 12 runs): "so call it freely" is gone (the no-op fact stays); when the git check fails
+  the agent first tells the user that rewrites are not being recorded and that `vibecommit connect`
+  installs the hook, and sends `commit_sha_successor` only with its real transcript — never an
+  empty or reconstructed `transcript_records` (the server rejects empty records, and reconstructed
+  ones are a fabricated capture); the check is stated to test the GIT hook only, not session
+  capture; and `connect` refuses under a custom `core.hooksPath` (e.g. husky), where the check
+  then correctly fails.
   `search_history` is described as what it is — a most-recent-first list of commits with
   `filters.repo` (a slug) / `filters.org`; a free-text `query` returns an error — and the
   typical flow goes through a commit sha (`search_history` → `blame_commit` →
