@@ -51,7 +51,8 @@ import { announcedSubagentFileKey, isInsideAny, subagentFileKey, subagentsDir, }
 import { resolveProjectKeys } from "../project.js";
 import { startSpawnBudget } from "../spawn_budget.js";
 import { turnStart } from "../pending_bound.js";
-import { capSpool, capSuccessors, pendingModeFor, promotePending, readRewrites, readSpool } from "../spool.js";
+import { pruneOrphanPending } from "../pending_prune.js";
+import { capSpool, capSuccessors, pendingModeFor, promotePending, readPending, readRewrites, readSpool } from "../spool.js";
 import { meetsNodeFloor } from "../runtime.js";
 import { renderNotice } from "../system_message.js";
 /**
@@ -657,8 +658,14 @@ async function hookBody(ctx, budgetMs, hookStartedAt) {
     // not live, i.e. it is being RESUMED; `first-turn` = no state file yet (or a live one — the first Stop promotes before it saves). They differ only when no turn start can be found: stale-own DROPS (0.4.0's
     // behaviour), first-turn KEEPS. See `pending_bound.ts` for the rule, the clocks and the scan cap.
     const pendingMode = pendingModeFor(ctx.home, spoolKey);
-    const bound = turnStart(input.transcriptPath, fileState(loadSessionState(ctx.home, spoolKey), "main").sentOffset, Date.now());
+    const bound = promotionBound(ctx.home, spoolKey, input.transcriptPath, Date.now());
     promotePending(ctx.home, spoolKey, "this-session-is-running", bound, pendingMode);
+    // ⛔ `TODOS[175]` — ORPHAN PENDING FILES. After THIS session's own pending lines were promoted (or dropped by the bound), sweep the
+    // repo for pending files nobody can claim any more (older than 7 days; see `pending_prune.ts` for the rule, the tombstone race and
+    // the counts-only tally `status` announces). Stop and SessionEnd ONLY: never `post-commit` (it runs under git, on the commit
+    // path) and never `status` (readers stay read-only). Cheap (one readdir, at most 50 files) and it never throws.
+    if (event === "Stop" || isSessionEnd)
+        pruneOrphanPending(ctx.home, projectKey, Date.now());
     const spooled = capSpool(readSpool(ctx.home, spoolKey));
     // ⛔ REWRITES ARE THEIR OWN FILE WITH THEIR OWN CAP (`T5`). The units differ —
     // 41 bytes for a sha, 82 for an `ancestor:successor` pair — so one constant
@@ -1330,5 +1337,15 @@ export function readSpan(path, from, to, projectRoots, home, env) {
             }
         }
     }
+}
+/**
+ * `TODOS[176](b)` — the promotion bound for THIS hook, computed ONLY when there is something to promote. The turn-start scan
+ * is the one transcript read on the promotion path (up to 8 MiB now that it reads in chunks) and `promotePending` returns at once
+ * when the session has no pending line — the usual case on every Stop — so the scan is skipped then. `scan` is a test seam.
+ */
+export function promotionBound(home, key, transcriptPath, nowMs, scan = turnStart) {
+    if (readPending(home, key).length === 0)
+        return { kind: "none" };
+    return scan(transcriptPath, fileState(loadSessionState(home, key), "main").sentOffset, nowMs);
 }
 //# sourceMappingURL=entry.js.map
