@@ -42,6 +42,7 @@
  */
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { keepsPendingLine } from "./pending_bound.js";
 import { repoSessionsDir, sessionStatePath } from "./paths.js";
 /**
  * How many SHAs one hook may put on the wire.
@@ -306,36 +307,33 @@ export function activeSessionFor(home, repoKey, envSessionId, nowMs = Date.now()
     // forever. The refusal's premise — *we were TOLD who committed, and it is none of these* —
     // is false for a session that has merely not written its state file YET.
     //
-    // ⛔ **ONLY FOR A SESSION THAT HAS NO STATE FILE AT ALL, NEVER A STALE ONE.**
-    // `activeSessionFor(…, SESSION, +9h)` must stay `null`, and the reason is
-    // pinned by a cell: *"an id naming a session that went quiet nine hours ago
-    // is still nothing — otherwise a shell that exported the value once would
-    // keep a session alive for as long as the terminal lived."* That hazard is
-    // real and this rung would have re-opened it, because state files are never
-    // deleted: a lingering variable would file every future commit under one
-    // ancient session, and promotion would then mint permanent edges for it.
+    // ⭐ **`TODOS[176]` — AND IT IS THE SAME FOR A SESSION WHOSE STATE FILE EXISTS BUT HAS GONE STALE.**
+    // A RESUMED session (idle past the 30-minute window) is exactly as "not yet corroborated" as a brand-new one: the
+    // resumed turn's first commit is made BEFORE any hook of that turn has fired, and `liveAt` is refreshed only by a
+    // hook. Measured on the registry 0.4.0 binary: alone, that commit left no spool line anywhere (null); with another
+    // session live it was filed under the OTHER session as `env_session_unmatched` and then discarded. Either way the
+    // edge was lost for good. So rung 1 failing (X is not live) with X named by the environment now ALWAYS takes the cold
+    // rung, keyed to X's own id.
     //
-    // ⚠ The distinction is exactly the case this rung is for: a session on its
-    // FIRST turn has written nothing yet, while a dead one left a file behind.
-    // ⚠ Absence of the file is the line between too EARLY and too LATE. (Worded
-    // to avoid `from` followed by a quoted string: `provenance.test.ts` walls
-    // RAW TEXT and reads that shape as an escaping import specifier. Third time
-    // this guard has fired on ordinary prose in this package; the house response
-    // is to move the wording and leave the guard alone.)
+    // ⛔ WHAT MAKES THAT SAFE (the old comment here forbade it, for a good reason): the hazard was a shell that exported a
+    // session id once and kept committing, with the commits then adopted by a long-dead session and PROMOTED to
+    // edge-minting rows. Three things close it, and none of them is this function:
+    //   1. this rung writes ONE `.pending.jsonl` line (post_commit.ts picks the sidecar for this rung): no state file, no
+    //      `liveAt`, no spool line. A non-hook writer cannot make X live (D2; asserted as bytes in
+    //      `test/stale-own-pending.test.ts`).
+    //   2. only X's OWN running hook promotes X's bucket (`promotePending`'s call site is keyed by the executing hook's
+    //      session, never by the environment): a dead session never runs a hook, and another session's hook cannot touch it.
+    //   3. the promotion bound (`pending_bound.ts`): a line observed before the START OF THE TURN X is delivering (its first unsent prompt-like record) is
+    //      DROPPED, so a lingering-id commit from days ago is not adopted when X is finally resumed.
+    // Residual, stated: a stale exported id committing DURING the resumed turn looks exactly like X's own commit.
+    // (Worded to avoid `from` followed by a quoted string: `provenance.test.ts` walls RAW TEXT and reads that shape as an
+    // escaping import specifier.)
     //
-    // ⚠ WHAT THIS COSTS, stated rather than discovered: an environment naming a session this
-    // clone has NEVER captured now opens a `.pending.jsonl` bucket even when others are live
-    // (Codex under an outer Claude session is the case `agents/registry.ts:11-13` describes).
-    // That is the same exposure the all-quiet case already accepted. The line is `pending`, not
-    // sendable: it promotes only if THAT session's own hook later corroborates it, and otherwise
-    // ages out under `MAX_PENDING_SHAS`.
-    const envHasNoStateFile = (() => {
-        if (envSessionId === null)
-            return false;
-        const state = sessionStatePath(home, { repoKey, sessionId: envSessionId });
-        return state !== null && !existsSync(state);
-    })();
-    if (envSessionId !== null && envHasNoStateFile) {
+    // ⚠ WHAT THIS COSTS, stated rather than discovered: an environment naming a session this clone has never captured, or
+    // captured long ago, opens a `.pending.jsonl` bucket even when others are live (Codex under an outer Claude session is
+    // the case `agents/registry.ts:11-13` describes). The line is `pending`, not sendable: it promotes only if THAT
+    // session's own hook later corroborates it, and otherwise ages out under `MAX_PENDING_SHAS`.
+    if (envSessionId !== null && sessionStatePath(home, { repoKey, sessionId: envSessionId }) !== null) {
         return { sessionId: envSessionId, attribution: "env_session_uncorroborated" };
     }
     if (live.length === 0)
@@ -372,6 +370,19 @@ function readLiveAt(path) {
     catch {
         return null;
     }
+}
+/**
+ * `TODOS[176]` — which promotion path a pending line is on, decided by the session's OWN state at the moment its hook runs:
+ * `stale-own` = its state file EXISTS and is not live (a RESUMED session: the cold rung put the line here because rung 1 failed),
+ * `first-turn` = no state file yet, or one that is live (the original cold case — the first Stop promotes BEFORE it saves state).
+ * Reads only; writes nothing (D2).
+ */
+export function pendingModeFor(home, key, nowMs = Date.now(), windowMs = SESSION_LIVE_WINDOW_MS) {
+    const state = sessionStatePath(home, key);
+    if (state === null || !existsSync(state))
+        return "first-turn";
+    const at = readLiveAt(state);
+    return at !== null && nowMs - at <= windowMs ? "first-turn" : "stale-own";
 }
 /** Every session whose hook last ran inside the window, most recent first. */
 function liveSessions(home, repoKey, nowMs, windowMs) {
@@ -764,7 +775,8 @@ function parseEntry(line) {
     const at = typeof o.at === "string" ? o.at : "";
     const branch = typeof o.branch === "string" && o.branch !== "" ? o.branch : null;
     const files = Array.isArray(o.files) ? o.files.filter((f) => typeof f === "string") : [];
-    return { sha, branch, at, files, attribution: parseRung(o.attribution) };
+    const observedAt = typeof o.observedAt === "number" && Number.isFinite(o.observedAt) && o.observedAt > 0 ? o.observedAt : undefined;
+    return { sha, branch, at, files, attribution: parseRung(o.attribution), ...(observedAt === undefined ? {} : { observedAt }) };
 }
 /**
  * ⛔ **AN UNLABELLED LINE IS `recency_heuristic`, AND THAT IS NOT A DEFAULT — IT
@@ -938,14 +950,26 @@ export function promotePending(home, key,
  * a lingering exported `CLAUDE_CODE_SESSION_ID` accumulates pending lines that
  * are never promoted and age out under `MAX_PENDING_SHAS`.
  */
-corroboration) {
+corroboration, 
+/**
+ * ⛔ `TODOS[176]` — THE PROMOTION BOUND AND ITS PATH, BOTH REQUIRED SO A CALLER CANNOT FORGET THEM. `bound` is the start
+ * of the turn this hook is delivering (`turnStart`: the first unsent PROMPT-LIKE record's timestamp); `mode` says whether the
+ * session's state file already existed (`stale-own`) or not (`first-turn`). A line observed before the turn start is DROPPED;
+ * when no turn start is found a stale-own line is dropped and a first-turn line kept. See `pending_bound.ts`.
+ */
+bound, mode) {
     void corroboration;
     const pending = readPending(home, key);
     if (pending.length === 0)
         return 0;
     let promoted = 0;
     for (const entry of pending) {
-        if (appendSpool(home, key, { ...entry, attribution: "env_session_id" }))
+        if (!keepsPendingLine(entry, bound, mode))
+            continue;
+        // The pending-only observation clock stays behind: a promoted line is an ordinary spool line.
+        const { observedAt: _observedAt, ...rest } = entry;
+        void _observedAt;
+        if (appendSpool(home, key, { ...rest, attribution: "env_session_id" }))
             promoted += 1;
     }
     clearPending(home, key);
