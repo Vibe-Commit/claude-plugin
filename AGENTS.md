@@ -36,7 +36,8 @@ You have a VibeCommit MCP server. On every coding task:
      as `transcript_records`. Hard rule:
      never send an empty or reconstructed transcript_records.
    - Send `transcript_records`: your session transcript (Claude Code JSONL)
-     parsed into an array of record objects, INLINE. Do NOT send
+     parsed into an array of record objects, INLINE — your REAL transcript;
+     never send an empty or reconstructed transcript_records. Do NOT send
      `transcript_file_location` to the hosted server — it cannot read your disk.
    - Add `repo_id` (`owner/name` or `null`) and `model`.
    - When you just committed, also send `commit_sha` (`git rev-parse HEAD`),

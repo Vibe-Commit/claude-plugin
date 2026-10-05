@@ -118,8 +118,9 @@ All notable changes to this plugin will be documented here.
   installs the hook, and sends `commit_sha_successor` only with its real transcript — never an
   empty or reconstructed `transcript_records` (the server rejects empty records, and reconstructed
   ones are a fabricated capture); the check is stated to test the GIT hook only, not session
-  capture; and `connect` refuses under a custom `core.hooksPath` (e.g. husky), where the check
-  then correctly fails.
+  capture; `connect` refuses under a custom `core.hooksPath` (e.g. husky), where the check
+  then correctly fails; and the no-empty / no-reconstructed rule is also on the generic
+  `transcript_records` bullet, which every capture path uses.
   `search_history` is described as what it is — a most-recent-first list of commits with
   `filters.repo` (a slug) / `filters.org`; a free-text `query` returns an error — and the
   typical flow goes through a commit sha (`search_history` → `blame_commit` →
