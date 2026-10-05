@@ -39,7 +39,16 @@ import { chmodSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "
 import { dirname, join } from "node:path";
 import { repoSessionsDir, sessionStatePath } from "./paths.js";
 import { EMPTY_FILE_STATE } from "./policy.js";
-export const EMPTY_SESSION_STATE = { seq: 0, stop: null, files: {}, endHold: null };
+export const EMPTY_SESSION_STATE = {
+    seq: 0,
+    stop: null,
+    files: {},
+    endHold: null,
+    lastReceipt: null,
+    endedAt: null,
+    finalized: null,
+    liveAt: null,
+};
 export function loadSessionState(home, key) {
     const path = sessionStatePath(home, key);
     // No repo, no key, no read. Falling back to a session-only file here is the
@@ -199,6 +208,108 @@ export function heldAtEndForRepo(home, repoKey) {
     }
     return { bytes, sessions };
 }
+/** Commit lines waiting in a session's spool or pending file. */
+function commitLinesFor(dir, stem) {
+    let n = 0;
+    for (const suffix of [".spool.jsonl", ".pending.jsonl"]) {
+        try {
+            n += readFileSync(join(dir, `${stem}${suffix}`), "utf8")
+                .split("\n")
+                .filter((l) => l.trim() !== "").length;
+        }
+        catch {
+            /* no file: nothing waiting */
+        }
+    }
+    return n;
+}
+/**
+ * Sessions of this repo that ended with the last turn still open AND a loss to name — `TODOS[145]`.
+ *
+ * ⛔ **THE SERVER SEALS A TURN ONLY WHEN A FOLLOWING PROMPT ARRIVES**, so EVERY session ends with its last
+ * turn open; raising that on every session would be noise and would teach the user to ignore the line.
+ * The loss is real in two cases, and only those are named: the session NEVER sealed anything (a one-shot
+ * run — none of it is recorded), or it ended with commits still waiting for a turn to close. A session
+ * the caller already finalized, or whose newest delivery sealed something, is not listed. A header the
+ * server did not send (`sealed: null`, an older server) is unknown, and unknown is not reported.
+ */
+export function openTailForRepo(home, repoKey) {
+    const none = { ids: [] };
+    const dir = repoSessionsDir(home, repoKey);
+    if (dir === null)
+        return none;
+    let entries;
+    try {
+        entries = readdirSync(dir);
+    }
+    catch {
+        return none;
+    }
+    const found = [];
+    for (const entry of entries) {
+        if (!entry.endsWith(".json"))
+            continue;
+        const stem = entry.slice(0, -".json".length);
+        const session = readStateAt(join(dir, entry));
+        const r = session.lastReceipt;
+        if (session.endedAt === null || r === null || r.sealed !== false)
+            continue;
+        if (session.finalized !== null && session.finalized.at >= r.at)
+            continue;
+        if (r.everSealed && commitLinesFor(dir, stem) === 0)
+            continue;
+        found.push({ id: stem, endedAt: session.endedAt });
+    }
+    found.sort((a, b) => b.endedAt - a.endedAt);
+    return { ids: found.map((f) => f.id) };
+}
+/** Commit lines this repo is holding because no turn has closed over them yet. */
+export function commitsWaitingForRepo(home, repoKey) {
+    const dir = repoSessionsDir(home, repoKey);
+    if (dir === null)
+        return 0;
+    let entries;
+    try {
+        entries = readdirSync(dir);
+    }
+    catch {
+        return 0;
+    }
+    let n = 0;
+    for (const entry of entries) {
+        if (!entry.endsWith(".spool.jsonl") && !entry.endsWith(".pending.jsonl"))
+            continue;
+        try {
+            n += readFileSync(join(dir, entry), "utf8").split("\n").filter((l) => l.trim() !== "").length;
+        }
+        catch {
+            /* a vanished file holds nothing */
+        }
+    }
+    return n;
+}
+/** The newest main-stream receipt across this repo's sessions, or null. */
+export function lastReceiptForRepo(home, repoKey) {
+    const dir = repoSessionsDir(home, repoKey);
+    if (dir === null)
+        return null;
+    let entries;
+    try {
+        entries = readdirSync(dir);
+    }
+    catch {
+        return null;
+    }
+    let best = null;
+    for (const entry of entries) {
+        if (!entry.endsWith(".json"))
+            continue;
+        const r = readStateAt(join(dir, entry)).lastReceipt;
+        if (r !== null && (best === null || r.at > best.at))
+            best = r;
+    }
+    return best;
+}
 /** Persist. Returns false on any failure — the caller must not throw from a hook. */
 export function saveSessionState(home, key, next) {
     const path = sessionStatePath(home, key);
@@ -254,7 +365,40 @@ function parseSessionState(parsed) {
                 files[key] = state;
         }
     }
-    return { seq: nonNegative(o.seq), stop: parseStop(o.stop), files, endHold: parseEndHold(o.endHold) };
+    return {
+        seq: nonNegative(o.seq),
+        stop: parseStop(o.stop),
+        files,
+        endHold: parseEndHold(o.endHold),
+        lastReceipt: parseReceipt(o.lastReceipt),
+        endedAt: positiveOrNull(o.endedAt),
+        finalized: parseFinalized(o.finalized),
+        liveAt: positiveOrNull(o.liveAt),
+    };
+}
+/** Absent in every file written before `TODOS[145]`, which reads as "no delivery recorded". */
+function parseReceipt(value) {
+    if (value === null || typeof value !== "object" || Array.isArray(value))
+        return null;
+    const o = value;
+    const at = nonNegative(o.at);
+    if (at === 0)
+        return null;
+    const sealed = o.sealed === true ? true : o.sealed === false ? false : null;
+    return { at, sealed, everSealed: o.everSealed === true || sealed === true };
+}
+function parseFinalized(value) {
+    if (value === null || typeof value !== "object" || Array.isArray(value))
+        return null;
+    const o = value;
+    const at = nonNegative(o.at);
+    if (at === 0 || (o.ack !== "sealed" && o.ack !== "already"))
+        return null;
+    return { at, ack: o.ack };
+}
+function positiveOrNull(value) {
+    const n = nonNegative(value);
+    return n > 0 ? n : null;
 }
 /** Absent in every file written before `CR-228`, which reads as "held nothing". */
 function parseEndHold(value) {

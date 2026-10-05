@@ -681,6 +681,7 @@ async function hookBody(ctx, budgetMs, hookStartedAt) {
         // is one the biggest spender walks straight through (`CR-182`).
         timeoutMs: sendTimeoutMs(sendBudget, consumedMs),
         nowMs: Date.now(),
+        byHook: true,
         // ⛔ THE MAIN DELIVERY ONLY. Sub-agent deliveries below leave all three
         // unset: each is its own `capture_id`, and `capture_commits`' PK is
         // `(org_id, capture_id, commit_sha)`, so attaching these to all nine
@@ -720,6 +721,7 @@ async function hookBody(ctx, budgetMs, hookStartedAt) {
         repoSlug,
         startedAt: settleStart,
         sendBudget,
+        byHook: true,
     });
     // --- THE HONEST HOLE. D95, widened to `main` by `CR-182`. ---
     //
@@ -801,8 +803,8 @@ async function hookBody(ctx, budgetMs, hookStartedAt) {
  * stamps against that set, and an unattempted file is precisely the one most in
  * need of a hole.
  */
-async function deliverSubagents(opts) {
-    const { ctx, input, url, credential, projectKey, redactionRoots, repoSlug, startedAt, sendBudget } = opts;
+export async function deliverSubagents(opts) {
+    const { ctx, input, url, credential, projectKey, redactionRoots, repoSlug, startedAt, sendBudget, byHook } = opts;
     // ⛔ TWO MECHANISMS, NEVER BOTH AT ONCE — `CR-196`, D177 §9. Each of these
     // returns `[]` unless the CONTAINING ROOT's dialect declares its own
     // mechanism, so the concatenation is a union of two disjoint sets rather than
@@ -852,6 +854,7 @@ async function deliverSubagents(opts) {
             // The remainder, MEASURED. This is what keeps N files inside one budget.
             timeoutMs: sendTimeoutMs(sendBudget, consumedMs),
             nowMs: Date.now(),
+            byHook,
         }, file.size, 
         // The SAME reader as the main transcript, so `CR-024d`'s redaction and
         // `/cso` finding 1's confinement both apply. A delegated agent reading a
@@ -956,15 +959,19 @@ heldThisInvocation, nowMs) {
             continue;
         }
         // D95's case, unchanged: the server was answering and the BUDGET ran out.
-        saveSessionState(ctx.home, key, withFileState(session, file.fileKey, markSkipped(current, current.sentOffset, file.size)));
+        saveSessionState(ctx.home, key, { ...withFileState(session, file.fileKey, markSkipped(current, current.sentOffset, file.size)), liveAt: nowMs });
     }
     // The positive record. Written when there is a hold to state OR an old one to
     // clear — a `SessionEnd` that owes nothing must not leave a previous one's
     // claim standing, and one that never held anything need not touch the file.
     const session = loadSessionState(ctx.home, key);
     const endHold = Object.keys(owed).length > 0 ? { at: nowMs, eof: owed } : null;
-    if (endHold !== null || session.endHold !== null) {
-        saveSessionState(ctx.home, key, { ...session, endHold });
+    // ⭐ `TODOS[146]`: also record THAT the session ended, so `status` can tell a turn that is open because the
+    // session is live from one that is open because it is over. Only for a session that has done something
+    // (`seq > 0`): a SessionEnd for a session that never delivered must not mint a state file, which would
+    // make it "live" to the attribution ladder.
+    if (endHold !== null || session.endHold !== null || session.seq > 0) {
+        saveSessionState(ctx.home, key, { ...session, endHold, endedAt: nowMs, liveAt: nowMs });
     }
 }
 /**
@@ -1120,7 +1127,7 @@ function announcedSubagentFiles(ctx, input) {
     }
 }
 /** Size in bytes, or null if it cannot be read. */
-function fileSize(path) {
+export function fileSize(path) {
     try {
         return statSync(path).size;
     }

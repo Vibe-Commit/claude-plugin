@@ -40,7 +40,7 @@
  * the sha; the observation is not. `files` is carried for wave 2 and never put
  * in a header.
  */
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { repoSessionsDir, sessionStatePath } from "./paths.js";
 /**
@@ -284,10 +284,10 @@ export function activeSessionFor(home, repoKey, envSessionId, nowMs = Date.now()
     }
     // ⛔ **THE COLD CASE — `CR-195`/D208, and it used to DROP THE COMMIT SILENTLY.**
     //
-    // No state file is live for this repo. Until D208 that returned `null` and the
-    // observation was gone: MEASURED in a real session as commit `f1608bc`, spooled
-    // nowhere. And it is not an edge case — `Stop` fires at the END of a turn, so
-    // **every commit made during a session's first turn lands here**, which is
+    // The environment names a session and NO state file exists for it. Until D208 that
+    // returned `null` and the observation was gone: MEASURED in a real session as commit
+    // `f1608bc`, spooled nowhere. And it is not an edge case — `Stop` fires at the END of a
+    // turn, so **every commit made during a session's first turn lands here**, which is
     // exactly what a tester does before asking `blame_commit`.
     //
     // ⚠ **Rung 1 cannot cover it, structurally.** That rung requires
@@ -297,33 +297,54 @@ export function activeSessionFor(home, repoKey, envSessionId, nowMs = Date.now()
     // So when the committing process DID name itself, record the observation at a
     // rung that says exactly that and cannot mint an edge. When it did not, there
     // is genuinely nothing to record and the silence stands.
-    if (live.length === 0) {
-        // ⛔ **ONLY FOR A SESSION THAT HAS NO STATE FILE AT ALL, NEVER A STALE ONE.**
-        // `activeSessionFor(…, SESSION, +9h)` must stay `null`, and the reason is
-        // pinned by a cell: *"an id naming a session that went quiet nine hours ago
-        // is still nothing — otherwise a shell that exported the value once would
-        // keep a session alive for as long as the terminal lived."* That hazard is
-        // real and this rung would have re-opened it, because state files are never
-        // deleted: a lingering variable would file every future commit under one
-        // ancient session, and promotion would then mint permanent edges for it.
-        //
-        // ⚠ The distinction is exactly the case this rung is for: a session on its
-        // FIRST turn has written nothing yet, while a dead one left a file behind.
-        // ⚠ Absence of the file is the line between too EARLY and too LATE. (Worded
-        // to avoid `from` followed by a quoted string: `provenance.test.ts` walls
-        // RAW TEXT and reads that shape as an escaping import specifier. Third time
-        // this guard has fired on ordinary prose in this package; the house response
-        // is to move the wording and leave the guard alone.)
+    //
+    // ⭐ **`TODOS[172]` — AND IT IS INDEPENDENT OF WHO ELSE IS LIVE.** This rung was guarded by
+    // `live.length === 0`, so a second session started within the 30-minute window of a first
+    // reached the NAMED REFUSAL below instead, which files the commit under `live[0]` (another
+    // session's bucket) as `env_session_unmatched` — a rung that can never mint an edge. Two
+    // terminals, or a quick second `claude -p`, lost every first-turn commit of the second one,
+    // forever. The refusal's premise — *we were TOLD who committed, and it is none of these* —
+    // is false for a session that has merely not written its state file YET.
+    //
+    // ⛔ **ONLY FOR A SESSION THAT HAS NO STATE FILE AT ALL, NEVER A STALE ONE.**
+    // `activeSessionFor(…, SESSION, +9h)` must stay `null`, and the reason is
+    // pinned by a cell: *"an id naming a session that went quiet nine hours ago
+    // is still nothing — otherwise a shell that exported the value once would
+    // keep a session alive for as long as the terminal lived."* That hazard is
+    // real and this rung would have re-opened it, because state files are never
+    // deleted: a lingering variable would file every future commit under one
+    // ancient session, and promotion would then mint permanent edges for it.
+    //
+    // ⚠ The distinction is exactly the case this rung is for: a session on its
+    // FIRST turn has written nothing yet, while a dead one left a file behind.
+    // ⚠ Absence of the file is the line between too EARLY and too LATE. (Worded
+    // to avoid `from` followed by a quoted string: `provenance.test.ts` walls
+    // RAW TEXT and reads that shape as an escaping import specifier. Third time
+    // this guard has fired on ordinary prose in this package; the house response
+    // is to move the wording and leave the guard alone.)
+    //
+    // ⚠ WHAT THIS COSTS, stated rather than discovered: an environment naming a session this
+    // clone has NEVER captured now opens a `.pending.jsonl` bucket even when others are live
+    // (Codex under an outer Claude session is the case `agents/registry.ts:11-13` describes).
+    // That is the same exposure the all-quiet case already accepted. The line is `pending`, not
+    // sendable: it promotes only if THAT session's own hook later corroborates it, and otherwise
+    // ages out under `MAX_PENDING_SHAS`.
+    const envHasNoStateFile = (() => {
         if (envSessionId === null)
-            return null;
+            return false;
         const state = sessionStatePath(home, { repoKey, sessionId: envSessionId });
-        if (state === null || existsSync(state))
-            return null;
+        return state !== null && !existsSync(state);
+    })();
+    if (envSessionId !== null && envHasNoStateFile) {
         return { sessionId: envSessionId, attribution: "env_session_uncorroborated" };
     }
+    if (live.length === 0)
+        return null;
     // ⛔ THE NAMED REFUSAL, AND IT COMES BEFORE BOTH WRITE RUNGS. We were TOLD who
-    // committed, and it is none of these. Falling through would attribute the
-    // commit to a session we have positive evidence did not make it.
+    // committed, and it is none of these — and now only when there is POSITIVE
+    // evidence against the named session: its state file exists, so it is not on its
+    // first turn, and it is not live. Falling through would attribute the commit to a
+    // session we have positive evidence did not make it.
     if (envSessionId !== null) {
         return { sessionId: live[0].sessionId, attribution: "env_session_unmatched" };
     }
@@ -337,7 +358,22 @@ export function activeSessionFor(home, repoKey, envSessionId, nowMs = Date.now()
     // requires exactly that, and a cardinality-one row is refused 23514.
     return { sessionId: live[0].sessionId, attribution: "recency_heuristic" };
 }
-/** Every session state file touched inside the window, most recent first. */
+/**
+ * `SessionState.liveAt` of one state file, or null when it is absent, unreadable or not a positive number.
+ *
+ * ⚠ Read straight from the JSON rather than through `state.ts`: that module imports this one's `commitLinesFor`, and the
+ * field is one number. `state.ts` owns the schema and its docblock; this is the single reader of it outside that module.
+ */
+function readLiveAt(path) {
+    try {
+        const v = JSON.parse(readFileSync(path, "utf8")).liveAt;
+        return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
+    }
+    catch {
+        return null;
+    }
+}
+/** Every session whose hook last ran inside the window, most recent first. */
 function liveSessions(home, repoKey, nowMs, windowMs) {
     const dir = repoSessionsDir(home, repoKey);
     if (dir === null)
@@ -357,14 +393,12 @@ function liveSessions(home, repoKey, nowMs, windowMs) {
         // load-bearing spelling `spoolPath` documents.
         if (!entry.endsWith(".json"))
             continue;
-        let touchedAt;
-        try {
-            touchedAt = statSync(join(dir, entry)).mtimeMs;
-        }
-        catch {
-            continue;
-        }
-        if (nowMs - touchedAt > windowMs)
+        // ⛔ THE CONTENT CLOCK, NEVER THE FILE'S MTIME (VG review 2, D2). `SessionState.liveAt` is written only by a hook;
+        // a `vibecommit finalize` of a long-dead session rewrites the file and moved the mtime, which made that session
+        // "live" and let a plain-terminal commit be filed under it at an edge-minting rung. A file with no `liveAt`
+        // (written by 0.3.0) is NOT live — see the field's docblock for the stated cost.
+        const touchedAt = readLiveAt(join(dir, entry));
+        if (touchedAt === null || nowMs - touchedAt > windowMs)
             continue;
         live.push({ sessionId: entry.slice(0, -".json".length), at: touchedAt });
     }
@@ -542,6 +576,143 @@ export function dropRewrites(home, key, count) {
 export function capSuccessors(pairs) {
     const taken = pairs.slice(0, MAX_SPOOLED_PAIRS);
     return { pairs: taken.map(wirePair), count: taken.length };
+}
+// ---------------------------------------------------------------------------
+// ⭐ TODOS[169] — the DANGLING INTERMEDIATE of an interactive-rebase squash.
+//
+// A 3 → 1 `rebase -i` squash fires `post-commit` for an intermediate `I1` (git builds it as
+// "# This is a combination of 2 commits" and then amends it), so `I1` gets a `capture_commits`
+// row. It fires `post-rewrite` as `amend` twice — `A→I1`, `I1→F` — which this package
+// SUPPRESSED (see `hooks/post_rewrite.ts`), and then as `rebase` once, carrying only
+// original→final. So `I1` has a capture row and NO successor row, and `blame_commit` on it
+// answers `turns` + `superseded_by: []` — "untouched" — about a commit that was never on any
+// branch. MEASURED on a real stack, capture 0.3.0 (`8e64faa9`).
+//
+// The cure uses git's OWN mapping, so every row stays `exact`: remember the suppressed `amend`
+// pairs in a per-repo scratch file, and at the final `rebase` fire collapse each chain to
+// `I → F` — for the shas `post-commit` OBSERVED and no others, because an intermediate nobody
+// observed has no capture row to explain and naming it would only add noise. The scratch lives
+// beside the spools (never ending in `.json`: `liveSessions` and `lastSendForRepo` would read it
+// as session state) and is consumed by the final fire.
+// ---------------------------------------------------------------------------
+/** `<sessions dir>/rebase-amends.jsonl` — per REPO, because a rebase has no session of its own. */
+export function rebaseAmendsPath(home, repoKey) {
+    const dir = repoSessionsDir(home, repoKey);
+    return dir === null ? null : join(dir, "rebase-amends.jsonl");
+}
+/** A leftover older than this is an aborted rebase's, not this one's. */
+const REBASE_AMENDS_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+/** Bound on the scratch: a rebase of hundreds of squashes must not grow a file forever. */
+const REBASE_AMENDS_MAX_LINES = 256;
+/** Remember `amend` pairs seen DURING a rebase. Never throws: this runs inside the user's `git rebase`. */
+export function recordRebaseAmends(home, repoKey, pairs, nowMs = Date.now()) {
+    const path = rebaseAmendsPath(home, repoKey);
+    if (path === null || pairs.length === 0)
+        return;
+    try {
+        mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+        let kept = [];
+        try {
+            kept = readFileSync(path, "utf8").split("\n").filter((l) => l.trim() !== "");
+        }
+        catch {
+            /* no scratch yet */
+        }
+        for (const pair of pairs)
+            kept.push(JSON.stringify({ ancestor: pair.ancestor, successor: pair.successor, at: nowMs }));
+        writeFileSync(path, kept.slice(-REBASE_AMENDS_MAX_LINES).map((l) => `${l}\n`).join(""), { mode: 0o600 });
+        chmodSync(path, 0o600);
+    }
+    catch {
+        /* the scratch is an optimisation of the record, never a reason to disturb a rebase */
+    }
+}
+/** Read the scratch and DELETE it. Entries older than six hours are an aborted rebase's and are ignored. */
+export function takeRebaseAmends(home, repoKey, nowMs = Date.now()) {
+    const path = rebaseAmendsPath(home, repoKey);
+    if (path === null)
+        return [];
+    let raw;
+    try {
+        raw = readFileSync(path, "utf8");
+    }
+    catch {
+        return [];
+    }
+    try {
+        rmSync(path, { force: true });
+    }
+    catch {
+        /* an undeletable scratch is re-read next time; the terminal-in-finals rule still guards it */
+    }
+    const out = [];
+    for (const line of raw.split("\n")) {
+        if (line.trim() === "")
+            continue;
+        try {
+            const o = JSON.parse(line);
+            if (typeof o.ancestor !== "string" || typeof o.successor !== "string")
+                continue;
+            if (!isFullSha(o.ancestor) || !isFullSha(o.successor))
+                continue;
+            if (typeof o.at === "number" && nowMs - o.at > REBASE_AMENDS_MAX_AGE_MS)
+                continue;
+            out.push({ ancestor: o.ancestor, successor: o.successor });
+        }
+        catch {
+            /* a torn line costs that line only */
+        }
+    }
+    return out;
+}
+/**
+ * Collapse the suppressed `amend` chains into `intermediate → final` pairs.
+ *
+ * Follow each `amend` pair to its chain's TERMINAL. Emit `x → terminal` only when:
+ *   - the terminal is a SUCCESSOR in this rebase's own pairs (so a chain left by an ABORTED rebase
+ *     cannot attach to an unrelated one — its terminal is not a final here);
+ *   - `x` was OBSERVED by `post-commit` (it has, or is about to have, a capture row to explain);
+ *   - `x` is not already an ancestor in the rebase's own pairs and is not the terminal itself.
+ * Pure, cycle-safe, and total: it returns `[]` rather than ever throwing.
+ */
+export function collapseObservedIntermediates(amends, finals, observedShas) {
+    const next = new Map();
+    for (const a of amends)
+        next.set(a.ancestor, a.successor);
+    const finalSuccessors = new Set(finals.map((p) => p.successor));
+    const finalAncestors = new Set(finals.map((p) => p.ancestor));
+    const out = [];
+    const emitted = new Set();
+    for (const start of next.keys()) {
+        let node = start;
+        const seen = new Set([node]);
+        let cyclic = false;
+        for (;;) {
+            const to = next.get(node);
+            if (to === undefined)
+                break;
+            if (seen.has(to)) {
+                cyclic = true;
+                break;
+            }
+            seen.add(to);
+            node = to;
+        }
+        if (cyclic)
+            continue;
+        const terminal = node;
+        if (!finalSuccessors.has(terminal))
+            continue;
+        // Every node on the chain except the terminal is a candidate; the chain is walked again from `start` only.
+        if (start === terminal || finalAncestors.has(start) || !observedShas.has(start))
+            continue;
+        const key = `${start}:${terminal}`;
+        if (emitted.has(key))
+            continue;
+        emitted.add(key);
+        out.push({ ancestor: start, successor: terminal });
+    }
+    return out;
 }
 /** The wire spelling of one pair. Also the dedup key. */
 function wirePair(pair) {

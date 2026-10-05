@@ -42,7 +42,7 @@ import { DEFAULT_AGENT_ID, dialectFor } from "../agents/registry.js";
 import { isProjectAllowed } from "../consent.js";
 import { gitProbe } from "../git.js";
 import { resolveProjectKeys } from "../project.js";
-import { activeSessionFor, appendRewrites, isFullSha } from "../spool.js";
+import { activeSessionFor, appendRewrites, collapseObservedIntermediates, isFullSha, readPending, readSpool, recordRebaseAmends, takeRebaseAmends, } from "../spool.js";
 import { existsSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 /**
@@ -87,10 +87,22 @@ export function observeRewrites(ctx) {
     // appears for `-i` at all, so it is not consulted.
     //
     // ⚠ It must not swallow an ordinary `--amend`, which is the other cell.
-    if (ctx.kind === "amend" && rebaseInProgress(toplevel))
+    //
+    // ⭐ `TODOS[169]` — BUT NOT FORGOTTEN. The suppressed pairs are git's own mapping, and the final
+    // `rebase` fire needs them: a squash intermediate `I` that `post-commit` observed has a capture
+    // row and, without `I→F`, no successor row, so `blame_commit` calls it untouched. They are
+    // remembered in a per-repo scratch (consent first: a declined repo writes nothing, scratch
+    // included) and collapsed at the final fire below.
+    if (ctx.kind === "amend" && rebaseInProgress(toplevel)) {
+        if (isProjectAllowed(ctx.home, keys.consent))
+            recordRebaseAmends(ctx.home, toplevel, pairs);
         return 0;
+    }
     if (!isProjectAllowed(ctx.home, keys.consent))
         return 0;
+    // The scratch is CONSUMED by the first `rebase` fire that sees it, whatever happens next, so a
+    // leftover can never wait around for an unrelated rebase.
+    const amends = ctx.kind === "rebase" ? takeRebaseAmends(ctx.home, toplevel) : [];
     // ⚠ THE SESSION BUCKET, AND THE RUNG IS DELIBERATELY NOT CONSULTED. A pair
     // asserts a relation between two SHAs — `A was rewritten to B` — and claims
     // nothing about who did it, so there is no attribution to be wrong about and
@@ -100,7 +112,12 @@ export function observeRewrites(ctx) {
     const active = activeSessionFor(ctx.home, toplevel, envSessionId(ctx.env));
     if (active === null)
         return 0;
-    return appendRewrites(ctx.home, { repoKey: toplevel, sessionId: active.sessionId }, pairs);
+    const key = { repoKey: toplevel, sessionId: active.sessionId };
+    if (amends.length === 0)
+        return appendRewrites(ctx.home, key, pairs);
+    // The shas `post-commit` observed for this session — in the spool, or still pending on a first turn.
+    const observedShas = new Set([...readSpool(ctx.home, key), ...readPending(ctx.home, key)].map((e) => e.sha));
+    return appendRewrites(ctx.home, key, [...pairs, ...collapseObservedIntermediates(amends, pairs, observedShas)]);
 }
 /**
  * Is a rebase running right now?

@@ -279,6 +279,9 @@ async function captureBeat(ctx, keys, credential) {
             transcriptPath: found.path,
             timeoutMs: DEFAULT_HOOK_BUDGET_MS,
             nowMs: ctx.now().getTime(),
+            // ⛔ NOT A HOOK. `connect` backfills the located transcript, which is not evidence that the session is alive: it
+            // would otherwise rewrite an old session's state file and (under the mtime clock) make it "live" — the D2 shape.
+            byHook: false,
         }, found.size, 
         // ⛔ THE ROOT SET, and it is `confinementRoots` — THE SAME FUNCTION THE
         // HOOK PATH CALLS (`entry.ts`), not a set built here. `D184 §3`: the
