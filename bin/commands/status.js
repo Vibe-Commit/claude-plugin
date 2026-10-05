@@ -31,7 +31,7 @@ import { EXIT } from "../exit.js";
 import { resolveRepoSlug } from "../git.js";
 import { emitJson } from "../json.js";
 import { resolveProjectKeys } from "../project.js";
-import { heldAtEndForRepo, lastSendForRepo, writtenOffForRepo } from "../state.js";
+import { commitsWaitingForRepo, heldAtEndForRepo, lastReceiptForRepo, lastSendForRepo, openTailForRepo, writtenOffForRepo, } from "../state.js";
 import { LABEL_GUTTER, WRAP_COLUMNS, glyph, labelled, paint, renderErrorBlock, tildePath, truncatePath, wrap, } from "../term.js";
 import { writeLines } from "./context.js";
 /** §10.3 indents the gutter rows four columns under the state line. */
@@ -67,7 +67,14 @@ export function status(ctx, argv = []) {
     // with `gapCount: 0` and its bytes HELD, and a glyph that read only the gap
     // counter would print `ok` over it again — the same defect with a longer fuse.
     const heldAtEnd = heldAtEndForRepo(ctx.home, projectKey);
-    const kind = on && writtenOff.gaps === 0 && heldAtEnd.bytes === 0 ? "ok" : "warn";
+    // ⭐ `TODOS[145]`/`[146]` — AND A SESSION THAT ENDED WITH ITS LAST TURN OPEN, when that costs something.
+    // The delivery "succeeded" (nothing is held, nothing is written off), the server accepted every byte, and
+    // nothing can ever bind: the glyph used to read `ok` over exactly that. Only the two losses are raised (a
+    // one-shot session that sealed nothing, or commits still waiting) — see `openTailForRepo`.
+    const openTail = openTailForRepo(ctx.home, projectKey);
+    const waiting = commitsWaitingForRepo(ctx.home, projectKey);
+    const receipt = lastReceiptForRepo(ctx.home, projectKey);
+    const kind = on && writtenOff.gaps === 0 && heldAtEnd.bytes === 0 && openTail.ids.length === 0 ? "ok" : "warn";
     const lines = [
         `  ${paint(ctx.colour, kind, glyph(ctx.colour, kind))} ${paint(ctx.colour, "strong", on ? STATUS.onForRepo : STATUS.offForRepo)}`,
         labelled(ROW_INDENT, STATUS.repoLabel, repoValue(ctx, projectKey)),
@@ -118,6 +125,12 @@ export function status(ctx, argv = []) {
                 sessions: writtenOff.sessions,
             },
             held_at_end: { bytes: heldAtEnd.bytes, sessions: heldAtEnd.sessions },
+            // `TODOS[145]`/`[146]`. `last_receipt.sealed` is `true` (the newest delivery sealed a capture), `false`
+            // (it sealed nothing) or `null` (an older server sent no receipt); the whole key is `null` when nothing
+            // has been delivered. ⛔ A contract change, recorded in `json-read-verbs.test.ts`.
+            last_receipt: receipt === null ? null : { at_ms: receipt.at, sealed: receipt.sealed },
+            commits_waiting: waiting,
+            open_tail: { sessions: openTail.ids.length, ids: openTail.ids },
         });
         return on ? EXIT.ok : EXIT.notConnected;
     }
@@ -140,6 +153,14 @@ export function status(ctx, argv = []) {
     }
     if (heldAtEnd.bytes > 0) {
         lines.push("", ...wrap(STATUS.heldAtEnd(heldAtEnd.bytes, heldAtEnd.sessions), 2));
+    }
+    // `TODOS[145]`/`[146]`: the consequence first (a session is over and its last turn never closed), then the
+    // neutral fact (commits are waiting for a turn). Both omitted when zero — absence here is the healthy case.
+    if (openTail.ids.length > 0) {
+        lines.push("", ...wrap(STATUS.openTail(openTail.ids.length), 2));
+    }
+    else if (waiting > 0) {
+        lines.push("", ...wrap(STATUS.commitsWaiting(waiting), 2));
     }
     // `CR-216/U3`. Same precedent as `neverSent` above: a SENTENCE, not a fifth
     // gutter row — §10.3 draws four questions in a fixed order and the order is the

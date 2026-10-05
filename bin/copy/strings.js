@@ -35,6 +35,8 @@ export const HELP = {
         // VERBATIM-APPROVED (D61 §PS6). Any reword needs a new claims-register row.
         why: "Show the conversation turns recorded against the commit that last changed this line.",
         report: "Summarise capture coverage over a time window.",
+        // `TODOS[146]`. Typed by a person or a script AFTER a one-shot run, so it is in the list.
+        finalize: "Close a finished session's last turn so commits made in it can be recorded.",
     },
     docsUrl: "https://vibecommit.ai/docs/what-we-upload",
 };
@@ -125,6 +127,19 @@ export const STATUS = {
     heldAtEnd: (bytes, sessions) => `${BYTE_COUNT.format(bytes)} ${bytes === 1 ? "byte" : "bytes"} of transcript from ` +
         `${sessions === 1 ? "1 session that has" : `${sessions} sessions that have`} ended ` +
         "could not be sent and have not been sent since.",
+    /**
+     * `TODOS[145]`/`[146]` — a session that ENDED while its last turn was still open. The server seals a
+     * turn only when a following prompt arrives, so nothing will ever seal this one and the commits made in
+     * it cannot be recorded. States the consequence and the command; promises nothing about the commits.
+     */
+    openTail: (sessions) => `${sessions === 1 ? "1 session has" : `${sessions} sessions have`} ended with the last turn still ` +
+        "open, so commits made in that turn are not recorded. Run `vibecommit finalize --latest` to close it.",
+    /**
+     * `TODOS[145]` — commits the client has seen and is holding because no turn has closed yet. Normal
+     * mid-session; shown as a fact, not as a fault.
+     */
+    commitsWaiting: (commits) => `${commits} ${commits === 1 ? "commit is" : "commits are"} waiting for a turn to close before ` +
+        `${commits === 1 ? "it can" : "they can"} be recorded.`,
     fixCommandLabel: "To reconnect, run",
     /** §10.3's two trailing actions, rendered as an aligned pair. */
     turnOffLabel: "Turn capture off for this repo",
@@ -1111,6 +1126,31 @@ export const ABSENCE = {
 // the brief for this task names. `test/copy-grades.test.ts` keeps its expected
 // table in the test for the same reason.
 /** Failure-class copy (CR-018). Three classes: later / never / fatal. */
+/**
+ * `vibecommit finalize` (`TODOS[146]`, VD decision 5).
+ *
+ * ⛔ The turn extractor seals a turn only when a following prompt opens the next one, so a session
+ * that is never followed by another prompt (a one-shot `claude -p`, the last turn of any session that
+ * is not resumed) seals nothing and binds no commit. This verb is the CALLER saying the session is
+ * over. The copy states what happened and what did not, and claims nothing about commits it cannot
+ * know were bound: `closed` says the last turn is recorded, not that any commit matched it.
+ */
+export const FINALIZE = {
+    needTarget: "Say which session to close: --session <id>, or --latest.",
+    badSessionId: "That is not a session id (letters, digits, dot, dash and underscore only).",
+    noRecentSession: "No session in this repository has delivered anything in the last 24 hours. Use --session <id>.",
+    severalRecent: "More than one session in this repository is recent. Name one with --session <id>:",
+    recentRow: (id, minutesAgo) => `${id}  (${minutesAgo} min ago)`,
+    unknownSession: (id) => `This repository has no captured session ${id}.`,
+    transcriptMissing: (id) => `Could not find the transcript for session ${id}.`,
+    stillWriting: "That session's transcript changed a moment ago. Wait for the session to finish, or pass --force if it is over.",
+    closed: (id) => `Closed session ${id}: its last turn is recorded, so commits made in it can now be recorded.`,
+    alreadyClosed: (id) => `Session ${id} had nothing left open. Nothing changed.`,
+    notAcknowledged: "The server accepted the data but did not confirm that it closed the session; it may predate this command. The last turn may still be open.",
+    refused: "The server declined to close the session on this attempt. Run the command again.",
+    notDelivered: "Could not deliver the session. Nothing was closed. Run the command again.",
+    credentialStopped: "VibeCommit stopped sending for this credential. Run `vibecommit auth` to replace it.",
+};
 export const ERRORS = {
     notConnected: "This repository is not connected. Run `vibecommit connect`.",
     networkLater: "Could not reach VibeCommit. This session will be recorded on the next turn.",
@@ -1316,6 +1356,8 @@ export const COMMANDS = {
     /** `CR-084d`. A FLAG, not a verb — `--help`'s verb list and its golden file do not move. */
     signIn: "vibecommit connect --sign-in",
     status: "vibecommit status",
+    /** `TODOS[146]`. */
+    finalize: "vibecommit finalize --latest",
     /**
      * `CR-108`. The ARGUMENT SHAPE, shown once so the usage error and the retry
      * fix line cannot drift apart — the same convention `why` uses.

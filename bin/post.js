@@ -119,6 +119,9 @@ export function buildIngestHeaders(credential, delta) {
     // never sent empty; an absent header is unambiguously "nothing to say".
     if (delta.agent !== UNKNOWN_AGENT_ID)
         headers["x-agent"] = delta.agent;
+    // Omitted, never sent as `0`: the server reads the exact token `1` and nothing else.
+    if (delta.final === true)
+        headers["x-session-final"] = "1";
     // ⚠ OMITTED, never sent empty. A blank header is a value the server has to
     // have an opinion about; an absent one is unambiguously "nothing to say", and
     // an empty repository genuinely has nothing to say here.
@@ -274,6 +277,7 @@ export async function send(url, headers, body, timeoutMs) {
             // `null` when the server does not send it at all — see `captureId` above.
             captureId: res.headers.get("x-capture-id"),
             commitsRetry: parseCommitsRetry(res.headers.get("x-commits-retry")),
+            finalAck: parseFinalAck(res.headers.get("x-session-final")),
         };
     }
     catch {
@@ -297,6 +301,11 @@ export async function send(url, headers, body, timeoutMs) {
  */
 export function credentialFingerprint(credential) {
     return createHash("sha256").update(credential.expose()).digest("hex").slice(0, 16);
+}
+/** Only the three values the server defines; anything else is "no acknowledgement". */
+function parseFinalAck(raw) {
+    const v = raw?.trim().toLowerCase();
+    return v === "sealed" || v === "already" || v === "refused" ? v : null;
 }
 /**
  * Send the undelivered span of one transcript file and apply the failure policy.
@@ -326,7 +335,13 @@ export async function deliver(ctx, eof, readBody) {
     if (isStopped(session, credentialFingerprint(ctx.credential)))
         return { kind: "stopped" };
     const current = fileState(session, ctx.fileKey);
-    const span = nextSpan(current, eof);
+    let span = nextSpan(current, eof);
+    // ⭐ `TODOS[146]`: a finalize with nothing new to send still has something to SAY. An empty span at
+    // the current offset is a valid delta (the server tolerates a zero-record body) and carries the flag.
+    if (span === null && ctx.final === true) {
+        const at = Math.min(current.sentOffset, eof);
+        span = { from: at, to: at };
+    }
     if (span === null)
         return { kind: "nothing-to-send" };
     const body = readBody(span.from, span.to);
@@ -347,16 +362,41 @@ export async function deliver(ctx, eof, readBody) {
         // per hook: a delegated stream is a file in its own right, and the root
         // that contains it is what names its producer.
         agent: agentForTranscript(ctx.home, ctx.env, ctx.transcriptPath),
+        final: ctx.final === true,
         head: ctx.head,
         commits: ctx.commits,
         rewrites: ctx.rewrites,
     }), body, ctx.timeoutMs);
     const disposition = classify(outcome);
     const caps = resolveCaps(ctx.env);
-    let next = { ...session, seq };
+    let next = ctx.byHook ? { ...session, seq, liveAt: ctx.nowMs } : { ...session, seq };
     switch (disposition) {
         case "ok":
             next = withFileState(next, ctx.fileKey, markDelivered(current, span.to, ctx.nowMs));
+            // ⭐ `TODOS[145]` — KEEP THE RECEIPT. `captureId` is non-empty when this delta sealed a capture
+            // and EMPTY when it sealed nothing; the client used to stamp `lastSentAt` identically for both and
+            // surface neither. MAIN stream only (a sub-agent stream seals nothing by construction and would
+            // overwrite the main stream's answer). A delivery also ends any "session is over" mark: the
+            // session is demonstrably alive again.
+            if (ctx.fileKey === "main" && outcome.kind === "response") {
+                next = {
+                    ...next,
+                    lastReceipt: {
+                        at: ctx.nowMs,
+                        sealed: outcome.captureId === null ? null : outcome.captureId !== "",
+                        everSealed: session.lastReceipt?.everSealed === true || (outcome.captureId !== null && outcome.captureId !== ""),
+                    },
+                    // ⛔ A DELIVERY THAT ASKED FOR FINALITY AND WAS NOT TOLD IT GOT IT LEAVES THE END MARK STANDING (VG review
+                    // 2, A2). Against a server that ignores `X-Session-Final` this ok-delivery used to clear `endedAt` for
+                    // every caller, so `status` said "ok Capture is on" about a session whose last turn was still open.
+                    endedAt: ctx.final === true && outcome.finalAck !== "sealed" && outcome.finalAck !== "already" ? session.endedAt : null,
+                };
+                // ⭐ `TODOS[146]` — the server ACKNOWLEDGED the caller's assertion. `null` (an older server that
+                // ignored the header) and `refused` record nothing: "asked" is not "done".
+                if (ctx.final === true && (outcome.finalAck === "sealed" || outcome.finalAck === "already")) {
+                    next = { ...next, finalized: { at: ctx.nowMs, ack: outcome.finalAck } };
+                }
+            }
             // ⛔ TRUNCATE HERE AND NOWHERE ELSE. The spool is append-then-drop-on-2xx,
             // so a commit survives a 500, a timeout and a `later` and is retried by
             // the next hook. Dropping on READ would lose it permanently to one bad
@@ -440,6 +480,7 @@ export async function deliver(ctx, eof, readBody) {
         kind: "attempted",
         disposition,
         detail: outcome.kind === "response" ? outcome.detail : null,
+        finalAck: outcome.kind === "response" ? outcome.finalAck : null,
     };
 }
 //# sourceMappingURL=post.js.map

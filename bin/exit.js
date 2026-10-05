@@ -37,6 +37,13 @@ export const EXIT = {
      * involved.
      */
     empty: 4,
+    /**
+     * Interactive-only. `vibecommit finalize` DELIVERED but the server did not CONFIRM that it closed
+     * the session — an older server ignores the assertion and says nothing (`TODOS[146]`). Distinct
+     * from `failure` (nothing was delivered) and from `ok` (it was closed): a script that must know
+     * its last turn was recorded branches on this without parsing copy.
+     */
+    unacknowledged: 5,
 };
 /**
  * Resolve the exit code for a completed invocation.

@@ -25,6 +25,7 @@ import { resolveAgentId } from "./agents/registry.js";
 import { auth } from "./commands/auth.js";
 import { browserCredential } from "./commands/browser_credential.js";
 import { connect } from "./commands/connect.js";
+import { finalize } from "./commands/finalize.js";
 import { off, status } from "./commands/status.js";
 import { report } from "./commands/report.js";
 import { why } from "./commands/why.js";
@@ -42,7 +43,7 @@ import { CLIENT_VERSION } from "./version.js";
 // `auth` is typed by a human on a new machine before anything else works, so a
 // help screen that omitted it would be the defect one layer up. The golden file
 // exists to make a change to that screen deliberate, not to make it impossible.
-const VERBS = ["auth", "connect", "status", "off", "why", "report"];
+const VERBS = ["auth", "connect", "status", "off", "why", "report", "finalize"];
 export function isVerb(value) {
     return VERBS.includes(value);
 }
@@ -198,6 +199,9 @@ async function main(argv) {
             // the verb, and the verb reads its own two flags rather than adding an
             // argument parser this package deliberately does not have.
             return await report(ctx, argv.slice(1));
+        case "finalize":
+            // `TODOS[146]`. Same shape as `report`: the verb reads its own flags.
+            return await finalize(ctx, argv.slice(1));
     }
 }
 /**
