@@ -19,16 +19,16 @@
   ],
   "capture": {
     "repo": "Vibe-Commit/vibecommit-capture",
-    "commit": "8755b00142577ad25bdc23d9184088b7b1c8ce62",
+    "commit": "b20d4fe912d7d13140c3cf8286c4684bbdbd5cff",
     "npmPackage": "@vibe-commit/capture",
-    "npmVersion": "0.4.0"
+    "npmVersion": "0.4.1"
   },
   "bundle": {
     "root": "bin",
     "algorithm": "sha256",
-    "digest": "16d9bf936b087e93ccb8261381d98758cd04189ee390fa72f37ae31fbeefcc37",
-    "fileCount": 53,
-    "byteCount": 773374,
+    "digest": "27fde3113d675096f704e997af328d678d7ffea28e64bf82a6b3de47ddaa3b4a",
+    "fileCount": 54,
+    "byteCount": 784418,
     "files": {
       "agent_hooks.js": "fe0e341b0f34768202db2cf062e4bd55c82e15fe680f262f9728a4c97db40bc7",
       "agent_install.js": "723070318a362179adf53e5b793775c88944b78876db7ed43eef8bbe59a9d870",
@@ -54,9 +54,9 @@
       "credential.js": "61bdd49c53bc8bb94eb7114fd6c1e55646e10eed59068583328724ad1e04b48d",
       "exit.js": "c7c811bf33fd7626636e045c874ddc502e0de065bb5080757c4bba9e8f13a83d",
       "git.js": "5f111e0e3d6334e50e481f0163beed55beb4f96f98dc960f59ff58997a596df8",
-      "hooks/entry.js": "37d0589d1a08b4a181db5c62955875e38c8172af61e42c54b0d8a2eed7c630cb",
+      "hooks/entry.js": "70d5d6f44ed4020fb487ef207321d07cff9f630229c1070bfdfb6ee059535c2f",
       "hooks/fire_lock.js": "0cf455a9180f961df93c811d33e4086ed39cfbb2b99299f3ff98c7bf59abb3e6",
-      "hooks/post_commit.js": "ac765f76d27bce6ac2960f444d16aa2a8167a0fa2e20a41191dc5f8c889ff2f1",
+      "hooks/post_commit.js": "16f894cbcdd3adac4433b93c4b8581151856b5f8209071c24757c99876915ac6",
       "hooks/post_rewrite.js": "e224e5a19c05008753500a6f789c0d6fcb71f5a896dddd3bd27f778e07ecb04c",
       "hooks/session_end.js": "433f7f6201689c53d2ef82822bca3eebab008ba7731a13589592985318f47580",
       "index.js": "23fa8eabaf94e47e5c8edab8f2b16afa479ad639622748922cd014043135cf04",
@@ -72,17 +72,18 @@
       "oauth/signin.js": "33985d50a0f2bf8f5d2253d210d2286128cdd02b5c10d8915bfe9793c1f95ee8",
       "oauth/token.js": "39a7c531d829faf2518482425a8c7251174388f9230b7f7bc480626d0be92c6d",
       "paths.js": "dad1f392b768a735f1fac09c427de1cfd86a1eec0b633e6e46a1026b8b1dbdd1",
+      "pending_bound.js": "0bd52837c926241c9f7ca2a3e7a764f7007fe8f57b4c7968a22521621c9967f0",
       "policy.js": "e3bf07f2b5b467cddce2f339cbaf85e24bed2c6d997ce2659780519965cb4143",
       "post.js": "8ecaa1beaba17457c1c05793890f6075112c456c829d660a79df5c41a0366b0e",
       "project.js": "1af9817a3d56b94ca248a40add12c3f80b7af3b2d43d6b5e2998886c13c293fd",
       "redact.js": "d7ea671191ad107d47d72c99a5350128a1ca941eeb189e38bfe08e80b0b1f5fa",
       "runtime.js": "b9b3b798b0736564843907658248f47638eec419e6ff7cd6ff6af55dad4859f9",
       "spawn_budget.js": "4d62d6c5fe0c876117c45c838d1871aae986a8ae31a215bee5860b7d2c6c3cc6",
-      "spool.js": "6926ae6fde68fd1ea80ecd8dbeb4d6c8a45558b0736ea54a840906115e7b94b8",
+      "spool.js": "b046ef516e194e73e376124078a26f61b01e5c7330c9c046eaaa68e763becb8c",
       "state.js": "f81ed15ec91ce82347ced0e5a5f9780cda6d5c219ac8b5397626a0d718ea3f0f",
       "system_message.js": "dcd68a1c39cf30f9454d4d077ae392eab1af4e835d2d92c045fa79fdba9705c9",
       "term.js": "f47d76c06871c48b1f8c0a2c77bbc6c631406270651f04d4b85f0fa6e0791514",
-      "version.js": "a917b30e119d26dca008c14027f4c8dc464132b916aa46bf3fd9ad2c1862a415"
+      "version.js": "5086a112876decf37d31d3c93bf780b78ce0e5712b3889a0b1351afa37016779"
     }
   }
 }

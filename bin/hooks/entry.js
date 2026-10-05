@@ -50,7 +50,8 @@ import { claimFiring, fireLockPath } from "./fire_lock.js";
 import { announcedSubagentFileKey, isInsideAny, subagentFileKey, subagentsDir, } from "../paths.js";
 import { resolveProjectKeys } from "../project.js";
 import { startSpawnBudget } from "../spawn_budget.js";
-import { capSpool, capSuccessors, promotePending, readRewrites, readSpool } from "../spool.js";
+import { turnStart } from "../pending_bound.js";
+import { capSpool, capSuccessors, pendingModeFor, promotePending, readRewrites, readSpool } from "../spool.js";
 import { meetsNodeFloor } from "../runtime.js";
 import { renderNotice } from "../system_message.js";
 /**
@@ -650,7 +651,14 @@ async function hookBody(ctx, budgetMs, hookStartedAt) {
     // ⛔ The corroboration is THIS CALL SITE: `spoolKey.sessionId` is
     // `input.sessionId`, the session whose hook is executing. See `promotePending`
     // for why a state-file test is the wrong one and fails the first turn.
-    promotePending(ctx.home, spoolKey, "this-session-is-running");
+    // ⛔ `TODOS[176]` — THE PROMOTION BOUND, applied to EVERY promotion (the first-turn cold case too): a pending line observed
+    // before the START OF THIS TURN (the first unsent prompt-like record, skipping the previous Stop's trailing records and any
+    // record without a timestamp) predates the turn and is dropped. `stale-own` = this session's state file exists and is
+    // not live, i.e. it is being RESUMED; `first-turn` = no state file yet (or a live one — the first Stop promotes before it saves). They differ only when no turn start can be found: stale-own DROPS (0.4.0's
+    // behaviour), first-turn KEEPS. See `pending_bound.ts` for the rule, the clocks and the scan cap.
+    const pendingMode = pendingModeFor(ctx.home, spoolKey);
+    const bound = turnStart(input.transcriptPath, fileState(loadSessionState(ctx.home, spoolKey), "main").sentOffset, Date.now());
+    promotePending(ctx.home, spoolKey, "this-session-is-running", bound, pendingMode);
     const spooled = capSpool(readSpool(ctx.home, spoolKey));
     // ⛔ REWRITES ARE THEIR OWN FILE WITH THEIR OWN CAP (`T5`). The units differ —
     // 41 bytes for a sha, 82 for an `ancestor:successor` pair — so one constant

@@ -122,6 +122,9 @@ export function observe(ctx) {
         // process that has exited and the mtimes have all moved on — the rung
         // could not be re-derived from anything then, only re-guessed.
         attribution: active.attribution,
+        // `TODOS[176]` — the pending sidecar only: OUR wall clock at observation, the clock the promotion bound compares
+        // with the start of the turn being delivered (the first unsent prompt-like transcript record). Not the committer time above, which is settable.
+        ...(active.attribution === "env_session_uncorroborated" ? { observedAt: Date.now() } : {}),
     });
 }
 /**
