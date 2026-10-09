@@ -108,6 +108,7 @@ export const EMPTY_FILE_STATE = {
     gapBytes: 0,
     gapCount: 0,
     lastSentAt: 0,
+    lean: false,
 };
 /**
  * The caps.
@@ -193,6 +194,11 @@ export function markSkipped(state, from, to) {
         backlog: [],
         gapBytes: state.gapBytes + skipped,
         gapCount: state.gapCount + (skipped > 0 ? 1 : 0),
+        // `TODOS[182]`. Carried, never cleared here: `lean` is STICKY, and a `never`
+        // disposition (including the "already lean, still 431" terminal case) says
+        // nothing about whether the NEXT span on this file should go back to
+        // building full headers.
+        lean: state.lean,
     };
 }
 /**
@@ -239,6 +245,6 @@ export function enforceCaps(state, nowMs, caps) {
         gapCount += 1;
         backlog = backlog.slice(1);
     }
-    return { sentOffset, backlog, gapBytes, gapCount, lastSentAt: state.lastSentAt };
+    return { sentOffset, backlog, gapBytes, gapCount, lastSentAt: state.lastSentAt, lean: state.lean };
 }
 //# sourceMappingURL=policy.js.map

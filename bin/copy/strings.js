@@ -171,6 +171,34 @@ export const STATUS = {
      * a 7-day tally — it falls as soon as a later hook's ack confirms them.
      */
     inferredUnacknowledged: (n) => n === 0 ? "" : `${n} ${n === 1 ? "pair" : "pairs"} from a squash made with git reset ${n === 1 ? "is" : "are"} spooled, waiting for the server to confirm them.`,
+    /**
+     * `TODOS[182]` — commits/rewrites/inferred pairs held back because the server refused a full request and
+     * this client is now sending a reduced (`lean`) one for the rest of the session. ONE sentence for both
+     * triggers (a measured 431, or a request this client itself predicted would be too large to send) — they
+     * set the same sticky flag, so the cause reads the same either way. Never "the server refused": that is
+     * literally true only for the first, and a user cannot tell the two apart from this screen anyway. A live
+     * count, not a 7-day tally — there is no prune for these files (`pending_prune.ts`), so nothing here ever
+     * needs to survive past the data it describes.
+     *
+     * ⛔ **NAMES EACH PART, NEVER ONE BARE NUMBER** (VG's B1, VL's V3 ruling). `commits_waiting` and
+     * `inferredUnacknowledged` exclude a lean session's data entirely now, so this is the ONE place it is
+     * counted — folding three different nouns into one number (an earlier draft's "11 pairs" for 7 commits
+     * plus 4 pairs) would misname most of what it is reporting.
+     */
+    leanHeld: (commits, rewrites, inferred) => {
+        const parts = [];
+        if (commits > 0)
+            parts.push(`${commits} ${commits === 1 ? "commit" : "commits"}`);
+        if (rewrites > 0)
+            parts.push(`${rewrites} ${rewrites === 1 ? "rewrite pair" : "rewrite pairs"}`);
+        if (inferred > 0)
+            parts.push(`${inferred} ${inferred === 1 ? "inferred pair" : "inferred pairs"}`);
+        if (parts.length === 0)
+            return "";
+        const list = parts.length === 1 ? parts[0] : `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}`;
+        const verb = parts.length === 1 && commits + rewrites + inferred === 1 ? "is" : "are";
+        return `${list} ${verb} held because the full request was too large to send; not sent.`;
+    },
     // ⛔ NO `inferredSetAside` SENTENCE HERE (VL, 2026-10-08, VG's double-count finding, item (b)): it duplicated the
     // `inferredSkipped` sentence's `set_aside` clause above — same pairs, two sentences. Removed, not kept dead:
     // nothing in `status.ts` calls it any more, and a copy function with no caller is the thing this package's own

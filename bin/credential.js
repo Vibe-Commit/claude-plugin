@@ -36,6 +36,7 @@
  */
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, statSync, writeFileSync, } from "node:fs";
 import { inspect } from "node:util";
+import { headerSafe } from "./header_safety.js";
 import { credentialsPath, rootDir } from "./paths.js";
 /**
  * Retyped from `INGEST_CREDENTIAL_TOKEN_PREFIX` in the closed-source server.
@@ -128,7 +129,17 @@ export function loadCredential(ctx) {
     const fromEnv = ctx.env.VIBECOMMIT_TOKEN;
     if (fromEnv !== undefined && fromEnv.trim() !== "") {
         const secret = fromEnv.trim();
-        if (!secret.startsWith(INGEST_TOKEN_PREFIX)) {
+        // ⛔ `TODOS[182]`. `!headerSafe(secret)` ALONGSIDE the prefix check, not a
+        // separate outcome: a credential containing a stray CR/LF or a byte above
+        // U+00FF can never become `Authorization: Bearer <secret>` either — the
+        // identical `fetch` `TypeError` an unsafe branch name throws
+        // (`header_safety.ts`). `wrong-class` is already exactly right for it: the
+        // existing copy ("not a VibeCommit ingest credential... It was not sent
+        // anywhere") is true in the most literal sense, and the caller never calls
+        // `deliver()` for a credential that failed to LOAD — the transcript's
+        // bytes are never read this hook, which is `fatal`'s own HOLD behavior
+        // with no new code needed to get it.
+        if (!secret.startsWith(INGEST_TOKEN_PREFIX) || !headerSafe(secret)) {
             return { kind: "wrong-class", source: "env" };
         }
         return { kind: "ok", credential: new IngestCredential(secret, "env") };
@@ -151,7 +162,8 @@ export function loadCredential(ctx) {
         return { kind: "unreadable", path };
     }
     const secret = token.trim();
-    if (!secret.startsWith(INGEST_TOKEN_PREFIX)) {
+    // `TODOS[182]` — see the `env` branch above for why `headerSafe` belongs here too.
+    if (!secret.startsWith(INGEST_TOKEN_PREFIX) || !headerSafe(secret)) {
         return { kind: "wrong-class", source: "file" };
     }
     return { kind: "ok", credential: new IngestCredential(secret, "file") };
