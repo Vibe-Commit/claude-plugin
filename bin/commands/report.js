@@ -46,7 +46,7 @@
  *
  * @provenance vibecommit-mcp src/read/coverage.ts — the payload shape, retyped
  */
-import { ABSENCE, COMMANDS, ERRORS, REPORT, SIGNIN, WHY, } from "../copy/index.js";
+import { ABSENCE, COMMANDS, ERRORS, HELP, REPORT, SIGNIN, WHY, } from "../copy/index.js";
 import { EXIT } from "../exit.js";
 import { currentBranch, gitProbe, isReachable, isShallowClone, resolveRepoSlug } from "../git.js";
 import { emitJson } from "../json.js";
@@ -233,6 +233,11 @@ function coverageScreen(payload, reachable, percent) {
     return lines;
 }
 export async function report(ctx, argv, deps = {}) {
+    // `TODOS[184]`. Check-first, before `parseArgs`/anything else. Reads and writes nothing.
+    if (argv.includes("--help") || argv.includes("-h")) {
+        writeLines(ctx.stdout, [HELP.commands.report]);
+        return EXIT.ok;
+    }
     // §13.3 — `--json` emits nothing but the JSON document on stdout, and D122 §2
     // rules that §13.3 REQUIRES it here. Every FAILURE below is unchanged (§13.6
     // to stderr, nothing on stdout); the three ANSWER states branch.

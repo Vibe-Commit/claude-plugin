@@ -43,6 +43,13 @@ import { paint, renderErrorBlock, tildePath, truncatePath, wrap } from "../term.
 import { writeLines } from "./context.js";
 import { signInBeat } from "./browser_credential.js";
 export async function connect(ctx, options = {}, deps = {}) {
+    // `TODOS[184]`. Checked first, before the node-floor check below — nothing about `--help` on
+    // `connect` carries the "already exposed" urgency `auth`'s own positional refusal does, so first is
+    // safe here, unlike there. Reads and writes nothing.
+    if (options.help === true) {
+        writeLines(ctx.stdout, [HELP.commands.connect]);
+        return EXIT.ok;
+    }
     // (1) The runtime floor refuses LOUDLY here, unlike in the hook: the user is
     // watching and can act, and D57 §DX11 asks for exactly that asymmetry.
     if (!meetsNodeFloor(ctx.nodeVersion)) {

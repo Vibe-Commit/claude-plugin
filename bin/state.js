@@ -40,7 +40,7 @@ import { dirname, join } from "node:path";
 import { pendingFileExpired } from "./pending_prune.js";
 import { repoSessionsDir, sessionStatePath } from "./paths.js";
 import { EMPTY_FILE_STATE } from "./policy.js";
-import { WIRE_RUNGS, readInferred, readRewrites, readSpool } from "./spool.js";
+import { SESSION_LIVE_WINDOW_MS, WIRE_RUNGS, readInferred, readRewrites, readSpool } from "./spool.js";
 export const EMPTY_SESSION_STATE = {
     seq: 0,
     stop: null,
@@ -210,6 +210,122 @@ export function heldAtEndForRepo(home, repoKey) {
     }
     return { bytes, sessions };
 }
+/**
+ * Bytes a file holds that `heldAtEndForRepo` does NOT already claim — `TODOS[184]`, VG's D1.
+ *
+ * `heldAtEndForRepo` owns `[sentOffset, endHold.eof[file])`, keyed on the LAST `SessionEnd`'s snapshot. A
+ * resumed session's hooks keep appending to `backlog` without ever re-stamping `endHold`, so the backlog's
+ * tail beyond that snapshot (or the whole backlog, if `endHold` never claimed this file at all) belongs to
+ * nobody today. This is that remainder — the offset range `heldAtEndForRepo` cannot see because arithmetic,
+ * not a session field, is what tells the two apart (an `endedAt === null` gate double-counts or misses it,
+ * measured in DESIGN.md's S3/S4).
+ */
+function unclaimedPendingBytes(fs, claimedEof) {
+    if (fs.backlog.length === 0)
+        return 0;
+    const start = Math.max(fs.backlog[0].from, claimedEof ?? fs.backlog[0].from);
+    return Math.max(0, fs.backlog[fs.backlog.length - 1].to - start);
+}
+/** The `at` of the first backlog span whose `.to` exceeds `claimedEof` — the oldest span `unclaimedPendingBytes` counts. */
+function oldestUnclaimedAt(fs, claimedEof) {
+    const claimedUpTo = claimedEof ?? fs.backlog[0]?.from ?? 0;
+    for (const span of fs.backlog) {
+        if (span.to > claimedUpTo)
+            return span.at;
+    }
+    return null;
+}
+/**
+ * Classify this session's MAIN file as `live_stuck`, `held_idle`, or neither.
+ *
+ * Deliberately MAIN ONLY, never a sub-agent file: a spooled commit rides the MAIN delivery by
+ * construction (`entry.ts:841`'s own comment, carried over from `TODOS[182]`'s budget work), so this is
+ * the one classification `stuckSpoolLinesForRepo` below needs — a sub-agent file being stuck says
+ * nothing about whether a commit is waiting to go out. `stuckForRepo` (below) answers a DIFFERENT,
+ * broader question — every file's unclaimed bytes, not just main's — and is not built from this
+ * function. Returns which BUCKET (not a bare boolean) so a caller naming commits inside the
+ * `liveStuck`/`heldIdle` sentence never attributes the same session's lines to both.
+ */
+function classifyMainStuck(session, nowMs, windowMs) {
+    const fs = fileState(session, "main");
+    const claimedEof = session.endHold?.eof.main;
+    if (unclaimedPendingBytes(fs, claimedEof) === 0)
+        return null;
+    const live = session.liveAt !== null && nowMs - session.liveAt <= windowMs;
+    if (!live)
+        return "idle"; // no age bound — no hook is coming soon to retry.
+    const oldest = oldestUnclaimedAt(fs, claimedEof);
+    return oldest !== null && nowMs - oldest > windowMs ? "live" : null; // survived a full turn's retries, or not stuck at all.
+}
+const EMPTY_STUCK_GAUGES = {
+    liveStuck: { bytes: 0, sessions: 0, ids: [] },
+    heldIdle: { bytes: 0, sessions: 0, ids: [] },
+};
+/**
+ * Bytes stuck in a LIVE session's backlog, vs. a session nobody has retried in a while — `TODOS[184]`.
+ *
+ * Partitioned by BYTE RANGE per file (VG's D1), never by `endedAt`: `unclaimedPendingBytes` excludes
+ * whatever `heldAtEndForRepo` already owns for that file, so the two gauges are disjoint by arithmetic.
+ * Which of `liveStuck`/`heldIdle` a session's unclaimed bytes fall into is decided purely by liveness —
+ * `SessionState.liveAt` inside `SESSION_LIVE_WINDOW_MS` (`spool.ts`'s own hook-cadence constant, reused
+ * rather than a new wall-clock guess) — and, for a live session, whether its OLDEST unclaimed span (across
+ * every file) has itself survived a full turn's worth of retries. A live session whose unclaimed backlog
+ * is all RECENT is reported by neither gauge: that is an ordinary in-flight hold, not a defect.
+ */
+export function stuckForRepo(home, repoKey, nowMs = Date.now(), windowMs = SESSION_LIVE_WINDOW_MS) {
+    const dir = repoSessionsDir(home, repoKey);
+    if (dir === null)
+        return EMPTY_STUCK_GAUGES;
+    let entries;
+    try {
+        entries = readdirSync(dir);
+    }
+    catch {
+        return EMPTY_STUCK_GAUGES;
+    }
+    let liveBytes = 0;
+    let liveSessions = 0;
+    const liveIds = [];
+    let idleBytes = 0;
+    let idleSessions = 0;
+    const idleIds = [];
+    for (const entry of entries) {
+        if (!entry.endsWith(".json"))
+            continue;
+        const sessionId = entry.slice(0, -".json".length);
+        const session = readStateAt(join(dir, entry));
+        const live = session.liveAt !== null && nowMs - session.liveAt <= windowMs;
+        let sessionBytes = 0;
+        let oldestAcrossFiles = null;
+        for (const [fileKey, fs] of Object.entries(session.files)) {
+            const claimedEof = session.endHold?.eof[fileKey];
+            const unclaimed = unclaimedPendingBytes(fs, claimedEof);
+            if (unclaimed === 0)
+                continue;
+            sessionBytes += unclaimed;
+            const oldest = oldestUnclaimedAt(fs, claimedEof);
+            if (oldest !== null && (oldestAcrossFiles === null || oldest < oldestAcrossFiles))
+                oldestAcrossFiles = oldest;
+        }
+        if (sessionBytes === 0)
+            continue;
+        if (!live) {
+            idleBytes += sessionBytes;
+            idleSessions += 1;
+            idleIds.push(sessionId);
+        }
+        else if (oldestAcrossFiles !== null && nowMs - oldestAcrossFiles > windowMs) {
+            liveBytes += sessionBytes;
+            liveSessions += 1;
+            liveIds.push(sessionId);
+        }
+        // else: live, and every unclaimed span is recent — an ordinary in-flight hold, reported by neither gauge.
+    }
+    return {
+        liveStuck: { bytes: liveBytes, sessions: liveSessions, ids: liveIds },
+        heldIdle: { bytes: idleBytes, sessions: idleSessions, ids: idleIds },
+    };
+}
 /** Commit lines waiting in a session's spool or pending file. */
 function commitLinesFor(dir, stem, nowMs) {
     let n = 0;
@@ -304,6 +420,65 @@ export function commitsWaitingForRepo(home, repoKey, nowMs = Date.now()) {
         }
     }
     return n;
+}
+const EMPTY_STUCK_SPOOL_LINES = { liveCommits: 0, idleCommits: 0 };
+/**
+ * `commitsWaitingForRepo`'s "waiting for a turn to close" is false for a commit whose own Stop already
+ * fired and failed to deliver (measured, DESIGN.md's S8) — the turn DID close; what's actually pending is
+ * delivery, the exact fact `live_stuck`/`held_idle` already name. `status.ts` subtracts THIS reader's
+ * count from `commitsWaitingForRepo`'s for the rendered TEXT only; the JSON key and `commitsWaitingForRepo`
+ * itself are never called differently and never change — this function does its own independent scan.
+ *
+ * ⛔⛔ **MIRRORS `commitsWaitingForRepo`'S OWN TWO EXCLUSIONS EXACTLY, same `nowMs`, same helpers** (VL's
+ * required ruling on this ticket): it must count EXACTLY the stuck-session SUBSET of that function's
+ * population, never a superset — so it skips a `.spool.jsonl` whose session is `lean` on `main` (the
+ * SAME existing TODOS[182] exclusion `commitsWaitingForRepo` applies) and an EXPIRED `.pending.jsonl`
+ * (the SAME existing TODOS[175] exclusion), and counts every remaining non-blank line with NO
+ * `WIRE_RUNGS` filter — `commitsWaitingForRepo` has none either (confirmed by reading it: a flat
+ * `split("\n").filter(...)`.length`, nothing rung-aware). A rung filter here, or either exclusion
+ * missing, would make the stuck count larger than its own population and corrupt the subtraction
+ * `status.ts` does — which is exactly why there is no `Math.max(0, …)` clamp anywhere around that
+ * subtraction: this being a true subset is what the clamp would otherwise have to paper over.
+ */
+export function stuckSpoolLinesForRepo(home, repoKey, nowMs = Date.now(), windowMs = SESSION_LIVE_WINDOW_MS) {
+    const dir = repoSessionsDir(home, repoKey);
+    if (dir === null)
+        return EMPTY_STUCK_SPOOL_LINES;
+    let entries;
+    try {
+        entries = readdirSync(dir);
+    }
+    catch {
+        return EMPTY_STUCK_SPOOL_LINES;
+    }
+    let liveCommits = 0;
+    let idleCommits = 0;
+    for (const entry of entries) {
+        if (!entry.endsWith(".spool.jsonl") && !entry.endsWith(".pending.jsonl"))
+            continue;
+        const stem = entry.endsWith(".spool.jsonl")
+            ? entry.slice(0, -".spool.jsonl".length)
+            : entry.slice(0, -".pending.jsonl".length);
+        const session = readStateAt(join(dir, `${stem}.json`));
+        if (entry.endsWith(".spool.jsonl") && fileState(session, "main").lean)
+            continue;
+        const cls = classifyMainStuck(session, nowMs, windowMs);
+        if (cls === null)
+            continue;
+        try {
+            if (entry.endsWith(".pending.jsonl") && pendingFileExpired(join(dir, entry), nowMs))
+                continue;
+            const lines = readFileSync(join(dir, entry), "utf8").split("\n").filter((l) => l.trim() !== "").length;
+            if (cls === "live")
+                liveCommits += lines;
+            else
+                idleCommits += lines;
+        }
+        catch {
+            /* a vanished file holds nothing */
+        }
+    }
+    return { liveCommits, idleCommits };
 }
 /**
  * How many inferred pairs this REPO has spooled right now, across every session, waiting on an ack that has
@@ -403,6 +578,36 @@ export function leanHeldForRepo(home, repoKey) {
         }
     }
     return { commits, rewrites, inferred };
+}
+/**
+ * How many sessions in this repo have gone `lean` on ANY file, main or sub-agent — `TODOS[184]`, Gate C's
+ * construction check K.
+ *
+ * `leanHeldForRepo` above counts SPOOLED data a lean session is holding back, which can read 0 for a
+ * session that went lean with nothing currently spooled (a 431 on a hook carrying no new commits,
+ * rewrites or inferred groups) — the flag itself is the only durable trace of that. A session, not a
+ * line or a file, is the unit: two lean files in one session count once.
+ */
+export function leanSessionsForRepo(home, repoKey) {
+    const dir = repoSessionsDir(home, repoKey);
+    if (dir === null)
+        return 0;
+    let entries;
+    try {
+        entries = readdirSync(dir);
+    }
+    catch {
+        return 0;
+    }
+    let n = 0;
+    for (const entry of entries) {
+        if (!entry.endsWith(".json"))
+            continue;
+        const session = readStateAt(join(dir, entry));
+        if (Object.values(session.files).some((f) => f.lean))
+            n += 1;
+    }
+    return n;
 }
 /** The newest main-stream receipt across this repo's sessions, or null. */
 export function lastReceiptForRepo(home, repoKey) {
