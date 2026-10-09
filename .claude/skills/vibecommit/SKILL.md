@@ -13,9 +13,10 @@ For custom rules, create a separate file alongside this one.
 
 You have a VibeCommit MCP server. On every coding task:
 
-1. **Once per session (and once per hour):** call the `setup` MCP tool to
-   refresh these instructions. It is idempotent — on the common path you get
-   back only a list of already-current files, one cheap round-trip.
+1. **Call `setup` to install or refresh these instructions** whenever you suspect
+   they're stale (e.g. after a VibeCommit upgrade). It is idempotent — on the
+   common path you get back only a list of already-current files, one cheap
+   round-trip.
 
 2. **Capture.** Two separate facts:
    - **Session capture** is automatic when Claude Code runs VibeCommit's hooks
@@ -24,10 +25,12 @@ You have a VibeCommit MCP server. On every coding task:
      hooks, capture with `commit_conversation`: call it after each meaningful
      chunk of work, and ALWAYS right after you make a git commit.
    - **Rewrites** (amend, rebase, squash) are recorded automatically ONLY if
-     VibeCommit's git `post-rewrite` hook is installed — `vibecommit connect`
-     installs it, unless `core.hooksPath` sends hooks elsewhere (e.g. husky);
-     then connect refuses and the check below correctly fails. The plugin does
-     not install it. Check:
+     VibeCommit's git hooks are installed — `vibecommit connect` installs
+     `post-commit` and `post-rewrite` together, unless `core.hooksPath` sends hooks
+     elsewhere (e.g. husky); then connect refuses and the check below correctly
+     fails. The plugin does not install them. With the hooks, an amend, rebase or
+     `rebase -i` squash is recorded by `post-rewrite`, and a `reset --soft` squash
+     is inferred by `post-commit` (recorded as `probable`). Check:
      `grep -qs vibecommit "$(git rev-parse --git-path hooks/post-rewrite)"`.
      This tests the GIT hook only; it says nothing about whether session
      capture is on.
@@ -48,11 +51,12 @@ You have a VibeCommit MCP server. On every coding task:
      links the capture to that commit and tells you if any recent commits still
      lack a capture.
    - If a squash, rebase or amend rewrote a sha you already captured and the
-     `post-rewrite` check above failed, add `commit_sha_successor`: `{ ancestor_sha, successor_sha, match_kind }` —
-     the old sha, the one that replaced it, and `"exact"` if you can name the
-     rewrite or `"probable"` if you matched it by patch id. Send it ONLY when
-     a rewrite happened; the two shas must differ. It is what lets
-     `blame_commit` still resolve the old sha.
+     `post-rewrite` check above failed, add `commit_sha_successor`: `{ ancestor_sha, successor_sha }` —
+     the old sha and the one that replaced it. Send it ONLY when a rewrite
+     happened; the two shas must differ. It is recorded as your assertion
+     (`match_kind: 'asserted'`) — this is what lets `blame_commit` still resolve
+     the old sha, distinct from an evidence-backed `exact`/`probable` mapping.
+     `match_kind` is still accepted in the object for older installs but is ignored.
      Its optional `patch_id` MUST be computed with `--stable`, exactly:
      `git diff-tree -p --root --no-color --no-ext-diff <sha> | git patch-id --stable`
      Bare `git patch-id` is `--unstable` and gives a DIFFERENT id on any commit
