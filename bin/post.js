@@ -20,9 +20,10 @@
 import { createHash } from "node:crypto";
 import { agentForTranscript } from "./agents/registry.js";
 import { UNKNOWN_AGENT_ID } from "./agents/types.js";
+import { recordInferredSkipped } from "./inferred_tally.js";
 import { classify, markDelivered, markHeld, markSkipped, nextSpan, resolveCaps, } from "./policy.js";
 import { fileState, isStopped, loadSessionState, saveSessionState, withFileState, } from "./state.js";
-import { dropRewrites, dropSpooled, isFullSha, settleSpooled } from "./spool.js";
+import { INFERRED_SET_ASIDE_AFTER, dropInferredGroups, dropRewrites, dropSpooled, isFullSha, recordInferredAttempt, setAsideInferredGroup, settleSpooled, } from "./spool.js";
 import { CLIENT_VERSION, CLIENT_VERSION_HEADER } from "./version.js";
 /** Production data plane. Overridable for tests and for a self-hosted server. */
 export const DEFAULT_INGEST_URL = "https://api.vibecommit.ai/ingest/v1/session";
@@ -166,6 +167,10 @@ export function buildIngestHeaders(credential, delta) {
     if (delta.rewrites !== undefined && delta.rewrites.length > 0) {
         headers["x-rewrites"] = delta.rewrites.join(",");
     }
+    // `TODOS[177]` — same idiom: OMITTED, never sent empty; the spelling is fixed by `capInferred`.
+    if (delta.inferredRewrites !== undefined && delta.inferredRewrites.length > 0) {
+        headers["x-rewrites-inferred"] = delta.inferredRewrites.join(",");
+    }
     return headers;
 }
 /**
@@ -241,6 +246,13 @@ function parseCommitsRetry(raw) {
         .map((s) => s.trim().toLowerCase())
         .filter((s) => isFullSha(s));
 }
+/** `X-Rewrites-Inferred-Stored` → a non-negative integer, or `null` for absent/malformed. NEVER THROWS. */
+function parseInferredStored(raw) {
+    if (raw === null)
+        return null;
+    const n = Number(raw.trim());
+    return Number.isInteger(n) && n >= 0 ? n : null;
+}
 /**
  * One attempt. No retry, no backoff, no classification — `CR-018` owns all three.
  *
@@ -278,6 +290,7 @@ export async function send(url, headers, body, timeoutMs) {
             captureId: res.headers.get("x-capture-id"),
             commitsRetry: parseCommitsRetry(res.headers.get("x-commits-retry")),
             finalAck: parseFinalAck(res.headers.get("x-session-final")),
+            inferredStored: parseInferredStored(res.headers.get("x-rewrites-inferred-stored")),
         };
     }
     catch {
@@ -366,10 +379,12 @@ export async function deliver(ctx, eof, readBody) {
         head: ctx.head,
         commits: ctx.commits,
         rewrites: ctx.rewrites,
+        inferredRewrites: ctx.inferredRewrites,
     }), body, ctx.timeoutMs);
     const disposition = classify(outcome);
     const caps = resolveCaps(ctx.env);
     let next = ctx.byHook ? { ...session, seq, liveAt: ctx.nowMs } : { ...session, seq };
+    let inferredSetAsidePairs = 0;
     switch (disposition) {
         case "ok":
             next = withFileState(next, ctx.fileKey, markDelivered(current, span.to, ctx.nowMs));
@@ -454,6 +469,45 @@ export async function deliver(ctx, eof, readBody) {
             if (ctx.rewrites !== undefined && ctx.rewrites.length > 0) {
                 dropRewrites(ctx.home, key, ctx.rewrites.length);
             }
+            // `TODOS[177]` — the INFERRED pairs have their own file and their own drop. ⛔ UNLIKE `rewrites` above, this one is
+            // CONDITIONAL on the server's per-request ack (`x-rewrites-inferred-stored`): a 2xx alone is "the delta was
+            // accepted", not "every inferred pair in it was recorded" (VG pre-review, 2026-10-08). Drop by GROUP IDENTITY,
+            // never by count — see `dropInferredGroups`'s own comment for why a count-based drop lost pairs under concurrency.
+            //
+            // ⛔⛔ PER-GROUP BOUND (VL, 2026-10-08, VG's head-of-line finding): `capInferred` sends exactly ONE group per
+            // request now, so `ctx.inferredGroups` has at most one member and the ack names it unambiguously.
+            //   stored === sent        → delivered, drop it.
+            //   stored !== null, short → a real signal from a server that saw the group and recorded fewer than all of it:
+            //                            count an attempt; after `INFERRED_SET_ASIDE_AFTER` attempts, give up on it so it
+            //                            stops blocking the group behind it.
+            //   stored === null        → an old/absent-ack server said nothing at all: "keeping is right there" — no
+            //                            attempt is counted (an attempt means a signal was RECEIVED), nothing is set aside.
+            if (ctx.inferredRewrites !== undefined && ctx.inferredRewrites.length > 0 && ctx.inferredGroups !== undefined && ctx.inferredGroups.length > 0) {
+                const group = ctx.inferredGroups[0];
+                const stored = outcome.kind === "response" ? outcome.inferredStored : null;
+                if (stored === ctx.inferredRewrites.length) {
+                    dropInferredGroups(ctx.home, key, [group]);
+                }
+                else if (stored !== null) {
+                    // ⛔⛔ `stored !== null` ALONE, never `stored !== null && stored > 0` (VG's mutant G5, 2026-10-08): the
+                    // real server (`ff67ef9`) writes a group in one atomic upsert, so a CARRIED group gets back either `n`
+                    // (all stored, handled above) or exactly `0` (the write failed, the header was voided, or a replay) — it
+                    // never answers `n-1`. An ack of `0` is a real signal ("the server saw this and stored none of it") and
+                    // must count an attempt exactly like any other short ack, or a persistently-refused group is never set
+                    // aside and head-of-line blocking comes back on the realistic path.
+                    const attempts = recordInferredAttempt(ctx.home, key, group);
+                    if (attempts >= INFERRED_SET_ASIDE_AFTER) {
+                        setAsideInferredGroup(ctx.home, key, group, "short_ack");
+                        // `TODOS[177]` follow-up (VL, 2026-10-08, VG's silent-loss finding): tally BEFORE any deletion can
+                        // happen — `finalize` may delete this session's `.inferred.jsonl` outright once every group in it is
+                        // resolved, and this tally is the ONLY record of `set_aside` left once that file is gone (VG's
+                        // follow-up finding: an earlier version of this fix also kept a live gauge reading that same file,
+                        // which double-counted these pairs once the group aged into the 7-day prune — removed).
+                        recordInferredSkipped(ctx.home, key.repoKey, "set_aside", ctx.nowMs, ctx.inferredRewrites.length);
+                        inferredSetAsidePairs = ctx.inferredRewrites.length;
+                    }
+                }
+            }
             break;
         case "later":
             next = withFileState(next, ctx.fileKey, markHeld(current, span, ctx.nowMs, caps));
@@ -481,6 +535,8 @@ export async function deliver(ctx, eof, readBody) {
         disposition,
         detail: outcome.kind === "response" ? outcome.detail : null,
         finalAck: outcome.kind === "response" ? outcome.finalAck : null,
+        inferredStored: outcome.kind === "response" ? outcome.inferredStored : null,
+        inferredSetAsidePairs,
     };
 }
 //# sourceMappingURL=post.js.map

@@ -40,7 +40,7 @@
  * the sha; the observation is not. `files` is carried for wave 2 and never put
  * in a header.
  */
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { keepsPendingLine } from "./pending_bound.js";
 import { repoSessionsDir, sessionStatePath } from "./paths.js";
@@ -587,6 +587,499 @@ export function dropRewrites(home, key, count) {
 export function capSuccessors(pairs) {
     const taken = pairs.slice(0, MAX_SPOOLED_PAIRS);
     return { pairs: taken.map(wirePair), count: taken.length };
+}
+/**
+ * How many inferred pairs one request may carry. ⛔ ITS OWN CONSTANT, and a WHOLE-GROUP budget, not a flat per-hook cap: `blame_commit`
+ * renders `squashed_from` as a plain list (mcp `blame.ts:454`), so a group split across requests would read as a complete answer when it
+ * is not — the same class of defect as [160]. One squash's fold is at most `MAX_INFERRED_COMMITS` (64) pairs (a larger fold is refused
+ * before it is ever spooled — "oversize", tallied, nothing sent), so 64 is also the largest a single group can be. `capInferred` packs
+ * whole groups, oldest first, up to this budget; a group that would not fit WHOLE waits, with everything after it, for a later request —
+ * never split. Measured on the wire (prod, invalid-bearer probe, 2026-10-08): 64 pairs = 7,871 bytes alongside a 10-pair exact-rewrites
+ * header (819 B) still returns 401 (passed the proxy and node's header layer); a 40,000 B control header returns 431, so the probe can see
+ * a real limit and did not hit it here.
+ */
+export const MAX_INFERRED_PAIRS = 64;
+/** `<repo>/<session>.inferred.jsonl`, beside the rewrite spool. */
+export function inferredSpoolPath(home, key) {
+    const state = sessionStatePath(home, key);
+    if (state === null)
+        return null;
+    return state.replace(/\.json$/, ".inferred.jsonl");
+}
+/** A 40-hex patch-id. Not `isFullSha`: the wire contract is `patchid40`, lowercase hex, exactly 40. */
+export function isPatchId(value) {
+    return typeof value === "string" && /^[0-9a-f]{40}$/.test(value);
+}
+function identityOf(g) {
+    return `${g.successor}:${g.patchId}`;
+}
+const IDENTITY_RE = /^[0-9a-f]{40}:[0-9a-f]{40}$/;
+function parseStoredLine(line) {
+    let parsed;
+    try {
+        parsed = JSON.parse(line);
+    }
+    catch {
+        return null;
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))
+        return null;
+    const o = parsed;
+    if (typeof o.delivered === "string" && IDENTITY_RE.test(o.delivered))
+        return { kind: "delivered", identity: o.delivered };
+    if (typeof o.attempt === "string" && IDENTITY_RE.test(o.attempt))
+        return { kind: "attempt", identity: o.attempt };
+    if (typeof o.set_aside === "string" && IDENTITY_RE.test(o.set_aside))
+        return { kind: "set_aside", identity: o.set_aside };
+    const successor = o.successor;
+    const patchId = o.patch_id;
+    const ancestors = o.ancestors;
+    if (typeof successor !== "string" || !/^[0-9a-f]{40}$/.test(successor))
+        return null;
+    if (!isPatchId(patchId))
+        return null;
+    if (!Array.isArray(ancestors) || ancestors.length === 0)
+        return null;
+    const clean = ancestors.filter((a) => typeof a === "string" && /^[0-9a-f]{40}$/.test(a) && a !== successor);
+    if (clean.length === 0)
+        return null;
+    return { kind: "group", group: { successor, patchId, ancestors: [...new Set(clean)] } };
+}
+/** Every group line and every mark (delivered / attempt / set-aside) currently on disk. Malformed lines are skipped, not fatal. */
+function readStored(path) {
+    let raw;
+    try {
+        raw = readFileSync(path, "utf8");
+    }
+    catch {
+        return { groups: [], delivered: new Set(), setAside: new Set(), attempts: new Map() };
+    }
+    const groups = [];
+    const delivered = new Set();
+    const setAside = new Set();
+    const attempts = new Map();
+    for (const line of raw.split("\n")) {
+        if (line.trim() === "")
+            continue;
+        const parsed = parseStoredLine(line);
+        if (parsed === null)
+            continue;
+        if (parsed.kind === "delivered")
+            delivered.add(parsed.identity);
+        else if (parsed.kind === "set_aside")
+            setAside.add(parsed.identity);
+        else if (parsed.kind === "attempt")
+            attempts.set(parsed.identity, (attempts.get(parsed.identity) ?? 0) + 1);
+        else
+            groups.push(parsed.group);
+    }
+    return { groups, delivered, setAside, attempts };
+}
+/**
+ * Append inferred pairs as ONE GROUP LINE (they are the fold of one detected squash, so they share one successor and
+ * one patch-id by construction; grouped here anyway, defensively, in case a future caller ever passes more than one).
+ * A group whose identity is already on disk — spooled OR already delivered — is skipped whole: the same squash
+ * detected twice (a hook retried) must not duplicate it. Returns how many ancestor pairs were newly WRITTEN.
+ * ⛔ NEVER THROWS — this runs inside the user's `git commit`.
+ */
+export function appendInferred(home, key, pairs) {
+    const path = inferredSpoolPath(home, key);
+    if (path === null)
+        return 0;
+    const valid = pairs.filter(validInferred);
+    if (valid.length === 0)
+        return 0;
+    const order = [];
+    const bySuccessor = new Map();
+    for (const pair of valid) {
+        let g = bySuccessor.get(pair.successor);
+        if (g === undefined) {
+            g = [];
+            bySuccessor.set(pair.successor, g);
+            order.push(pair.successor);
+        }
+        g.push(pair);
+    }
+    let written = 0;
+    try {
+        mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+        const existing = readStored(path);
+        const known = new Set([...existing.delivered, ...existing.setAside, ...existing.groups.map(identityOf)]);
+        for (const successor of order) {
+            const members = bySuccessor.get(successor);
+            const patchId = members[0].patchId;
+            if (!members.every((p) => p.patchId === patchId))
+                continue; // defensive: a mixed call names no group
+            const identity = identityOf({ successor, patchId });
+            if (known.has(identity))
+                continue;
+            known.add(identity);
+            const ancestors = [...new Set(members.map((p) => p.ancestor))];
+            appendFileSync(path, `${JSON.stringify({ successor, patch_id: patchId, ancestors })}\n`, { mode: 0o600 });
+            written += ancestors.length;
+        }
+        if (written > 0)
+            chmodSync(path, 0o600);
+        return written;
+    }
+    catch {
+        return written;
+    }
+}
+/**
+ * Every well-formed, still-ELIGIBLE inferred pair in the spool, oldest group first, ancestors in stored order
+ * within a group. "Eligible" excludes a group already DELIVERED and one already SET ASIDE (VL, 2026-10-08: a
+ * group that gave up after `INFERRED_SET_ASIDE_AFTER` short acks is never offered again; `inferred_tally.ts`'s
+ * `recordInferredSkipped(..., "set_aside", ...)` tallied it durably at that moment, for `status`). `capInferred`
+ * takes `pairs[0]`'s group as the one it sends, so this function's ORDER is load-bearing: the oldest eligible
+ * group must come first.
+ */
+export function readInferred(home, key) {
+    const path = inferredSpoolPath(home, key);
+    if (path === null)
+        return [];
+    const { groups, delivered, setAside } = readStored(path);
+    const out = [];
+    for (const g of groups) {
+        if (delivered.has(identityOf(g)) || setAside.has(identityOf(g)))
+            continue;
+        for (const ancestor of g.ancestors)
+            out.push({ ancestor, successor: g.successor, patchId: g.patchId });
+    }
+    return out;
+}
+/**
+ * How many inferred pairs this REPO has spooled right now, across every session, waiting on an ack that has not
+ * (yet) come back `n == sent` (VL, 2026-10-08: "count it in status, e.g. `inferred_unacknowledged`"). A live gauge,
+ * not a cumulative tally like `inferred_tally.ts`'s oversize/sha256 — a pair stops counting the moment it is
+ * acknowledged, same as `commitsWaitingForRepo`'s shape for the exact-commit spool.
+ */
+export function inferredUnacknowledgedForRepo(home, repoKey) {
+    const dir = repoSessionsDir(home, repoKey);
+    if (dir === null)
+        return 0;
+    let entries;
+    try {
+        entries = readdirSync(dir);
+    }
+    catch {
+        return 0;
+    }
+    let n = 0;
+    for (const entry of entries) {
+        if (!entry.endsWith(".inferred.jsonl"))
+            continue;
+        const sessionId = entry.slice(0, -".inferred.jsonl".length);
+        try {
+            n += readInferred(home, { repoKey, sessionId }).length;
+        }
+        catch {
+            /* one unreadable session file must not stop the count */
+        }
+    }
+    return n;
+}
+/**
+ * Mark groups DELIVERED, by identity — never by position. Called ONLY after the server's 2xx AND its per-request ack
+ * (`x-rewrites-inferred-stored`) confirms every pair of every named group actually landed. An append-only tombstone
+ * mark, so a concurrent `appendInferred` for a DIFFERENT group racing this call is never clobbered: there is no file
+ * rewrite here to lose it inside. ⛔ NEVER THROWS.
+ */
+export function dropInferredGroups(home, key, groups) {
+    const path = inferredSpoolPath(home, key);
+    if (path === null || groups.length === 0)
+        return false;
+    try {
+        mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+        const marked = new Set();
+        for (const g of groups) {
+            const identity = identityOf(g);
+            if (marked.has(identity))
+                continue;
+            marked.add(identity);
+            appendFileSync(path, `${JSON.stringify({ delivered: identity })}\n`, { mode: 0o600 });
+        }
+        chmodSync(path, 0o600);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+/**
+ * The inferred pairs this hook will carry, in WIRE SPELLING — `<ancestor40>:<successor40>:<patchid40>`, lowercase hex, colon-separated —
+ * and the identity of the ONE group carried (`groups`, length 0 or 1 — plural for call-site symmetry with `dropInferredGroups`, never
+ * more than one member). Only 40-hex shas ride this header; a sha256 repository's pair is not spooled at all.
+ *
+ * ⛔⛔ ONE GROUP PER REQUEST (VL, 2026-10-08, VG's head-of-line finding over `vg-evidence/177-gate-7dde49e/hol.mjs`). The earlier
+ * version packed as many WHOLE groups as fit under `MAX_INFERRED_PAIRS` — correct for the concurrency bug, but it made the ack
+ * (`x-rewrites-inferred-stored`, ONE NUMBER per request) ambiguous whenever more than one group rode the same request: a short ack
+ * could not say WHICH group was short, so the client had to keep ALL of them, and the head group — if a server persistently
+ * refused or shorted it — blocked every group behind it forever (measured: 40+30 under a short ack reads `40,40,40,40,…` on every
+ * hook; the 30 is never sent). Sending exactly `readInferred(...)`'s FIRST eligible group makes `n` name exactly that group:
+ * `n == size` is unambiguous. A single group is never larger than `MAX_INFERRED_COMMITS` (64) by construction (a bigger fold is
+ * refused before it is ever spooled), so it always fits; `MAX_INFERRED_PAIRS` stays as that upper bound's own name.
+ */
+export function capInferred(pairs) {
+    if (pairs.length === 0)
+        return { pairs: [], count: 0, groups: [] };
+    const { successor, patchId } = pairs[0];
+    // ⛔ Defensive, not load-bearing: a single group is never larger than `MAX_INFERRED_PAIRS` by construction
+    // (`inferred_squash.ts` refuses a bigger fold before it is ever spooled). The clamp exists so a future upstream
+    // change that weakens that guarantee fails SAFE here (an undersized request) rather than oversized on the wire.
+    const group = pairs.filter((p) => p.successor === successor && p.patchId === patchId).slice(0, MAX_INFERRED_PAIRS);
+    return { pairs: group.map(wireInferred), count: group.length, groups: [{ successor, patchId }] };
+}
+function wireInferred(pair) {
+    return `${pair.ancestor}:${pair.successor}:${pair.patchId}`;
+}
+function validInferred(pair) {
+    return /^[0-9a-f]{40}$/.test(pair.ancestor) && /^[0-9a-f]{40}$/.test(pair.successor) && pair.ancestor !== pair.successor && isPatchId(pair.patchId);
+}
+/**
+ * ⛔ PER-GROUP BOUND (VL, 2026-10-08). A SHORT ack (the header is present but `n < sent`) is a real signal the
+ * server has an issue with THIS group — unlike an ABSENT ack (an old server, which says nothing at all and is
+ * never counted: "keeping is right there"). Each short ack counts ONE attempt, by identity, append-only like the
+ * `delivered` mark. After `INFERRED_SET_ASIDE_AFTER` attempts the group is given up on (`setAsideInferredGroup`),
+ * so a persistently-refused group blocks its neighbours for at most that many hook cycles, never forever.
+ */
+export const INFERRED_SET_ASIDE_AFTER = 3;
+/** Record one short-ack attempt against a group, by identity. Returns the attempt count AFTER this one. ⛔ NEVER THROWS. */
+export function recordInferredAttempt(home, key, group) {
+    const path = inferredSpoolPath(home, key);
+    if (path === null)
+        return 0;
+    try {
+        mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+        const identity = identityOf(group);
+        const before = readStored(path).attempts.get(identity) ?? 0;
+        appendFileSync(path, `${JSON.stringify({ attempt: identity })}\n`, { mode: 0o600 });
+        chmodSync(path, 0o600);
+        return before + 1;
+    }
+    catch {
+        return 0;
+    }
+}
+/**
+ * Give up on a group: it is never offered again (`readInferred` excludes it), but it is NOT deleted — it stays on
+ * disk, covered by the 7-day orphan prune like everything else here. Not counted by a live gauge here (VL,
+ * 2026-10-08, VG's double-count finding, item (b)): `recordInferredSkipped(..., "set_aside", ...)` at the call
+ * site is the ONE place this is counted, so a set-aside group is a sentence exactly once, never twice. ⛔ NEVER
+ * THROWS.
+ */
+export function setAsideInferredGroup(home, key, group, reason) {
+    const path = inferredSpoolPath(home, key);
+    if (path === null)
+        return false;
+    try {
+        mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+        appendFileSync(path, `${JSON.stringify({ set_aside: identityOf(group), reason })}\n`, { mode: 0o600 });
+        chmodSync(path, 0o600);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+/**
+ * Whether EVERY group ever spooled for this session is resolved — delivered or set aside, none still pending —
+ * so the file can be deleted outright rather than waiting on the 7-day prune. Called ONLY by `finalize` after its
+ * drain loop ends, and ONLY because the session is then over: no concurrent `appendInferred` can still be running
+ * for a session finalize just confirmed is finished (the hook that would call it is the one deciding the session
+ * is over).
+ */
+export function inferredFullyResolved(home, key) {
+    const path = inferredSpoolPath(home, key);
+    if (path === null)
+        return false;
+    const { groups, delivered, setAside } = readStored(path);
+    if (groups.length === 0)
+        return false; // nothing to resolve is not the same as everything resolved
+    return groups.every((g) => delivered.has(identityOf(g)) || setAside.has(identityOf(g)));
+}
+/** Delete a fully-resolved inferred spool file outright, rather than leaving dead marks for the 7-day prune to find. ⛔ NEVER THROWS. */
+export function deleteInferredSpool(home, key) {
+    const path = inferredSpoolPath(home, key);
+    if (path === null)
+        return false;
+    try {
+        rmSync(path, { force: true });
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+// ---------------------------------------------------------------------------
+// ⭐ VL, 2026-10-08, item 5: `.inferred.jsonl` older than 7 days gets the SAME prune MECHANISM as `.pending.jsonl`
+// (`pending_prune.ts`) — tombstone-rename, re-read, put back anything that was not actually expired. A SEPARATE
+// function rather than a generalisation of that one: `pending_prune.ts`'s restore-merge dedups by `sha` (a field
+// `.inferred.jsonl` lines do not have — every line would read as `sha: null` and collide), so reusing it unmodified
+// would silently drop a legitimately-recovered line on every restore. The rule that DOES transfer: a mark line
+// (`delivered`/`attempt`/`set_aside`) is safe to keep from BOTH the tombstone and a concurrently-created live file —
+// duplicating a mark is harmless (sets) or correct (an attempt really happened twice); only a GROUP line must be
+// deduped by identity, or its ancestors would be counted twice.
+// ---------------------------------------------------------------------------
+export const INFERRED_PRUNE_TTL_MS = 7 * 24 * 3600_000;
+const INFERRED_TOMBSTONE = /^(.+\.inferred\.jsonl)\.expired-(\d+)$/;
+const INFERRED_TOMBSTONE_GRACE_MS = 3600_000;
+const INFERRED_PRUNE_MAX_FILES = 50;
+function settleInferredLine(line, liveGroupIdentities) {
+    const parsed = parseStoredLine(line);
+    if (parsed === null)
+        return null; // a torn line in a tombstone is dropped, like everywhere else here
+    if (parsed.kind === "group" && liveGroupIdentities.has(identityOf(parsed.group)))
+        return null; // already present live
+    return line;
+}
+/** Merge a tombstone's lines back onto its original path, which a concurrent `appendInferred` may have recreated. */
+function restoreInferred(tomb, original, raw) {
+    let live = null;
+    try {
+        live = readFileSync(original, "utf8");
+    }
+    catch {
+        /* nothing there */
+    }
+    if (live === null) {
+        renameSync(tomb, original);
+        return;
+    }
+    const liveGroups = new Set();
+    for (const l of live.split("\n")) {
+        if (l.trim() === "")
+            continue;
+        const p = parseStoredLine(l);
+        if (p?.kind === "group")
+            liveGroups.add(identityOf(p.group));
+    }
+    for (const l of raw.split("\n")) {
+        if (l.trim() === "")
+            continue;
+        const kept = settleInferredLine(l, liveGroups);
+        if (kept !== null)
+            appendFileSync(original, `${kept}\n`);
+    }
+    rmSync(tomb, { force: true });
+}
+/**
+ * Examine one tombstone: delete it if still expired by mtime, else restore it. Returns the GROUP lines discarded
+ * (`groups`) and the ANCESTOR PAIRS they carried (`pairs` — VL, 2026-10-08, VG's silent-loss finding: the caller
+ * tallies `pairs`, not `groups`, so a durable record survives the delete at the same GRANULARITY as the live
+ * gauges it replaces). Marks are not counted either way: they are not themselves data loss.
+ *
+ * ⛔⛔ COUNTS ONLY GROUPS WITH NEITHER A `delivered` NOR A `set_aside` MARK (VL, 2026-10-08, VG's double-count
+ * finding, item (a)). A group is removed from `readInferred`'s offer the moment it is delivered or set aside, but
+ * its GROUP LINE stays on disk — only `finalize`'s `inferredFullyResolved`/`deleteInferredSpool` deletes the
+ * whole file outright, and most sessions are never finalized. So an ordinary, successfully-delivered 40-pair
+ * squash sits in a file that ages past 7 days on the COMMON path, and the old code counted its group line as a
+ * fresh discard: a real server stored all 40, and a week later `status` announced 40 pairs "discarded after 7
+ * days with no acknowledgement" — a false loss report for a delivery that succeeded. A set-aside group has the
+ * SAME shape for a different reason: it was already tallied as `set_aside` at the moment `setAsideInferredGroup`
+ * ran, so counting it again here as `pruned` would double-announce the same 40 pairs under two reasons. Only a
+ * group with NEITHER mark is a genuine, newly-discovered loss — never offered, never resolved, now expired.
+ */
+function settleInferred(tomb, original, nowMs) {
+    let raw;
+    let mtimeMs;
+    try {
+        raw = readFileSync(tomb, "utf8");
+        mtimeMs = statSync(tomb).mtimeMs;
+    }
+    catch {
+        return { groups: 0, pairs: 0 };
+    }
+    if (!(nowMs - mtimeMs > INFERRED_PRUNE_TTL_MS)) {
+        restoreInferred(tomb, original, raw);
+        return { groups: 0, pairs: 0 };
+    }
+    rmSync(tomb, { force: true });
+    const resolved = new Set();
+    const unresolvedGroups = [];
+    for (const l of raw.split("\n")) {
+        if (l.trim() === "")
+            continue;
+        const p = parseStoredLine(l);
+        if (p === null)
+            continue;
+        if (p.kind === "delivered" || p.kind === "set_aside")
+            resolved.add(p.identity);
+        else if (p.kind === "group")
+            unresolvedGroups.push(p.group);
+    }
+    let groups = 0;
+    let pairs = 0;
+    for (const g of unresolvedGroups) {
+        if (resolved.has(identityOf(g)))
+            continue; // delivered, or already tallied as set_aside — not a new loss
+        groups += 1;
+        pairs += g.ancestors.length;
+    }
+    return { groups, pairs };
+}
+/**
+ * Prune `.inferred.jsonl` files whose mtime is more than 7 days old — the file as a whole, by the SAME rename
+ * -then-settle discipline as `pruneOrphanPending` (see that function's header for the race it narrows). Called from
+ * the Stop/SessionEnd hooks only, alongside `pruneOrphanPending`, never from `post-commit` or `status`.
+ *
+ * ⛔⛔ `pairs` is new (VL, 2026-10-08, VG's silent-loss finding): the CALLER must feed it to
+ * `recordInferredSkipped(..., "pruned", ..., pairs)` so a discard still shows up in `status` after this function's
+ * own rename-then-delete removes the file the live gauges read. `lines` (group count) is kept as `pruneExpiredInferred`
+ * already returned it and an existing test pins that shape; `pairs` is the one the tally wants.
+ */
+export function pruneExpiredInferred(home, repoKey, nowMs) {
+    let files = 0;
+    let lines = 0;
+    let pairs = 0;
+    try {
+        const dir = repoSessionsDir(home, repoKey);
+        if (dir === null)
+            return { files, lines, pairs };
+        const entries = readdirSync(dir).sort();
+        let budget = INFERRED_PRUNE_MAX_FILES;
+        for (const entry of entries) {
+            if (budget <= 0)
+                break;
+            try {
+                const t = INFERRED_TOMBSTONE.exec(entry);
+                if (t !== null) {
+                    if (nowMs - Number(t[2]) <= INFERRED_TOMBSTONE_GRACE_MS)
+                        continue;
+                    budget -= 1;
+                    const n = settleInferred(join(dir, entry), join(dir, t[1]), nowMs);
+                    if (n.groups > 0) {
+                        files += 1;
+                        lines += n.groups;
+                        pairs += n.pairs;
+                    }
+                    continue;
+                }
+                if (!entry.endsWith(".inferred.jsonl"))
+                    continue;
+                const path = join(dir, entry);
+                const mtimeMs = statSync(path).mtimeMs;
+                if (!(nowMs - mtimeMs > INFERRED_PRUNE_TTL_MS))
+                    continue;
+                budget -= 1;
+                const tomb = `${path}.expired-${nowMs}`;
+                renameSync(path, tomb);
+                const n = settleInferred(tomb, path, nowMs);
+                if (n.groups > 0) {
+                    files += 1;
+                    lines += n.groups;
+                    pairs += n.pairs;
+                }
+            }
+            catch {
+                /* one unreadable entry must not stop the pass */
+            }
+        }
+    }
+    catch {
+        /* never throw from a hook */
+    }
+    return { files, lines, pairs };
 }
 // ---------------------------------------------------------------------------
 // ⭐ TODOS[169] — the DANGLING INTERMEDIATE of an interactive-rebase squash.

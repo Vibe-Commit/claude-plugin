@@ -36,8 +36,10 @@ import { EXIT } from "../exit.js";
 import { DEFAULT_AGENT_ID, dialectFor } from "../agents/registry.js";
 import { isProjectAllowed } from "../consent.js";
 import { gitProbe, headRef } from "../git.js";
+import { detectSquash } from "../inferred_squash.js";
+import { recordInferredSkipped } from "../inferred_tally.js";
 import { resolveProjectKeys } from "../project.js";
-import { activeSessionFor, appendPending, appendSpool } from "../spool.js";
+import { activeSessionFor, appendInferred, appendPending, appendSpool } from "../spool.js";
 /**
  * Observe the commit that just happened, or do nothing.
  *
@@ -108,7 +110,8 @@ export function observe(ctx) {
     // carry it. `.pending.jsonl` gives it different retention without touching that
     // truncation rule, whose `count`-not-`shas.length` semantics are load-bearing.
     const write = active.attribution === "env_session_uncorroborated" ? appendPending : appendSpool;
-    return write(ctx.home, { repoKey: toplevel, sessionId: active.sessionId }, {
+    const sessionKey = { repoKey: toplevel, sessionId: active.sessionId };
+    const wrote = write(ctx.home, sessionKey, {
         sha: head.sha,
         branch: head.branch,
         at: committedAt(toplevel),
@@ -126,6 +129,22 @@ export function observe(ctx) {
         // with the start of the turn being delivered (the first unsent prompt-like transcript record). Not the committer time above, which is settable.
         ...(active.attribution === "env_session_uncorroborated" ? { observedAt: Date.now() } : {}),
     });
+    // ⭐ `TODOS[177]` — A SQUASH BY `reset --soft` FIRES NO `post-rewrite`, so the pairs are INFERRED here, from the reflog + ancestry +
+    // tree + patch-id (see `inferred_squash.ts`; all five conditions or nothing). They go to the session's INFERRED spool — a file of their
+    // own, delivered on `x-rewrites-inferred`, NEVER merged into the exact `x-rewrites` spool. The session is the one the ladder just chose
+    // (the rung itself is not consulted, as in `post_rewrite.ts`: a pair relates two shas and claims nothing about who made them).
+    // ⚠ After the commit line is written and in its own guard: an inference that throws must not cost the commit it was made for.
+    try {
+        const squash = detectSquash(toplevel, head);
+        appendInferred(ctx.home, sessionKey, squash.pairs);
+        // A squash that WAS detected but the contract cannot carry (over 64 commits; a sha256 repository) is counted, never silently dropped.
+        if (squash.skipped !== null)
+            recordInferredSkipped(ctx.home, toplevel, squash.skipped);
+    }
+    catch {
+        // silence is the contract
+    }
+    return wrote;
 }
 /**
  * The committing session's own id, or null.
@@ -147,9 +166,9 @@ export function observe(ctx) {
 function envSessionId(env) {
     return dialectFor(DEFAULT_AGENT_ID).sessionIdFromEnv(env);
 }
-/** git's own `%cI` — strict ISO-8601, the committer date. */
+/** git's own `%cI` — strict ISO-8601, the committer date. `--no-show-signature`: see `inferred_squash.ts`'s reflog read for why. */
 function committedAt(dir) {
-    const out = gitProbe(dir, ["log", "-1", "--format=%cI"]);
+    const out = gitProbe(dir, ["log", "--no-show-signature", "-1", "--format=%cI"]);
     return out === null ? "" : out.trim();
 }
 /**

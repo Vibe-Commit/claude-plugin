@@ -30,8 +30,10 @@ import { loadCredential, savedCredentialExists } from "../credential.js";
 import { EXIT } from "../exit.js";
 import { resolveRepoSlug } from "../git.js";
 import { emitJson } from "../json.js";
+import { readInferredSkipped } from "../inferred_tally.js";
 import { readPruneTally } from "../pending_prune.js";
 import { resolveProjectKeys } from "../project.js";
+import { inferredUnacknowledgedForRepo } from "../spool.js";
 import { commitsWaitingForRepo, heldAtEndForRepo, lastReceiptForRepo, lastSendForRepo, openTailForRepo, writtenOffForRepo, } from "../state.js";
 import { LABEL_GUTTER, WRAP_COLUMNS, glyph, labelled, paint, renderErrorBlock, tildePath, truncatePath, wrap, } from "../term.js";
 import { writeLines } from "./context.js";
@@ -76,6 +78,14 @@ export function status(ctx, argv = []) {
     const waiting = commitsWaitingForRepo(ctx.home, projectKey, ctx.now().getTime());
     // `TODOS[175]`: counts of orphan waiting lines discarded in the last 7 days (null = none).
     const discarded = readPruneTally(ctx.home, projectKey, ctx.now().getTime());
+    // `TODOS[177]`: squashes made by `git reset --soft` that were detected but could not be linked (null = none in the last 7 days).
+    const inferredSkipped = readInferredSkipped(ctx.home, projectKey, ctx.now().getTime());
+    // `TODOS[177]` follow-up: inferred pairs spooled right now, waiting on an ack that has not (yet) confirmed them.
+    const inferredUnacknowledged = inferredUnacknowledgedForRepo(ctx.home, projectKey);
+    // ⛔ NO `inferredSetAsideForRepo` LIVE GAUGE HERE (VL, 2026-10-08, VG's double-count finding, item (b)): it read
+    // the SAME information `inferred_skipped.set_aside` already tallies durably, producing two JSON keys and two
+    // sentences for one event. The tally is the ONE source of truth now; `inferredUnacknowledged` above stays,
+    // since "still waiting" and "the server gave up" are two different facts.
     const receipt = lastReceiptForRepo(ctx.home, projectKey);
     const kind = on && writtenOff.gaps === 0 && heldAtEnd.bytes === 0 && openTail.ids.length === 0 ? "ok" : "warn";
     const lines = [
@@ -135,6 +145,13 @@ export function status(ctx, argv = []) {
             commits_waiting: waiting,
             // `TODOS[175]`. Always an object, zeros included. ⛔ A contract change, recorded in `json-read-verbs.test.ts`.
             discarded_stale: { lines: discarded?.lines ?? 0, files: discarded?.files ?? 0 },
+            inferred_skipped: {
+                oversize: inferredSkipped?.oversize ?? 0,
+                sha256: inferredSkipped?.sha256 ?? 0,
+                set_aside: inferredSkipped?.set_aside ?? 0,
+                pruned: inferredSkipped?.pruned ?? 0,
+            },
+            inferred_unacknowledged: inferredUnacknowledged,
             open_tail: { sessions: openTail.ids.length, ids: openTail.ids },
         });
         return on ? EXIT.ok : EXIT.notConnected;
@@ -166,6 +183,12 @@ export function status(ctx, argv = []) {
     }
     else if (waiting > 0) {
         lines.push("", ...wrap(STATUS.commitsWaiting(waiting), 2));
+    }
+    if (inferredSkipped !== null) {
+        lines.push("", ...wrap(STATUS.inferredSkipped(inferredSkipped.oversize, inferredSkipped.sha256, inferredSkipped.set_aside, inferredSkipped.pruned), 2));
+    }
+    if (inferredUnacknowledged > 0) {
+        lines.push("", ...wrap(STATUS.inferredUnacknowledged(inferredUnacknowledged), 2));
     }
     if (discarded !== null && discarded.lines > 0) {
         lines.push("", ...wrap(STATUS.discardedStale(discarded.lines), 2));

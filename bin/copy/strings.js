@@ -146,6 +146,35 @@ export const STATUS = {
      */
     discardedStale: (lines) => `${lines} waiting commit ${lines === 1 ? "line" : "lines"} older than 7 days ${lines === 1 ? "was" : "were"} ` +
         `discarded (no session claimed ${lines === 1 ? "it" : "them"}).`,
+    /**
+     * `TODOS[177]` — squash pairs made with `git reset --soft` that were detected but never ended up recorded by the
+     * server. `oversize`/`sha256` are never-spooled SQUASHES: more than 64 commits folded (the server's per-request
+     * ceiling; a partial set of links is worse than none) or a sha256 repository (the server reads 40-hex only).
+     * `set_aside`/`pruned` (VL, 2026-10-08, VG's silent-loss finding) are PAIRS that WERE spooled, at least once sent,
+     * and never fully recorded: given up on after too many short acks, or discarded by the 7-day prune. All four are
+     * COUNTS only, shown for up to 7 days after the last one — a skipped link is not a non-event.
+     */
+    inferredSkipped: (oversize, sha256, setAside, pruned) => {
+        const squashes = (n, why) => `${n} ${n === 1 ? "squash" : "squashes"} made with git reset could not be linked (${why}).`;
+        const pairs = (n, why) => `${n} ${n === 1 ? "pair" : "pairs"} from a squash made with git reset ${n === 1 ? "was" : "were"} ${why}.`;
+        return [
+            oversize > 0 ? squashes(oversize, "more than 64 commits") : "",
+            sha256 > 0 ? squashes(sha256, "a sha256 repository") : "",
+            setAside > 0 ? pairs(setAside, "given up on and discarded (the server kept acknowledging less than was sent)") : "",
+            pruned > 0 ? pairs(pruned, "discarded after 7 days with no acknowledgement") : "",
+        ].filter((x) => x !== "").join(" ");
+    },
+    /**
+     * `TODOS[177]` follow-up (VG pre-review, 2026-10-08) — inferred pairs spooled right now, waiting on the
+     * server's per-request ack (`x-rewrites-inferred-stored`) that has not yet confirmed them: an absent, short,
+     * or mismatched ack keeps a group for the next hook rather than dropping it on a 2xx alone. A live count, not
+     * a 7-day tally — it falls as soon as a later hook's ack confirms them.
+     */
+    inferredUnacknowledged: (n) => n === 0 ? "" : `${n} ${n === 1 ? "pair" : "pairs"} from a squash made with git reset ${n === 1 ? "is" : "are"} spooled, waiting for the server to confirm them.`,
+    // ⛔ NO `inferredSetAside` SENTENCE HERE (VL, 2026-10-08, VG's double-count finding, item (b)): it duplicated the
+    // `inferredSkipped` sentence's `set_aside` clause above — same pairs, two sentences. Removed, not kept dead:
+    // nothing in `status.ts` calls it any more, and a copy function with no caller is the thing this package's own
+    // dead-symbols gate exists to catch.
     fixCommandLabel: "To reconnect, run",
     /** §10.3's two trailing actions, rendered as an aligned pair. */
     turnOffLabel: "Turn capture off for this repo",
@@ -261,7 +290,7 @@ export const CONNECT = {
      * truth. Repairing the scope where a skimmer meets it; the heading itself is a
      * bigger copy change than this task was scoped for.
      */
-    consentCommits: "Not only the transcript. Commits you make while a session is recording are uploaded too: the commit ID, the branch name, the session it was linked to, and how that link was made. If you amend or rebase, the ID of the commit you replaced goes with them — that commit may never have left this machine, and git will eventually delete it from here.",
+    consentCommits: "Not only the transcript. Commits you make while a session is recording are uploaded too: the commit ID, the branch name, the session it was linked to, and how that link was made. If you amend, rebase, or squash with git reset, the ID of the commit you replaced goes with them — that commit may never have left this machine, and git will eventually delete it from here. A squash made with git reset also sends a hash of the combined change.",
     /** §10.2's first labelled link. Points at `HELP.docsUrl` — one definition. */
     consentDocsLabel: "Read the full list:",
     /**
@@ -1156,6 +1185,13 @@ export const FINALIZE = {
     refused: "The server declined to close the session on this attempt. Run the command again.",
     notDelivered: "Could not deliver the session. Nothing was closed. Run the command again.",
     credentialStopped: "VibeCommit stopped sending for this credential. Run `vibecommit auth` to replace it.",
+    /**
+     * `TODOS[177]` follow-up (VL, 2026-10-08, VG's silent-loss finding) — ONE stderr line for the whole run when
+     * `finalize` sets any inferred-squash pairs aside (the main delivery, the drain loop, or both, summed). Printed
+     * alongside the normal `closed(id)`/`alreadyClosed(id)` stdout line, never instead of it: finalize still closed
+     * the session successfully, and this is a separate, narrower fact about the inferred-squash spool specifically.
+     */
+    inferredSetAside: (n) => `${n} inferred-squash ${n === 1 ? "pair" : "pairs"} ${n === 1 ? "was" : "were"} given up on: the server kept acknowledging less than was sent.`,
 };
 export const ERRORS = {
     notConnected: "This repository is not connected. Run `vibecommit connect`.",

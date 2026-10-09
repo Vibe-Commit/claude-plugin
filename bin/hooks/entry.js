@@ -51,8 +51,9 @@ import { announcedSubagentFileKey, isInsideAny, subagentFileKey, subagentsDir, }
 import { resolveProjectKeys } from "../project.js";
 import { startSpawnBudget } from "../spawn_budget.js";
 import { turnStart } from "../pending_bound.js";
+import { recordInferredSkipped } from "../inferred_tally.js";
 import { pruneOrphanPending } from "../pending_prune.js";
-import { capSpool, capSuccessors, pendingModeFor, promotePending, readPending, readRewrites, readSpool } from "../spool.js";
+import { capInferred, capSpool, capSuccessors, pendingModeFor, promotePending, pruneExpiredInferred, readInferred, readPending, readRewrites, readSpool } from "../spool.js";
 import { meetsNodeFloor } from "../runtime.js";
 import { renderNotice } from "../system_message.js";
 /**
@@ -91,7 +92,7 @@ export function sendTimeoutMs(budgetMs, consumedMs) {
     return Math.max(MIN_SEND_TIMEOUT_MS, Math.floor(remaining * SEND_BUDGET_FRACTION));
 }
 /** A promise that resolves after `ms`. The one clock the settle path needs. */
-function wait(ms) {
+export function wait(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 /**
@@ -664,13 +665,25 @@ async function hookBody(ctx, budgetMs, hookStartedAt) {
     // repo for pending files nobody can claim any more (older than 7 days; see `pending_prune.ts` for the rule, the tombstone race and
     // the counts-only tally `status` announces). Stop and SessionEnd ONLY: never `post-commit` (it runs under git, on the commit
     // path) and never `status` (readers stay read-only). Cheap (one readdir, at most 50 files) and it never throws.
-    if (event === "Stop" || isSessionEnd)
+    if (event === "Stop" || isSessionEnd) {
         pruneOrphanPending(ctx.home, projectKey, Date.now());
+        // `TODOS[177]` follow-up (VL, 2026-10-08, item 5): `.inferred.jsonl` gets the same 7-day sweep.
+        //
+        // ⛔⛔ THE RETURN VALUE IS NOT DISCARDED (VL, 2026-10-08, VG's silent-loss finding, G1: a mutant that makes this
+        // call a no-op SURVIVED all 57 tests, because the function was tested in isolation but nothing here checked it
+        // was actually WIRED). `pairs` is fed to the same durable tally `set_aside` uses, before the sweep's own
+        // tombstone-delete removes the file `status`'s live gauge would otherwise have read.
+        const prunedInferred = pruneExpiredInferred(ctx.home, projectKey, Date.now());
+        if (prunedInferred.pairs > 0)
+            recordInferredSkipped(ctx.home, projectKey, "pruned", Date.now(), prunedInferred.pairs);
+    }
     const spooled = capSpool(readSpool(ctx.home, spoolKey));
     // ⛔ REWRITES ARE THEIR OWN FILE WITH THEIR OWN CAP (`T5`). The units differ —
     // 41 bytes for a sha, 82 for an `ancestor:successor` pair — so one constant
     // sized against the other would make one of the two headers wrong.
     const rewritten = capSuccessors(readRewrites(ctx.home, spoolKey));
+    // `TODOS[177]` — INFERRED squash pairs: their own file, their own cap, their own header (`x-rewrites-inferred`), never `x-rewrites`.
+    const inferred = capInferred(readInferred(ctx.home, spoolKey));
     // ⛔ THE REDACTION BOUNDARY, and it is NOT the consent key (`D184 §3`).
     // Resolved here rather than at the gate so the derivation's one spawn is not
     // paid by the invocations that return above without reading a byte.
@@ -711,6 +724,8 @@ async function hookBody(ctx, budgetMs, hookStartedAt) {
         // number for that and passing the pieces separately is how they diverge.
         commits: spooled,
         rewrites: rewritten.pairs,
+        inferredRewrites: inferred.pairs,
+        inferredGroups: inferred.groups,
     }, eof, 
     // ⛔ THE ROOT SET, AND IT IS NOT THE VALUE THE CONSENT GATE APPROVED.
     // Those were one value until `D184`, and this line is where the difference

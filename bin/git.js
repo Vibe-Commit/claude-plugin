@@ -326,6 +326,22 @@ export function isReachable(dir, sha, ref) {
  */
 export function gitPatchId(dir, ref) {
     const diff = gitProbe(dir, ["diff-tree", "-p", "--root", "--no-color", "--no-ext-diff", ref]);
+    return patchIdOfDiff(dir, diff);
+}
+/**
+ * The `git patch-id` of the diff between two TREES-ish — `TODOS[177]`. The same plumbing, the same flags and the same hashing as
+ * `gitPatchId`, so `gitRangePatchId(B, T)` and `gitPatchId(F)` are comparable byte for byte: for an inferred squash `F` the two
+ * diffs are the SAME diff (`parent(F) == B`, `tree(F) == tree(T)`), which is the evidence the inferred header stores.
+ *
+ * ⚠ `diff-tree -p`, not porcelain `git diff` / `git show`: a developer's `diff.noprefix`, `diff.renames` or `diff.mnemonicPrefix`
+ * configures the porcelain and would change the bytes being hashed on that machine only. NULL when the diff is empty (two
+ * identical trees have no patch-id) or git cannot answer.
+ */
+export function gitRangePatchId(dir, from, to) {
+    const diff = gitProbe(dir, ["diff-tree", "-p", "--no-color", "--no-ext-diff", from, to]);
+    return patchIdOfDiff(dir, diff);
+}
+function patchIdOfDiff(dir, diff) {
     // ⚠ An empty diff is NOT a failure — it is a merge, or an empty commit. Both
     // are "no patch id exists", which is the same answer as "we could not ask".
     if (diff === null || diff.trim() === "")
