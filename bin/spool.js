@@ -748,37 +748,9 @@ export function readInferred(home, key) {
     }
     return out;
 }
-/**
- * How many inferred pairs this REPO has spooled right now, across every session, waiting on an ack that has not
- * (yet) come back `n == sent` (VL, 2026-10-08: "count it in status, e.g. `inferred_unacknowledged`"). A live gauge,
- * not a cumulative tally like `inferred_tally.ts`'s oversize/sha256 — a pair stops counting the moment it is
- * acknowledged, same as `commitsWaitingForRepo`'s shape for the exact-commit spool.
- */
-export function inferredUnacknowledgedForRepo(home, repoKey) {
-    const dir = repoSessionsDir(home, repoKey);
-    if (dir === null)
-        return 0;
-    let entries;
-    try {
-        entries = readdirSync(dir);
-    }
-    catch {
-        return 0;
-    }
-    let n = 0;
-    for (const entry of entries) {
-        if (!entry.endsWith(".inferred.jsonl"))
-            continue;
-        const sessionId = entry.slice(0, -".inferred.jsonl".length);
-        try {
-            n += readInferred(home, { repoKey, sessionId }).length;
-        }
-        catch {
-            /* one unreadable session file must not stop the count */
-        }
-    }
-    return n;
-}
+// ⛔ `inferredUnacknowledgedForRepo` MOVED TO `state.ts` (`TODOS[182]`): it now needs `FileState.lean`
+// (`SessionState`'s own domain) to exclude a lean session's pairs, and `spool.ts` cannot import `state.ts`
+// without a cycle — `state.ts` already imports several read/cap functions from this file.
 /**
  * Mark groups DELIVERED, by identity — never by position. Called ONLY after the server's 2xx AND its per-request ack
  * (`x-rewrites-inferred-stored`) confirms every pair of every named group actually landed. An append-only tombstone

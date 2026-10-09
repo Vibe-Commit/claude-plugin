@@ -240,7 +240,15 @@ export async function finalize(ctx, argv) {
         // the identity of the group that was short-acked on the PREVIOUS iteration and how many times in a row.
         let backoffGroupId = null;
         let backoffStreak = 0;
-        for (let i = 0; i < FINALIZE_DRAIN_MAX_ITERATIONS; i += 1) {
+        // ⛔⛔ `TODOS[182]` — SKIP THE DRAIN LOOP ENTIRELY WHILE `lean`. Read fresh: the main `deliver()` call above
+        // may have just SET it (a 431 mid-seal, retried in-process per `post.ts`'s own `deliver()` docblock). The
+        // drain loop exists only to flush `x-rewrites`/`x-rewrites-inferred` — exactly two of the five headers a
+        // lean request drops — so while lean it has structurally nothing to send; running it anyway would make up
+        // to `FINALIZE_DRAIN_MAX_ITERATIONS` pointless empty-list requests, with the backoff delays above making
+        // each one slower rather than faster to give up on (the ack is an explicit `0`, never `null`, so the
+        // existing "absent ack, stop asking" guard below never fires either).
+        const lean = fileState(loadSessionState(ctx.home, spoolKey), "main").lean;
+        for (let i = 0; !lean && i < FINALIZE_DRAIN_MAX_ITERATIONS; i += 1) {
             const moreRewritten = capSuccessors(readRewrites(ctx.home, spoolKey));
             const moreInferred = capInferred(readInferred(ctx.home, spoolKey));
             if (moreRewritten.pairs.length === 0 && moreInferred.pairs.length === 0)

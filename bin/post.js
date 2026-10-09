@@ -20,6 +20,7 @@
 import { createHash } from "node:crypto";
 import { agentForTranscript } from "./agents/registry.js";
 import { UNKNOWN_AGENT_ID } from "./agents/types.js";
+import { headerSafe, sessionIdSafe } from "./header_safety.js";
 import { recordInferredSkipped } from "./inferred_tally.js";
 import { classify, markDelivered, markHeld, markSkipped, nextSpan, resolveCaps, } from "./policy.js";
 import { fileState, isStopped, loadSessionState, saveSessionState, withFileState, } from "./state.js";
@@ -59,6 +60,19 @@ export function ingestUrl(env) {
     const candidate = override.trim();
     return isAllowedIngestUrl(candidate) ? candidate : null;
 }
+/**
+ * `parseObservedHead`'s upper bound on `X-Head-Branch`, mirrored here — `TODOS[182]`.
+ *
+ * Duplicating the server's constant is deliberate, the same reason `git.ts`'s
+ * `SLUG_MAX` duplicates `REPO_SLUG_MAX`: this module cannot import across the
+ * repo boundary, and the alternative is a 431 in the field instead of an
+ * omission here. The server nulls, never truncates, a branch over this bound
+ * — it has a matching check of its own one layer further down, is why.
+ *
+ * @provenance vibecommit-mcp src/conversation/ingest_session.ts — `parseObservedHead`,
+ * `trimmed.length > 255 ? null : trimmed`, read
+ */
+const MAX_HEAD_BRANCH_LENGTH = 255;
 /**
  * Build the request headers.
  *
@@ -126,10 +140,25 @@ export function buildIngestHeaders(credential, delta) {
     // ⚠ OMITTED, never sent empty. A blank header is a value the server has to
     // have an opinion about; an absent one is unambiguously "nothing to say", and
     // an empty repository genuinely has nothing to say here.
+    //
+    // ⛔⛔ `TODOS[182]` — OMITTED, NEVER TRUNCATED, above `MAX_HEAD_BRANCH_LENGTH`
+    // or on an unsendable byte. The server already nulls a branch over its own
+    // 255-char limit (`parseObservedHead`, mirrored below) and takes the existing
+    // detached-HEAD path for it — no ref move, `last_head_sha` untouched — so
+    // omitting here changes nothing downstream; a TRUNCATED prefix could
+    // coincidentally equal a different, real, SHORTER branch and mint a wrong,
+    // PERMANENT `repository_ref_moves` row (`reject_history_mutation` refuses an
+    // UPDATE). And a branch is the one field in this function built from
+    // arbitrary git ref bytes rather than a wire-fixed shape, so it is the one
+    // that needs `headerSafe`: a character above U+00FF or a bare LF/CR here
+    // throws the SAME `TypeError` a real network outage does (`header_safety.ts`),
+    // and the 255 cap alone does not catch `功能/登录` (13 bytes).
     if (delta.head != null) {
         headers["x-head-sha"] = delta.head.sha;
-        if (delta.head.branch !== null)
-            headers["x-head-branch"] = delta.head.branch;
+        const branch = delta.head.branch;
+        if (branch !== null && branch.length <= MAX_HEAD_BRANCH_LENGTH && headerSafe(branch)) {
+            headers["x-head-branch"] = branch;
+        }
     }
     // ⛔⛔ THE WIRE CONTRACT, AND EVERY WAY OF GETTING IT WRONG IS SILENT IN BOTH
     // DIRECTIONS (`D190`). Three header names and two separators, agreed between
@@ -172,6 +201,73 @@ export function buildIngestHeaders(credential, delta) {
         headers["x-rewrites-inferred"] = delta.inferredRewrites.join(",");
     }
     return headers;
+}
+/**
+ * ⛔⛔ `TODOS[182]` — THE FIVE, AND EXACTLY THE FIVE. `lean` is defined by
+ * SUBTRACTION from this set, never by an allow-list: an earlier draft of this
+ * fix hand-picked which headers to KEEP and silently dropped `content-type` /
+ * `content-encoding` (the server could no longer parse the zstd body) and
+ * `x-agent` (a lean FIRST delta would pin `unknown` forever under STICKY
+ * `lean` — `UNKNOWN_AGENT_ID`'s own docblock above). A deny-list fails SAFE:
+ * anything not named here defaults to "stays", and the only headers worth
+ * dropping are the ones whose SIZE is unbounded by a count cap — a branch name
+ * and the four list headers. `leanHeaders` is tested by SET EQUALITY against
+ * `buildIngestHeaders`'s full output, never by eyeballing an allow-list.
+ */
+export const LEAN_OMIT_HEADERS = new Set([
+    "x-head-branch",
+    "x-commits",
+    "x-commit-attributions",
+    "x-rewrites",
+    "x-rewrites-inferred",
+]);
+/**
+ * The lean (deny-list) reduction of a full header set — `TODOS[182]`.
+ *
+ * Takes the FULL object `buildIngestHeaders` would already build from the real
+ * delta — real branch, real commits, real rewrites — and removes exactly
+ * `LEAN_OMIT_HEADERS`. Never built the other way around (a delta with its
+ * list fields pre-blanked): that would make "lean" whatever
+ * `buildIngestHeaders`'s conditionals happen to gate on today, which is the
+ * allow-list failure mode this function exists to avoid repeating.
+ */
+function leanHeaders(full) {
+    const reduced = {};
+    for (const [name, value] of Object.entries(full)) {
+        if (!LEAN_OMIT_HEADERS.has(name))
+            reduced[name] = value;
+    }
+    return reduced;
+}
+/**
+ * The first header whose value fails the shared predicate, or `null` if every
+ * one is sendable — `TODOS[182]`.
+ *
+ * `x-head-branch` can never be the header this returns: `buildIngestHeaders`
+ * already omits it unless it is both within `MAX_HEAD_BRANCH_LENGTH` and
+ * `headerSafe`. So anything this function still finds, by elimination, is one
+ * of the REQUIRED headers — there is no second optional one to drop.
+ */
+function firstUnsafeHeader(headers) {
+    for (const [name, value] of Object.entries(headers)) {
+        if (!headerSafe(value))
+            return name;
+    }
+    return null;
+}
+/**
+ * The backstop (`TODOS[182]`, step 4 of the design): `new Headers()` in its
+ * own try, after the explicit predicate already passed, before `fetch` ever
+ * sees the object. Never the primary check — see `header_safety.ts`.
+ */
+function headersConstructible(headers) {
+    try {
+        new Headers(headers);
+        return true;
+    }
+    catch {
+        return false;
+    }
 }
 /**
  * The wire's error code for org-approval-pending — `CR-128`, D81.
@@ -321,12 +417,104 @@ function parseFinalAck(raw) {
     return v === "sealed" || v === "already" || v === "refused" ? v : null;
 }
 /**
+ * Build the delta, reduce it to the deny-list set when `lean`, validate every
+ * resulting header value, and only then call `send()` — `TODOS[182]`.
+ *
+ * `x-head-branch` can never be the `header` an "unsafe" result names:
+ * `buildIngestHeaders` already omits it unless it is both within
+ * `MAX_HEAD_BRANCH_LENGTH` and `headerSafe`. So a `header-unsafe` result here,
+ * by elimination, always names a REQUIRED header — there is no second
+ * optional one for the caller to drop.
+ */
+async function attemptSend(ctx, agent, seq, span, body, lean) {
+    const full = buildIngestHeaders(ctx.credential, {
+        sessionId: ctx.sessionId,
+        seq,
+        byteOffset: span.from,
+        fileKey: ctx.fileKey,
+        repoSlug: ctx.repoSlug,
+        agent,
+        final: ctx.final === true,
+        head: ctx.head,
+        commits: ctx.commits,
+        rewrites: ctx.rewrites,
+        inferredRewrites: ctx.inferredRewrites,
+    });
+    const headers = lean ? leanHeaders(full) : full;
+    const badHeader = firstUnsafeHeader(headers);
+    if (badHeader !== null)
+        return { kind: "unsafe", header: badHeader };
+    // The backstop: nothing named it, but `Headers()` still refuses. Cannot be
+    // attributed to a specific header from here, so it is reported the same way
+    // a non-`authorization` failure is below — a general refusal, never `fatal`
+    // on a guess.
+    if (!headersConstructible(headers))
+        return { kind: "unsafe", header: "" };
+    return { kind: "sent", outcome: await send(ctx.url, headers, body, ctx.timeoutMs) };
+}
+/**
+ * A pre-send refusal: the header that failed never reached `fetch`, so there
+ * is no `SendOutcome` to classify — `TODOS[182]`.
+ *
+ * `disposition: "fatal"` is for `authorization` specifically (a byte-invalid
+ * credential is a credential-class problem, not a payload-class one, the
+ * exact reasoning a 401 already gets): `markHeld`, never `markSkipped`,
+ * because these bytes are fine and a reconnected user should still get them.
+ * Every other required header takes `"never"` — the loud-refusal path a 400
+ * or 413 already gets, so a bad session id is exactly as visible in `status`
+ * as those are, never a new, differently-silent no-op.
+ *
+ * ⚠ **This `authorization` branch is unreachable via any real CLI path today, verified rather than
+ * assumed.** `credential.ts`'s `loadCredential` already rejects anything that would fail `headerSafe` (the
+ * same predicate `attemptSend` runs here), and `"Bearer " + secret` cannot become unsafe from a safe secret —
+ * a safe ASCII prefix added to a safe string is still safe. So `headerSafe(secret)` at load time and
+ * `headerSafe(authorization)` here always agree, and the real first line of defense is `credential.ts`'s,
+ * never this one — which is kept anyway as the backstop for a FUTURE credential source that might bypass
+ * that loader.
+ *
+ * `lean` is an explicit parameter, never read off `current`, because the ONE
+ * caller that can reach this mid-transition (a `finalize` lean retry whose
+ * OWN headers somehow still failed — unreachable in practice, since lean
+ * headers are already proven safe, but stated rather than assumed) must
+ * persist `lean: true` going forward, which `current.lean` would not yet say.
+ */
+function refuse(ctx, key, session, current, span, caps, disposition, lean) {
+    const next = disposition === "fatal"
+        ? {
+            ...withFileState(session, ctx.fileKey, { ...markHeld(current, span, ctx.nowMs, caps), lean }),
+            stop: { at: new Date(ctx.nowMs).toISOString(), fingerprint: credentialFingerprint(ctx.credential) },
+        }
+        : withFileState(session, ctx.fileKey, { ...markSkipped(current, span.from, span.to), lean });
+    saveSessionState(ctx.home, key, next);
+    return { kind: "attempted", disposition, detail: null, finalAck: null, inferredStored: null, inferredSetAsidePairs: 0 };
+}
+/**
+ * The first 431 on a HOOK's attempt: hold the span (not `never` yet — the
+ * bytes may still be sendable, just not with these headers) and set `lean`
+ * STICKY for every attempt after this one, on this file, for the rest of the
+ * session — `TODOS[182]`.
+ *
+ * D56 §D8 forbids a synchronous retry inside a hook, so the lean retry itself
+ * waits for the NEXT hook invocation, which re-enters `deliver()` and reads
+ * `current.lean === true` from the top. `deliver()`'s own 431 branch below
+ * explains why `finalize` (no "next hook" to defer to) instead retries
+ * in-process, within the same call.
+ */
+function holdLean(ctx, key, session, current, span, caps) {
+    const next = withFileState(session, ctx.fileKey, { ...markHeld(current, span, ctx.nowMs, caps), lean: true });
+    saveSessionState(ctx.home, key, next);
+    return { kind: "attempted", disposition: "later", detail: null, finalAck: null, inferredStored: null, inferredSetAsidePairs: 0 };
+}
+/**
  * Send the undelivered span of one transcript file and apply the failure policy.
  *
- * **Exactly one attempt, ever.** `later` does not retry here; it leaves the
- * offset where it is so the hook that fires on the NEXT turn picks the same
- * bytes up. A loop in this function would reopen D56 plan §D8, the founder
- * override that says a hook must never block or slow a developer's turn.
+ * **At most one NETWORK attempt per hook, still — exactly D56 §D8's rule.** A
+ * `finalize` lean retry (below) is the one exception D56 §D8 itself does not
+ * cover: it governs HOOKS, and `finalize` is a synchronous, user-invoked verb
+ * that already makes 1 + up to `FINALIZE_DRAIN_MAX_ITERATIONS` requests by
+ * design (VL's explicit ruling, `TODOS[182]`). On the hook path, `later` still
+ * does not retry here; it leaves the offset where it is so the hook that fires
+ * on the NEXT turn picks the same bytes up.
  *
  * Never throws: the caller is a hook, and an exception on this path is the
  * contract breaking. Every failure resolves to a `Delivery`.
@@ -360,34 +548,101 @@ export async function deliver(ctx, eof, readBody) {
     const body = readBody(span.from, span.to);
     if (body === null)
         return { kind: "nothing-to-send" };
-    // `seq` is claimed BEFORE the attempt and persisted regardless of outcome, so
-    // it is monotonic per session across retries. A seq reused after a failure
-    // would read server-side as a replay of a delta that is not the same bytes.
-    const seq = session.seq + 1;
-    const outcome = await send(ctx.url, buildIngestHeaders(ctx.credential, {
-        sessionId: ctx.sessionId,
-        seq,
-        byteOffset: span.from,
-        fileKey: ctx.fileKey,
-        repoSlug: ctx.repoSlug,
-        // ⛔ THE ONE PLACE THE WIRE AGENT IS DECIDED — from the containing
-        // registry root, never from the flag (D177 §7). Per delivery rather than
-        // per hook: a delegated stream is a file in its own right, and the root
-        // that contains it is what names its producer.
-        agent: agentForTranscript(ctx.home, ctx.env, ctx.transcriptPath),
-        final: ctx.final === true,
-        head: ctx.head,
-        commits: ctx.commits,
-        rewrites: ctx.rewrites,
-        inferredRewrites: ctx.inferredRewrites,
-    }), body, ctx.timeoutMs);
-    const disposition = classify(outcome);
     const caps = resolveCaps(ctx.env);
+    // `seq` is claimed BEFORE the attempt and persisted by the SWITCH below (every ordinary disposition —
+    // "ok"/"later"/"never"/"fatal" — builds `next` from `{ ...session, seq, … }`), so it is monotonic per
+    // session across retries once a request was actually classified. A seq reused after a failure would read
+    // server-side as a replay of a delta that is not the same bytes.
+    //
+    // ⚠ `refuse()` and `holdLean()` below do NOT persist it — they build `next` from `session` alone, so a
+    // pre-send refusal or a hook's first hold leaves `session.seq` exactly where it was. That is harmless: a
+    // request classified `refuse`/`holdLean` never reached `send()` at all (a bad session id, an unsafe
+    // credential, or the first 431 a hook defers on), so the server never saw THIS seq either — reusing it on
+    // the next real attempt is not a replay of anything, because nothing was sent under it.
+    //
+    // Claimed ONCE even across a `finalize` lean retry below: both attempts, if there are two, carry the same
+    // bytes at the same offset, so they are one logical delivery that happened to need its headers shed, not two.
+    const seq = session.seq + 1;
+    // ⛔ THE ONE PLACE THE WIRE AGENT IS DECIDED — from the containing registry
+    // root, never from the flag (D177 §7). Computed once per `deliver()` call,
+    // reused across a lean retry, so a retry never pays a second filesystem
+    // lookup for an answer that cannot have changed between two attempts
+    // milliseconds apart.
+    const agent = agentForTranscript(ctx.home, ctx.env, ctx.transcriptPath);
+    // ⛔⛔ `TODOS[182]` — `X-Session-Id` HAS NO BOUND ANYWHERE ELSE ON THE HOOK
+    // PATH. The server 400s an id over its own `SESSION_ID_MAX` (200), and 400 is
+    // already `never` — so an over-LONG id was never silently retried. The GAP is
+    // charset: a byte above `\x7E` here throws the SAME `TypeError` a real
+    // network outage does (`header_safety.ts`), which `classify`'s `unreachable`
+    // branch would fold into `later` and retry FOREVER. Checked before anything
+    // else: a bad id can never be sent no matter what the rest of the delta looks
+    // like, so there is nothing to gain by building headers around it first.
+    if (!sessionIdSafe(ctx.sessionId)) {
+        return refuse(ctx, key, session, current, span, caps, "never", current.lean);
+    }
+    // `lean` is STICKY (VL's ruling, `TODOS[182]`): once `current.lean` is true,
+    // THIS attempt — and every attempt after it, for this file, for the rest of
+    // the session — builds the deny-list header set from the start. Not
+    // re-evaluated size or charset attempt by attempt: a flag that cleared
+    // itself whenever a smaller delta happened to fit would alternate between
+    // full and lean requests depending on what the NEXT turn happens to contain,
+    // which nobody can debug.
+    let lean = current.lean;
+    let attempt = await attemptSend(ctx, agent, seq, span, body, lean);
+    if (attempt.kind === "unsafe") {
+        return refuse(ctx, key, session, current, span, caps, attempt.header === "authorization" ? "fatal" : "never", lean);
+    }
+    let outcome = attempt.outcome;
+    // ⛔⛔ `TODOS[182]` — 431 IS NOT IN `STATUS_CLASSES` AND NEVER WILL BE: it is
+    // handled entirely by this state machine, never by the generic table.
+    // `later`'s own definition is "retry the SAME bytes next hook" — for a 431,
+    // "the same bytes" means the same HEADERS, and nothing about a later attempt
+    // changes the branch, the spooled commits or the session id that caused it.
+    // A table-driven `later` for 431 retries the identical oversized/rejected
+    // request forever: the exact stall this task exists to close.
+    if (outcome.kind === "response" && outcome.status === 431) {
+        if (lean) {
+            // Already lean and STILL 431: nothing client-side can shrink this
+            // further. `never`, exactly as 413 — the one case `never` is correct
+            // here, because it really is per-body now.
+            return refuse(ctx, key, session, current, span, caps, "never", true);
+        }
+        if (ctx.byHook) {
+            // A hook defers rather than retries — see `holdLean`'s own docblock.
+            return holdLean(ctx, key, session, current, span, caps);
+        }
+        // `finalize`: no "next hook" to defer to, and VL's explicit ruling that one
+        // in-process retry here does not reopen D56 §D8, which governs hooks. Go
+        // lean and retry ONCE, within this same invocation.
+        lean = true;
+        attempt = await attemptSend(ctx, agent, seq, span, body, lean);
+        if (attempt.kind === "unsafe") {
+            // Unreachable in practice — every lean header is already proven safe, or
+            // it would never have reached the full build either — but stated rather
+            // than assumed: refuse exactly as the first attempt would have.
+            return refuse(ctx, key, session, current, span, caps, attempt.header === "authorization" ? "fatal" : "never", lean);
+        }
+        outcome = attempt.outcome;
+        if (outcome.kind === "response" && outcome.status === 431) {
+            // The lean retry ALSO 431'd, within the SAME `finalize` invocation:
+            // `never` for the span, discovered now rather than on a next hook that
+            // does not exist for this verb.
+            return refuse(ctx, key, session, current, span, caps, "never", true);
+        }
+        // Falls through to the ordinary classification below, now with `lean`
+        // true — the `"ok"` case's accounting reads it to skip settling data this
+        // attempt never put on the wire.
+    }
+    const disposition = classify(outcome);
     let next = ctx.byHook ? { ...session, seq, liveAt: ctx.nowMs } : { ...session, seq };
     let inferredSetAsidePairs = 0;
     switch (disposition) {
         case "ok":
-            next = withFileState(next, ctx.fileKey, markDelivered(current, span.to, ctx.nowMs));
+            // `{ ...markDelivered(...), lean }` rather than relying on `markDelivered`'s own spread of `current`:
+            // `current.lean` is this file's state from BEFORE this call, so on the one path where a `finalize`
+            // retry just went lean mid-call and then succeeded, `current.lean` would still read `false` — `lean`
+            // (the local variable, updated above) is the value that must persist going forward.
+            next = withFileState(next, ctx.fileKey, { ...markDelivered(current, span.to, ctx.nowMs), lean });
             // ⭐ `TODOS[145]` — KEEP THE RECEIPT. `captureId` is non-empty when this delta sealed a capture
             // and EMPTY when it sealed nothing; the client used to stamp `lastSentAt` identically for both and
             // surface neither. MAIN stream only (a sub-agent stream seals nothing by construction and would
@@ -447,79 +702,91 @@ export async function deliver(ctx, eof, readBody) {
             // above reads as "drop". `X-Commits-Retry` is the per-sha answer, so it
             // decides line by line and the prefix drop is only the fallback for a
             // server that predates it.
-            const retry = outcome.kind === "response" ? outcome.commitsRetry : null;
-            const nothingLanded = outcome.kind === "response" && outcome.captureId === "";
-            const holdForNextDelta = nothingLanded && (ctx.commits?.shas.length ?? 0) > 0;
-            if (ctx.commits !== undefined && ctx.commits.count > 0) {
-                if (retry !== null) {
-                    settleSpooled(ctx.home, key, ctx.commits.count, new Set(retry));
-                }
-                else if (!holdForNextDelta) {
-                    dropSpooled(ctx.home, key, ctx.commits.count);
-                }
-            }
-            // The rewrite spool is its own file with its own cap, so its own drop.
             //
-            // ⛔ AND IT IS UNCONDITIONAL, UNLIKE THE COMMITS ABOVE — do not "fix" this
-            // to match. `tryRecordRewrites` on the server sits OUTSIDE the capture
-            // write and its comment says why: "Unconditional on the capture: a delta
-            // that sealed no turns still saw the rewrite, and the mapping is what
-            // keeps a squash-merged commit reachable." A `commit_sha_successors` row
-            // names no turn, so `X-Capture-Id` says nothing about whether it landed.
-            if (ctx.rewrites !== undefined && ctx.rewrites.length > 0) {
-                dropRewrites(ctx.home, key, ctx.rewrites.length);
-            }
-            // `TODOS[177]` — the INFERRED pairs have their own file and their own drop. ⛔ UNLIKE `rewrites` above, this one is
-            // CONDITIONAL on the server's per-request ack (`x-rewrites-inferred-stored`): a 2xx alone is "the delta was
-            // accepted", not "every inferred pair in it was recorded" (VG pre-review, 2026-10-08). Drop by GROUP IDENTITY,
-            // never by count — see `dropInferredGroups`'s own comment for why a count-based drop lost pairs under concurrency.
-            //
-            // ⛔⛔ PER-GROUP BOUND (VL, 2026-10-08, VG's head-of-line finding): `capInferred` sends exactly ONE group per
-            // request now, so `ctx.inferredGroups` has at most one member and the ack names it unambiguously.
-            //   stored === sent        → delivered, drop it.
-            //   stored !== null, short → a real signal from a server that saw the group and recorded fewer than all of it:
-            //                            count an attempt; after `INFERRED_SET_ASIDE_AFTER` attempts, give up on it so it
-            //                            stops blocking the group behind it.
-            //   stored === null        → an old/absent-ack server said nothing at all: "keeping is right there" — no
-            //                            attempt is counted (an attempt means a signal was RECEIVED), nothing is set aside.
-            if (ctx.inferredRewrites !== undefined && ctx.inferredRewrites.length > 0 && ctx.inferredGroups !== undefined && ctx.inferredGroups.length > 0) {
-                const group = ctx.inferredGroups[0];
-                const stored = outcome.kind === "response" ? outcome.inferredStored : null;
-                if (stored === ctx.inferredRewrites.length) {
-                    dropInferredGroups(ctx.home, key, [group]);
+            // ⛔⛔ `TODOS[182]` — EVERYTHING BELOW IS GATED ON `!lean`. A lean request's `ctx.commits` /
+            // `ctx.rewrites` / `ctx.inferredRewrites` / `ctx.inferredGroups` describe data THIS delivery never put
+            // on the wire (the deny-list dropped their headers) — dropping, settling or counting an attempt
+            // against them would discard real, unsent data. VG's measured finding: a copy of this client whose
+            // header BUILDER omitted the list headers while `ctx` was left unchanged lost a real commit (3→0) and
+            // a real rewrite (1→0) in one Stop hook, neither of which the server had ever seen. Held (never
+            // sendable, for a reason unrelated to `lean`) entries are UNAFFECTED by this gate: they are consumed
+            // only via a NORMAL, non-lean call's `capSpool`/`capSuccessors`/`capInferred`, which this gate does not
+            // touch, so a lean session's held lines still drain exactly as soon as a non-lean request reads them.
+            if (!lean) {
+                const retry = outcome.kind === "response" ? outcome.commitsRetry : null;
+                const nothingLanded = outcome.kind === "response" && outcome.captureId === "";
+                const holdForNextDelta = nothingLanded && (ctx.commits?.shas.length ?? 0) > 0;
+                if (ctx.commits !== undefined && ctx.commits.count > 0) {
+                    if (retry !== null) {
+                        settleSpooled(ctx.home, key, ctx.commits.count, new Set(retry));
+                    }
+                    else if (!holdForNextDelta) {
+                        dropSpooled(ctx.home, key, ctx.commits.count);
+                    }
                 }
-                else if (stored !== null) {
-                    // ⛔⛔ `stored !== null` ALONE, never `stored !== null && stored > 0` (VG's mutant G5, 2026-10-08): the
-                    // real server (`ff67ef9`) writes a group in one atomic upsert, so a CARRIED group gets back either `n`
-                    // (all stored, handled above) or exactly `0` (the write failed, the header was voided, or a replay) — it
-                    // never answers `n-1`. An ack of `0` is a real signal ("the server saw this and stored none of it") and
-                    // must count an attempt exactly like any other short ack, or a persistently-refused group is never set
-                    // aside and head-of-line blocking comes back on the realistic path.
-                    const attempts = recordInferredAttempt(ctx.home, key, group);
-                    if (attempts >= INFERRED_SET_ASIDE_AFTER) {
-                        setAsideInferredGroup(ctx.home, key, group, "short_ack");
-                        // `TODOS[177]` follow-up (VL, 2026-10-08, VG's silent-loss finding): tally BEFORE any deletion can
-                        // happen — `finalize` may delete this session's `.inferred.jsonl` outright once every group in it is
-                        // resolved, and this tally is the ONLY record of `set_aside` left once that file is gone (VG's
-                        // follow-up finding: an earlier version of this fix also kept a live gauge reading that same file,
-                        // which double-counted these pairs once the group aged into the 7-day prune — removed).
-                        recordInferredSkipped(ctx.home, key.repoKey, "set_aside", ctx.nowMs, ctx.inferredRewrites.length);
-                        inferredSetAsidePairs = ctx.inferredRewrites.length;
+                // The rewrite spool is its own file with its own cap, so its own drop.
+                //
+                // ⛔ AND IT IS UNCONDITIONAL, UNLIKE THE COMMITS ABOVE — do not "fix" this
+                // to match. `tryRecordRewrites` on the server sits OUTSIDE the capture
+                // write and its comment says why: "Unconditional on the capture: a delta
+                // that sealed no turns still saw the rewrite, and the mapping is what
+                // keeps a squash-merged commit reachable." A `commit_sha_successors` row
+                // names no turn, so `X-Capture-Id` says nothing about whether it landed.
+                if (ctx.rewrites !== undefined && ctx.rewrites.length > 0) {
+                    dropRewrites(ctx.home, key, ctx.rewrites.length);
+                }
+                // `TODOS[177]` — the INFERRED pairs have their own file and their own drop. ⛔ UNLIKE `rewrites` above, this one is
+                // CONDITIONAL on the server's per-request ack (`x-rewrites-inferred-stored`): a 2xx alone is "the delta was
+                // accepted", not "every inferred pair in it was recorded" (VG pre-review, 2026-10-08). Drop by GROUP IDENTITY,
+                // never by count — see `dropInferredGroups`'s own comment for why a count-based drop lost pairs under concurrency.
+                //
+                // ⛔⛔ PER-GROUP BOUND (VL, 2026-10-08, VG's head-of-line finding): `capInferred` sends exactly ONE group per
+                // request now, so `ctx.inferredGroups` has at most one member and the ack names it unambiguously.
+                //   stored === sent        → delivered, drop it.
+                //   stored !== null, short → a real signal from a server that saw the group and recorded fewer than all of it:
+                //                            count an attempt; after `INFERRED_SET_ASIDE_AFTER` attempts, give up on it so it
+                //                            stops blocking the group behind it.
+                //   stored === null        → an old/absent-ack server said nothing at all: "keeping is right there" — no
+                //                            attempt is counted (an attempt means a signal was RECEIVED), nothing is set aside.
+                if (ctx.inferredRewrites !== undefined && ctx.inferredRewrites.length > 0 && ctx.inferredGroups !== undefined && ctx.inferredGroups.length > 0) {
+                    const group = ctx.inferredGroups[0];
+                    const stored = outcome.kind === "response" ? outcome.inferredStored : null;
+                    if (stored === ctx.inferredRewrites.length) {
+                        dropInferredGroups(ctx.home, key, [group]);
+                    }
+                    else if (stored !== null) {
+                        // ⛔⛔ `stored !== null` ALONE, never `stored !== null && stored > 0` (VG's mutant G5, 2026-10-08): the
+                        // real server (`ff67ef9`) writes a group in one atomic upsert, so a CARRIED group gets back either `n`
+                        // (all stored, handled above) or exactly `0` (the write failed, the header was voided, or a replay) — it
+                        // never answers `n-1`. An ack of `0` is a real signal ("the server saw this and stored none of it") and
+                        // must count an attempt exactly like any other short ack, or a persistently-refused group is never set
+                        // aside and head-of-line blocking comes back on the realistic path.
+                        const attempts = recordInferredAttempt(ctx.home, key, group);
+                        if (attempts >= INFERRED_SET_ASIDE_AFTER) {
+                            setAsideInferredGroup(ctx.home, key, group, "short_ack");
+                            // `TODOS[177]` follow-up (VL, 2026-10-08, VG's silent-loss finding): tally BEFORE any deletion can
+                            // happen — `finalize` may delete this session's `.inferred.jsonl` outright once every group in it is
+                            // resolved, and this tally is the ONLY record of `set_aside` left once that file is gone (VG's
+                            // follow-up finding: an earlier version of this fix also kept a live gauge reading that same file,
+                            // which double-counted these pairs once the group aged into the 7-day prune — removed).
+                            recordInferredSkipped(ctx.home, key.repoKey, "set_aside", ctx.nowMs, ctx.inferredRewrites.length);
+                            inferredSetAsidePairs = ctx.inferredRewrites.length;
+                        }
                     }
                 }
             }
             break;
         case "later":
-            next = withFileState(next, ctx.fileKey, markHeld(current, span, ctx.nowMs, caps));
+            next = withFileState(next, ctx.fileKey, { ...markHeld(current, span, ctx.nowMs, caps), lean });
             break;
         case "never":
-            next = withFileState(next, ctx.fileKey, markSkipped(current, span.from, span.to));
+            next = withFileState(next, ctx.fileKey, { ...markSkipped(current, span.from, span.to), lean });
             break;
         case "fatal":
             // Credential-level, not payload-level: the offset does NOT advance, because
             // these bytes are fine and a reconnected user should still get them.
             next = {
-                ...withFileState(next, ctx.fileKey, markHeld(current, span, ctx.nowMs, caps)),
+                ...withFileState(next, ctx.fileKey, { ...markHeld(current, span, ctx.nowMs, caps), lean }),
                 stop: {
                     at: new Date(ctx.nowMs).toISOString(),
                     fingerprint: credentialFingerprint(ctx.credential),

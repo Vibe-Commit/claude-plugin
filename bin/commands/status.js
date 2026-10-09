@@ -33,8 +33,7 @@ import { emitJson } from "../json.js";
 import { readInferredSkipped } from "../inferred_tally.js";
 import { readPruneTally } from "../pending_prune.js";
 import { resolveProjectKeys } from "../project.js";
-import { inferredUnacknowledgedForRepo } from "../spool.js";
-import { commitsWaitingForRepo, heldAtEndForRepo, lastReceiptForRepo, lastSendForRepo, openTailForRepo, writtenOffForRepo, } from "../state.js";
+import { commitsWaitingForRepo, heldAtEndForRepo, inferredUnacknowledgedForRepo, lastReceiptForRepo, lastSendForRepo, leanHeldForRepo, openTailForRepo, writtenOffForRepo, } from "../state.js";
 import { LABEL_GUTTER, WRAP_COLUMNS, glyph, labelled, paint, renderErrorBlock, tildePath, truncatePath, wrap, } from "../term.js";
 import { writeLines } from "./context.js";
 /** §10.3 indents the gutter rows four columns under the state line. */
@@ -86,8 +85,18 @@ export function status(ctx, argv = []) {
     // the SAME information `inferred_skipped.set_aside` already tallies durably, producing two JSON keys and two
     // sentences for one event. The tally is the ONE source of truth now; `inferredUnacknowledged` above stays,
     // since "still waiting" and "the server gave up" are two different facts.
+    // `TODOS[182]`: commits/rewrites/inferred pairs held back right now because a session went `lean`, broken
+    // out by kind — VG's B1/VL's V3 ruling is that this is the ONLY place they are counted: `waiting`/
+    // `inferredUnacknowledged` above already exclude a lean session's data entirely (`commitsWaitingForRepo`/
+    // `inferredUnacknowledgedForRepo`'s own docblocks), so there is no double-count to guard against here. A
+    // live gauge is correct — nothing deletes `.spool.jsonl`/`.rewrites.jsonl` while unresolved
+    // (`leanHeldForRepo`'s own docblock), so there is no file for a durable tally to outlive.
+    const leanHeld = leanHeldForRepo(ctx.home, projectKey);
+    const leanHeldTotal = leanHeld.commits + leanHeld.rewrites + leanHeld.inferred;
     const receipt = lastReceiptForRepo(ctx.home, projectKey);
-    const kind = on && writtenOff.gaps === 0 && heldAtEnd.bytes === 0 && openTail.ids.length === 0 ? "ok" : "warn";
+    const kind = on && writtenOff.gaps === 0 && heldAtEnd.bytes === 0 && openTail.ids.length === 0 && leanHeldTotal === 0
+        ? "ok"
+        : "warn";
     const lines = [
         `  ${paint(ctx.colour, kind, glyph(ctx.colour, kind))} ${paint(ctx.colour, "strong", on ? STATUS.onForRepo : STATUS.offForRepo)}`,
         labelled(ROW_INDENT, STATUS.repoLabel, repoValue(ctx, projectKey)),
@@ -152,6 +161,10 @@ export function status(ctx, argv = []) {
                 pruned: inferredSkipped?.pruned ?? 0,
             },
             inferred_unacknowledged: inferredUnacknowledged,
+            // `TODOS[182]`. A single number — the sum of commits/rewrites/inferred pairs held back by `lean`
+            // (`status`'s TEXT names the parts; the JSON contract stays one key). A contract change, recorded in
+            // `json-read-verbs.test.ts`.
+            lean_held: leanHeldTotal,
             open_tail: { sessions: openTail.ids.length, ids: openTail.ids },
         });
         return on ? EXIT.ok : EXIT.notConnected;
@@ -189,6 +202,9 @@ export function status(ctx, argv = []) {
     }
     if (inferredUnacknowledged > 0) {
         lines.push("", ...wrap(STATUS.inferredUnacknowledged(inferredUnacknowledged), 2));
+    }
+    if (leanHeldTotal > 0) {
+        lines.push("", ...wrap(STATUS.leanHeld(leanHeld.commits, leanHeld.rewrites, leanHeld.inferred), 2));
     }
     if (discarded !== null && discarded.lines > 0) {
         lines.push("", ...wrap(STATUS.discardedStale(discarded.lines), 2));
