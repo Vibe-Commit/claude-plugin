@@ -39,11 +39,11 @@ import { isProjectAllowed } from "../consent.js";
 import { loadCredential } from "../credential.js";
 import { EXIT } from "../exit.js";
 import { headRef, resolveRepoSlug } from "../git.js";
-import { confinementRoots, deliverSubagents, fileSize, readSpan, sendTimeoutMs } from "../hooks/entry.js";
+import { confinementRoots, deliverSubagents, fileSize, readSpan, sendTimeoutMs, wait } from "../hooks/entry.js";
 import { repoSessionsDir, sessionStatePath } from "../paths.js";
 import { deliver, ingestUrl } from "../post.js";
 import { resolveProjectKeys } from "../project.js";
-import { capSpool, capSuccessors, readRewrites, readSpool } from "../spool.js";
+import { capInferred, capSpool, capSuccessors, deleteInferredSpool, inferredFullyResolved, readInferred, readRewrites, readSpool } from "../spool.js";
 import { fileState, loadSessionState, saveSessionState } from "../state.js";
 import { renderErrorBlock, wrap } from "../term.js";
 import { writeLines } from "./context.js";
@@ -53,6 +53,18 @@ const STILL_WRITING_MS = 5_000;
 const LATEST_WINDOW_MS = 24 * 60 * 60 * 1000;
 /** One wall-clock budget for the whole verb: not a hook, so not the hook's few seconds. */
 const SEND_BUDGET_MS = 60_000;
+/** Bounded drain of the rewrite/inferred spools after the seal succeeds (TODOS[177] follow-up); never unbounded. */
+const FINALIZE_DRAIN_MAX_ITERATIONS = 8;
+/**
+ * `TODOS[177]` follow-up (VL, 2026-10-08, VG's silent-loss finding B1) — the backoff BETWEEN successive short acks
+ * for the SAME inferred group, inside the drain loop only. `INFERRED_SET_ASIDE_AFTER` (K=3) attempts spread across
+ * separate HOOK CYCLES (minutes apart) is a real signal of a persistently-refusing server; the same K attempts
+ * inside one `finalize` call's drain loop — which otherwise iterates with no delay at all — could burn through all
+ * of them in under a second, turning a one-second TRANSIENT server hiccup into a permanent-looking set-aside. Index
+ * 0 is the wait before the 2nd attempt on a group, index 1 before the 3rd; total added delay 1s + 3s = 4s, inside
+ * VL's ≤6s bound.
+ */
+const FINALIZE_DRAIN_BACKOFF_MS = [1_000, 3_000];
 /** The id becomes a filename component; keep it to what a session id is. */
 const SESSION_ID = /^[A-Za-z0-9._-]{1,128}$/;
 function parseArgs(argv) {
@@ -160,6 +172,7 @@ export async function finalize(ctx, argv) {
     const spoolKey = { repoKey: projectKey, sessionId };
     const spooled = capSpool(readSpool(ctx.home, spoolKey));
     const rewritten = capSuccessors(readRewrites(ctx.home, spoolKey));
+    const inferred = capInferred(readInferred(ctx.home, spoolKey)); // `TODOS[177]`
     const redactionRoots = confinementRoots(keys);
     const repoSlug = resolveRepoSlug(projectKey);
     const hookEnv = {
@@ -198,6 +211,8 @@ export async function finalize(ctx, argv) {
         head: headRef(projectKey),
         commits: spooled,
         rewrites: rewritten.pairs,
+        inferredRewrites: inferred.pairs,
+        inferredGroups: inferred.groups,
         final: true,
         byHook: false,
     }, eof, (from, to) => readSpan(transcriptPath, from, to, redactionRoots, ctx.home, ctx.env));
@@ -212,7 +227,84 @@ export async function finalize(ctx, argv) {
     }
     if (delivery.finalAck === "sealed" || delivery.finalAck === "already") {
         clearDeliveredHold(ctx.home, spoolKey);
+        // ⭐ `TODOS[177]` follow-up (VL, 2026-10-08) — DRAIN what the first delivery's caps left spooled. A session
+        // over 16 exact pairs or 64 inferred pairs (one squash of 64 is already the server's own cap; several
+        // squashes in one session is what overflows this) would otherwise leave the rest spooled FOREVER: nobody
+        // fires another hook for a session finalize just declared over. Bounded, empty-body deltas (the main
+        // stream is already at EOF; `final: true` again is idempotent — `already`) carrying only what remains.
+        // Stops the moment an ack goes missing: a server that cannot confirm one drain request will not confirm
+        // the next either, and hammering it buys nothing.
+        let setAsidePairs = delivery.inferredSetAsidePairs;
+        // `TODOS[177]` follow-up (VL, 2026-10-08, VG's silent-loss finding B1) — the backoff state, local to THIS
+        // drain loop only (never across hook cycles, which already space attempts by minutes on their own). Tracks
+        // the identity of the group that was short-acked on the PREVIOUS iteration and how many times in a row.
+        let backoffGroupId = null;
+        let backoffStreak = 0;
+        for (let i = 0; i < FINALIZE_DRAIN_MAX_ITERATIONS; i += 1) {
+            const moreRewritten = capSuccessors(readRewrites(ctx.home, spoolKey));
+            const moreInferred = capInferred(readInferred(ctx.home, spoolKey));
+            if (moreRewritten.pairs.length === 0 && moreInferred.pairs.length === 0)
+                break;
+            const groupId = moreInferred.groups.length > 0 ? `${moreInferred.groups[0].successor}:${moreInferred.groups[0].patchId}` : null;
+            if (groupId !== null && groupId === backoffGroupId && backoffStreak >= 1 && backoffStreak <= FINALIZE_DRAIN_BACKOFF_MS.length) {
+                await wait(FINALIZE_DRAIN_BACKOFF_MS[backoffStreak - 1]);
+            }
+            const drain = await deliver({
+                home: ctx.home,
+                env: ctx.env,
+                url,
+                credential: load.credential,
+                repoKey: projectKey,
+                repoSlug,
+                sessionId,
+                fileKey: "main",
+                transcriptPath,
+                timeoutMs: sendTimeoutMs(SEND_BUDGET_MS, Date.now() - startedAt),
+                nowMs: Date.now(),
+                head: headRef(projectKey),
+                rewrites: moreRewritten.pairs,
+                inferredRewrites: moreInferred.pairs,
+                inferredGroups: moreInferred.groups,
+                final: true,
+                byHook: false,
+            }, eof, (from, to) => readSpan(transcriptPath, from, to, redactionRoots, ctx.home, ctx.env));
+            if (drain.kind !== "attempted" || drain.disposition !== "ok")
+                break;
+            setAsidePairs += drain.inferredSetAsidePairs;
+            if (drain.finalAck !== "sealed" && drain.finalAck !== "already")
+                break;
+            // ⛔⛔ VL, 2026-10-08, VG's head-of-line finding: an ABSENT inferred ack (an old server — 86b9460 measured: 9
+            // requests, every one absent, the second group never sent) for a request that DID carry an inferred group
+            // means this server will never confirm ANY group, so stop asking rather than spend the whole bound on it.
+            // A SHORT ack is different (`deliver()` already counted the attempt / set it aside above) — fall through and
+            // let the next iteration pick up whatever group is next.
+            if (moreInferred.pairs.length > 0 && drain.inferredStored === null)
+                break;
+            // Update the backoff state for the NEXT iteration: a short ack (present, non-null, not the full count) on
+            // the SAME group as last time extends the streak; anything else (delivered, a different group, or this
+            // group just got set aside) resets it.
+            const sent = moreInferred.pairs.length;
+            if (groupId !== null && sent > 0 && drain.inferredStored !== null && drain.inferredStored !== sent) {
+                backoffStreak = groupId === backoffGroupId ? backoffStreak + 1 : 1;
+                backoffGroupId = groupId;
+            }
+            else {
+                backoffGroupId = null;
+                backoffStreak = 0;
+            }
+        }
+        // The session is over (that is what `finalize` just confirmed), so no concurrent `appendInferred` can still be
+        // running for it — the hook that would call one is the one deciding the session is over. Safe to delete outright
+        // rather than leave a fully-resolved file for the 7-day prune to find.
+        //
+        // ⛔⛔ Fine to delete AFTER `setAsidePairs` is computed above, NEVER before (VL, 2026-10-08, VG's silent-loss
+        // finding B1): `setAsidePairs` is read from `deliver()`'s own return values — which were captured before this
+        // point — not re-derived from the spool afterward, which is the file this line is about to delete.
+        if (inferredFullyResolved(ctx.home, spoolKey))
+            deleteInferredSpool(ctx.home, spoolKey);
         writeLines(ctx.stdout, wrap(delivery.finalAck === "sealed" ? FINALIZE.closed(sessionId) : FINALIZE.alreadyClosed(sessionId), 2));
+        if (setAsidePairs > 0)
+            writeLines(ctx.stderr, wrap(FINALIZE.inferredSetAside(setAsidePairs), 2));
         return EXIT.ok;
     }
     if (delivery.finalAck === "refused") {
