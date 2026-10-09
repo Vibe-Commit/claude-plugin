@@ -80,6 +80,20 @@ export const USAGE = {
  * two ways on two machines, and a byte count is a number a user may paste.
  */
 const BYTE_COUNT = new Intl.NumberFormat("en-US");
+/**
+ * `TODOS[184]` — up to 3 session ids, then "and N more." Shared by `STATUS.liveStuck`/`heldIdle` so the
+ * naming rule lives in exactly one place. The id named here is the state-file STEM, not necessarily the
+ * raw session id (`paths.ts`'s `sanitise`: `[^A-Za-z0-9._-]` → `_`, truncated to 128 chars) — an exotic id
+ * and its stem can differ, but `finalize --session <stem>` still fails SAFELY on a mismatch
+ * (`FINALIZE.unknownSession`/`transcriptMissing`) rather than ever finding a different real session by
+ * accident, because the lookup is an exact file match. Claude Code's own ids are UUIDs, so stem === id.
+ */
+function namedIds(ids) {
+    if (ids.length === 0)
+        return "";
+    const shown = ids.slice(0, 3).join(", ");
+    return ids.length > 3 ? `${shown} and ${ids.length - 3} more` : shown;
+}
 export const STATUS = {
     onForRepo: "Capture is on for this repository.",
     offForRepo: "Capture is off for this repository.",
@@ -203,6 +217,49 @@ export const STATUS = {
     // `inferredSkipped` sentence's `set_aside` clause above — same pairs, two sentences. Removed, not kept dead:
     // nothing in `status.ts` calls it any more, and a copy function with no caller is the thing this package's own
     // dead-symbols gate exists to catch.
+    /**
+     * `TODOS[184]` — a LIVE session (a hook fired inside `SESSION_LIVE_WINDOW_MS`) whose oldest unclaimed
+     * backlog span has ITSELF survived that same window: it has been retried at least a full turn's worth
+     * and still has not gone out. `stuckSpoolLinesForRepo`'s commit count is named here instead of in
+     * `commitsWaiting` for exactly these sessions (VG's S8 fix) — one fact, one line.
+     *
+     * ⛔ **NAMES ONLY THE OLDEST SPAN'S AGE, NEVER EVERY BYTE'S** (VG's N1). An earlier draft said every
+     * byte/commit "has not been sent in over 30 minutes," which is false for anything newer than the
+     * oldest held span in a session that keeps producing new backlog while stuck. This sentence sums all
+     * of it (the whole fact is worth reporting at once) but only claims the ONE thing that is actually true
+     * of the whole: the oldest has waited that long.
+     *
+     * No promised outcome (VG's D2): `enforceCaps`'s existing 24h age cap runs on the next attempt
+     * regardless of what this sentence says, so "keeps retrying" states what happens now, not a guarantee
+     * about later.
+     */
+    liveStuck: (bytes, sessions, commits, ids = []) => {
+        const who = `${sessions} live ${sessions === 1 ? "session" : "sessions"} (${namedIds(ids)})`;
+        const commitsClause = commits > 0 ? `, including ${commits} ${commits === 1 ? "commit" : "commits"}` : "";
+        return (`${BYTE_COUNT.format(bytes)} ${bytes === 1 ? "byte is" : "bytes are"} held from ${who}${commitsClause}; ` +
+            "the oldest has waited over 30 minutes. Capture keeps retrying; anything held past 24 hours is written off instead.");
+    },
+    /**
+     * `TODOS[184]` — a session no hook has touched in over `SESSION_LIVE_WINDOW_MS`: nothing is coming to
+     * retry it on its own. The remainder `heldAtEndForRepo` does not already own (VG's D1) and that is not
+     * covered by `liveStuck` because the session itself has gone quiet, not just one span.
+     *
+     * ⛔ **NEVER PROMISES `finalize` WILL SUCCEED** (VG's N2). An earlier draft said `finalize --session
+     * <id>` "sends them and closes it" — but a failed send closes NOTHING (`FINALIZE.notDelivered`:
+     * "Could not deliver the session. Nothing was closed."). "Tries to send them and, if that works,
+     * closes it" is true on both outcomes. Gated on "if that session is finished": `held_idle` alone
+     * cannot tell a crashed session from one idle at lunch, and closing a session still in progress seals
+     * a turn that was not actually over.
+     */
+    heldIdle: (bytes, sessions, commits, ids = []) => {
+        const who = sessions === 1 ? `session ${namedIds(ids)}` : `${sessions} sessions (${namedIds(ids)})`;
+        const commitsClause = commits > 0 ? `, including ${commits} ${commits === 1 ? "commit" : "commits"}` : "";
+        const action = sessions === 1
+            ? `If that session is finished, \`vibecommit finalize --session ${ids[0]}\` tries to send them and, if that works, closes it`
+            : "If a session above is finished, `vibecommit finalize --session <id>` tries to send its bytes and, if that works, closes it";
+        return (`${BYTE_COUNT.format(bytes)} ${bytes === 1 ? "byte" : "bytes"} held from ${who}${commitsClause}, with no hook in over 30 ` +
+            `minutes. ${action}; anything held past 24 hours is written off instead.`);
+    },
     fixCommandLabel: "To reconnect, run",
     /** §10.3's two trailing actions, rendered as an aligned pair. */
     turnOffLabel: "Turn capture off for this repo",
@@ -637,6 +694,11 @@ export const OFF = {
     done: "Capture is off for this repository.",
     alreadyOff: "Capture was already off for this repository.",
     note: "Sessions already recorded are unaffected.",
+    // `TODOS[184]`. `off` used to ignore `argv` entirely and always run — a stray
+    // argument, including `--help`'s own flag landing here by a bug, must never
+    // silently revoke consent. Same shape as `AUTH.argvWhat`/`argvWhy`.
+    unrecognizedArgWhat: "That is not something `vibecommit off` understands.",
+    unrecognizedArgWhy: "Nothing was changed. `off` takes no arguments.",
 };
 /**
  * `vibecommit why` — `CR-086`, W9.
@@ -742,6 +804,13 @@ export const WHY = {
      * does not fire on the note explaining the avoidance.
      */
     squashProbableBasis: "These two commits were matched by patch id rather than by a recorded successor row, so the pairing is read off the commits themselves and is not something capture witnessed.",
+    /**
+     * `TODOS[174]`, `D217` (`code` main `46d85c8`) — the THIRD `match_kind`, once mcp starts writing
+     * rewrite-link rows from an agent's own tool call rather than only from git's hook. Same shape as
+     * `squashProbableBasis` above: states what the pairing rests on and that capture did not witness it
+     * directly, claiming no more than that.
+     */
+    squashAssertedBasis: "This pairing was reported by an agent's tool call rather than recorded by git's own hook, so it is the agent's assertion and not something capture witnessed directly.",
     /**
      * ⚠ WHY THE TWO SHAS ON THE SQUASH SCREEN ARE DIFFERENT LENGTHS.
      *

@@ -24,7 +24,7 @@
  * invented here: `CR-112` (W8) owns the five-absence grammar as one set, and
  * adding a variant now is what that task exists to prevent.
  */
-import { COMMANDS, CREDENTIAL, ERRORS, OFF, STATUS, URLS, relativeAge } from "../copy/index.js";
+import { COMMANDS, CREDENTIAL, ERRORS, HELP, OFF, STATUS, URLS, relativeAge } from "../copy/index.js";
 import { isProjectAllowed, revokeProject } from "../consent.js";
 import { loadCredential, savedCredentialExists } from "../credential.js";
 import { EXIT } from "../exit.js";
@@ -33,12 +33,18 @@ import { emitJson } from "../json.js";
 import { readInferredSkipped } from "../inferred_tally.js";
 import { readPruneTally } from "../pending_prune.js";
 import { resolveProjectKeys } from "../project.js";
-import { commitsWaitingForRepo, heldAtEndForRepo, inferredUnacknowledgedForRepo, lastReceiptForRepo, lastSendForRepo, leanHeldForRepo, openTailForRepo, writtenOffForRepo, } from "../state.js";
+import { commitsWaitingForRepo, heldAtEndForRepo, inferredUnacknowledgedForRepo, lastReceiptForRepo, lastSendForRepo, leanHeldForRepo, leanSessionsForRepo, openTailForRepo, stuckForRepo, stuckSpoolLinesForRepo, writtenOffForRepo, } from "../state.js";
 import { LABEL_GUTTER, WRAP_COLUMNS, glyph, labelled, paint, renderErrorBlock, tildePath, truncatePath, wrap, } from "../term.js";
 import { writeLines } from "./context.js";
 /** §10.3 indents the gutter rows four columns under the state line. */
 const ROW_INDENT = 4;
 export function status(ctx, argv = []) {
+    // `TODOS[184]`. Check-first, before any git/credential/consent resolution — same ordering principle
+    // every other verb's `--help` check uses. Reads and writes nothing.
+    if (argv.includes("--help") || argv.includes("-h")) {
+        writeLines(ctx.stdout, [HELP.commands.status]);
+        return EXIT.ok;
+    }
     // ⛔ THIS SCREEN USES BOTH ROLES AT ONCE (`D184 §1`), which is why the whole
     // function is not flipped: `on` below is CONSENT STATE and keys on the git
     // common dir, while the repo row, the send scan and the `--json` document are
@@ -93,8 +99,24 @@ export function status(ctx, argv = []) {
     // (`leanHeldForRepo`'s own docblock), so there is no file for a durable tally to outlive.
     const leanHeld = leanHeldForRepo(ctx.home, projectKey);
     const leanHeldTotal = leanHeld.commits + leanHeld.rewrites + leanHeld.inferred;
+    // `TODOS[184]`: bytes stuck in a live session's backlog, or a session nobody has retried in a while —
+    // the gap VL's original report named (`ok` plus total silence over real held data). Byte-range
+    // partition (VG's D1), never `endedAt` — see `stuckForRepo`'s own docblock.
+    const nowMs = ctx.now().getTime();
+    const stuck = stuckForRepo(ctx.home, projectKey, nowMs);
+    const leanSessions = leanSessionsForRepo(ctx.home, projectKey);
+    // `TODOS[184]` (VG's S8 fix): the subset of `commitsWaitingForRepo`'s own count that belongs to a
+    // stuck session. Named inside `liveStuck`/`heldIdle`'s own sentence instead, below — never double
+    // counted, never touching `commitsWaitingForRepo` or its JSON number.
+    const stuckSpoolLines = stuckSpoolLinesForRepo(ctx.home, projectKey, nowMs);
     const receipt = lastReceiptForRepo(ctx.home, projectKey);
-    const kind = on && writtenOff.gaps === 0 && heldAtEnd.bytes === 0 && openTail.ids.length === 0 && leanHeldTotal === 0
+    const kind = on &&
+        writtenOff.gaps === 0 &&
+        heldAtEnd.bytes === 0 &&
+        openTail.ids.length === 0 &&
+        leanHeldTotal === 0 &&
+        stuck.liveStuck.bytes === 0 &&
+        stuck.heldIdle.bytes === 0
         ? "ok"
         : "warn";
     const lines = [
@@ -166,6 +188,12 @@ export function status(ctx, argv = []) {
             // `json-read-verbs.test.ts`.
             lean_held: leanHeldTotal,
             open_tail: { sessions: openTail.ids.length, ids: openTail.ids },
+            // `TODOS[184]`. Additive — always objects, zeros included, same precedent as `held_at_end`/
+            // `written_off`. `commits_waiting` above is UNTOUCHED: it is still `commitsWaitingForRepo`'s own
+            // number, never reduced for a stuck session's lines (those are named in the TEXT only, §3's note).
+            live_stuck: { bytes: stuck.liveStuck.bytes, sessions: stuck.liveStuck.sessions },
+            held_idle: { bytes: stuck.heldIdle.bytes, sessions: stuck.heldIdle.sessions },
+            lean_sessions: leanSessions,
         });
         return on ? EXIT.ok : EXIT.notConnected;
     }
@@ -174,11 +202,26 @@ export function status(ctx, argv = []) {
         writeLines(ctx.stderr, credentialProblem(load, ctx.colour));
         return EXIT.failure;
     }
+    // `TODOS[184]` (VL's D4 ruling): built once, placed in one of two spots below depending on whether
+    // `neverSent` prints. Each line also names the stuck-session subset of `commitsWaitingForRepo`'s count
+    // (VG's S8 fix) — `stuckCommitsTotal` below is subtracted from `waiting` for `commitsWaiting`'s own
+    // sentence so neither double-counts the other.
+    const stuckLines = [];
+    if (stuck.liveStuck.bytes > 0) {
+        stuckLines.push("", ...wrap(STATUS.liveStuck(stuck.liveStuck.bytes, stuck.liveStuck.sessions, stuckSpoolLines.liveCommits, stuck.liveStuck.ids), 2));
+    }
+    if (stuck.heldIdle.bytes > 0) {
+        stuckLines.push("", ...wrap(STATUS.heldIdle(stuck.heldIdle.bytes, stuck.heldIdle.sessions, stuckSpoolLines.idleCommits, stuck.heldIdle.ids), 2));
+    }
+    const stuckCommitsTotal = stuckSpoolLines.liveCommits + stuckSpoolLines.idleCommits;
     // Absence is a SENTENCE, not a blank row. Triggered on the send record rather
     // than on the credential: a repo that has delivered and then lost its
     // credential has still recorded a session, and saying otherwise would be false.
-    if (on && lastSend === null)
+    if (on && lastSend === null) {
         lines.push("", ...wrap(STATUS.neverSent, 2));
+        // `TODOS[184]` (D4): immediately after `neverSent`, same precedent `writtenOff` already follows it by.
+        lines.push(...stuckLines);
+    }
     // `CR-228`. After `neverSent`, deliberately: in the measured failure both are
     // true at once, and "nothing recorded" followed by why is the order that reads
     // as one account. Shown OFF as well — consent withdrawn later does not undo a
@@ -189,13 +232,18 @@ export function status(ctx, argv = []) {
     if (heldAtEnd.bytes > 0) {
         lines.push("", ...wrap(STATUS.heldAtEnd(heldAtEnd.bytes, heldAtEnd.sessions), 2));
     }
+    // `TODOS[184]` (D4): the delivery-health group's own slot, right after `heldAtEnd` — but only here when
+    // `neverSent` did NOT already print it above.
+    if (!(on && lastSend === null)) {
+        lines.push(...stuckLines);
+    }
     // `TODOS[145]`/`[146]`: the consequence first (a session is over and its last turn never closed), then the
     // neutral fact (commits are waiting for a turn). Both omitted when zero — absence here is the healthy case.
     if (openTail.ids.length > 0) {
         lines.push("", ...wrap(STATUS.openTail(openTail.ids.length), 2));
     }
-    else if (waiting > 0) {
-        lines.push("", ...wrap(STATUS.commitsWaiting(waiting), 2));
+    else if (waiting - stuckCommitsTotal > 0) {
+        lines.push("", ...wrap(STATUS.commitsWaiting(waiting - stuckCommitsTotal), 2));
     }
     if (inferredSkipped !== null) {
         lines.push("", ...wrap(STATUS.inferredSkipped(inferredSkipped.oversize, inferredSkipped.sha256, inferredSkipped.set_aside, inferredSkipped.pruned), 2));
@@ -274,7 +322,30 @@ function actionLines(ctx, on) {
         return `  ${`${label}:`.padEnd(width + 2)}${painted}`;
     });
 }
-export function off(ctx) {
+/**
+ * `TODOS[184]` (VG's F1, VL's ruling): `off`'s own mirror of `index.ts`'s `--no-color` argv parse —
+ * that call site (`argv.includes("--no-color")`, feeding `resolveColour`) is the authority this list
+ * copies; it does not import a shared constant from `term.ts`, because `index.ts` ties "is this a
+ * global flag" to "turn colour off" for every future entry there, and `off` must not inherit that
+ * coupling. If a second global flag is ever added at `index.ts`'s site, add it here too.
+ */
+const OFF_RECOGNIZED_GLOBAL_FLAGS = ["--no-color"];
+export function off(ctx, argv = []) {
+    // `TODOS[184]`. `off` used to take no `argv` at all, so EVERY trailing token — including `--help`
+    // landing here by accident — silently revoked consent (measured on 0.4.3 and 0.4.4 alike). `--help`/
+    // `-h` print help and change nothing; any other argument is refused the same way, also changing
+    // nothing — a revoke must never run on an argument this verb did not parse.
+    if (argv.includes("--help") || argv.includes("-h")) {
+        writeLines(ctx.stdout, [HELP.commands.off]);
+        return EXIT.ok;
+    }
+    // `--no-color` is a global flag 0.4.4's `off` (which parsed no argv at all) tolerated by construction;
+    // every OTHER argument (including `--json`, which `off` has no mode for) still refuses.
+    const rest = argv.filter((arg) => !OFF_RECOGNIZED_GLOBAL_FLAGS.includes(arg));
+    if (rest.length > 0) {
+        writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", what: OFF.unrecognizedArgWhat, why: [OFF.unrecognizedArgWhy] }, ctx.colour));
+        return EXIT.usage;
+    }
     const keys = resolveProjectKeys(ctx.cwd);
     if (keys === null) {
         writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", what: ERRORS.notAGitRepo, why: [] }, ctx.colour));

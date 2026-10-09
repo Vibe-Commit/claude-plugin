@@ -34,7 +34,7 @@
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_AGENT_ID, admitsTranscript, transcriptRoots } from "../agents/registry.js";
-import { ERRORS, FINALIZE } from "../copy/index.js";
+import { ERRORS, FINALIZE, HELP } from "../copy/index.js";
 import { isProjectAllowed } from "../consent.js";
 import { loadCredential } from "../credential.js";
 import { EXIT } from "../exit.js";
@@ -94,6 +94,14 @@ function parseArgs(argv) {
     return { session, latest, force };
 }
 export async function finalize(ctx, argv) {
+    // `TODOS[184]`. Check-first, before `parseArgs`/anything else — the ONE change this ticket makes to
+    // `finalize`. Reads and writes nothing; every other line below (`parseArgs`, session resolution, the
+    // seal call, the drain loop, every exit code and receipt string) is byte-identical to 0.4.4 for any
+    // `argv` that does not literally contain `--help`/`-h` (pinned by T10's differential).
+    if (argv.includes("--help") || argv.includes("-h")) {
+        writeLines(ctx.stdout, [HELP.commands.finalize]);
+        return EXIT.ok;
+    }
     const args = parseArgs(argv);
     if (args === null) {
         writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", what: FINALIZE.needTarget, why: [] }, ctx.colour));

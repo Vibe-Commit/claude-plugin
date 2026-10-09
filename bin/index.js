@@ -180,14 +180,18 @@ async function main(argv) {
             // `CR-226`: the browser beat for a fresh machine. Same rule as `auth` —
             // `connect`'s default never opens a browser, so without this argument the
             // route is unreachable from the install path.
-            return await connect(ctx, { signIn: argv.includes("--sign-in") }, { browser: browserCredential });
+            // `TODOS[184]`: `help` added — `connect` has no `argv` param, so its `--help`/`-h` check reads this
+            // option field, computed the same way `signIn` already is.
+            return await connect(ctx, { signIn: argv.includes("--sign-in"), help: argv.includes("--help") || argv.includes("-h") }, { browser: browserCredential });
         case "status":
             // `argv.slice(1)` for the same reason `why` and `report` take it: `status`
             // reads its own `--json` flag rather than this package acquiring an
             // argument parser it has deliberately never had (DESIGN.md §13.3).
             return status(ctx, argv.slice(1));
         case "off":
-            return off(ctx);
+            // `TODOS[184]`: `off` now takes its trailing argv, so a stray argument (including `--help`
+            // landing here by accident) can no longer silently revoke consent.
+            return off(ctx, argv.slice(1));
         case "why":
             // CR-086. `argv.slice(1)` is everything after the verb — there is no
             // argument parser in this package and `why` does not add one; it reads

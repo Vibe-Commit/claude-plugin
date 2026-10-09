@@ -92,7 +92,7 @@
  * @provenance vibecommit-mcp src/read/envelope.ts — the one-text-part wire shape, retyped
  * @provenance vibecommit-schema capture_turns + commit_file_attribution — MEASURED ABSENCE, cited
  */
-import { ABSENCE, COMMANDS, ERRORS, SIGNIN, WHY, renderCommitHeader, renderCommitIdentity, } from "../copy/index.js";
+import { ABSENCE, COMMANDS, ERRORS, HELP, SIGNIN, WHY, renderCommitHeader, renderCommitIdentity, } from "../copy/index.js";
 import { EXIT } from "../exit.js";
 import { gitProbe, isShallowClone, resolveRepoSlug } from "../git.js";
 import { emitJson } from "../json.js";
@@ -113,7 +113,7 @@ const UNCOMMITTED_SHA = "0".repeat(40);
 /** §10.4 renders the short form; the wire carries the full one. */
 const ABBREV = 7;
 const GRADES = new Set(["derived", "observed", "declared"]);
-const MATCH_KINDS = new Set(["exact", "probable"]);
+const MATCH_KINDS = new Set(["exact", "probable", "asserted"]);
 function parseMatchKind(value) {
     if (value === undefined || value === null)
         return { ok: true, value: null };
@@ -656,6 +656,11 @@ function notAuthorized(ctx, authorized, commit) {
     }
 }
 export async function why(ctx, argv, deps = {}) {
+    // `TODOS[184]`. Check-first, before `parseTarget`/anything else. Reads and writes nothing.
+    if (argv.includes("--help") || argv.includes("-h")) {
+        writeLines(ctx.stdout, [HELP.commands.why]);
+        return EXIT.ok;
+    }
     // §13.3 — `--json` emits nothing but the JSON document on stdout, and D122 §2
     // rules that §13.3 REQUIRES it here. Read once and carried, never re-derived
     // per branch. Every FAILURE below is unchanged: §13.6's block to stderr,
@@ -746,15 +751,37 @@ function render(ctx, outcome, commit, file, json) {
  * helper, both callers, and a cell on each.
  *
  * ⚠ `exact` renders UNQUALIFIED per §R3: the base copy states no provenance at
- * all, so there is nothing further owed. Only `probable` earns a stated basis.
+ * all, so there is nothing further owed. `probable` and `asserted` each earn
+ * their OWN stated basis — TODOS[174] (VG's required amendment): an earlier
+ * draft only special-cased `probable` with an `if`, so `asserted` (and any
+ * future kind `parseMatchKind` ever widened to accept) would have fallen
+ * through to this unqualified branch — the EXACT-match rendering — folding an
+ * agent's own claim into the strongest evidence this screen has. The
+ * exhaustive `switch` below, with a `never` default, makes that fall-through
+ * impossible: the next kind added to `MATCH_KINDS` without a case here is a
+ * compile error, not a silent misrender.
  * A `null` `match_kind` also renders unqualified — mcp always emits the field
  * on this state, so null means the two repos disagree, and whether THAT should
  * be malformed is a decision rather than a builder's call.
  */
 function squashWhy(blamed, matchKind) {
     const why = [ABSENCE.squashResolved.why(blamed)];
-    if (matchKind === "probable")
-        why.push(WHY.squashProbableBasis);
+    if (matchKind !== null) {
+        switch (matchKind) {
+            case "exact":
+                break; // unqualified — the base copy above already states no provenance.
+            case "probable":
+                why.push(WHY.squashProbableBasis);
+                break;
+            case "asserted":
+                why.push(WHY.squashAssertedBasis);
+                break;
+            default: {
+                const unreachable = matchKind;
+                throw new Error(`squashWhy: unhandled match_kind ${String(unreachable)}`);
+            }
+        }
+    }
     // ⚠ THE ASYMMETRY IS EXPLAINED, NOT REMOVED. Two builders read the differing
     // sha lengths as a defect, and the answer is a clause rather than a
     // truncation that would destroy the value — see THE SHA-LENGTH RULE above.

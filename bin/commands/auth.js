@@ -55,7 +55,7 @@
  * @provenance vibecommit-mcp src/transport/server.ts — POST /oauth/ingest-credential is the mint route, verified
  * @provenance vibecommit-web app/api/ingest-credentials/route.ts — the dashboard producer the paste path still serves, verified
  */
-import { AUTH, URLS } from "../copy/index.js";
+import { AUTH, HELP, URLS } from "../copy/index.js";
 import { writeLines } from "./context.js";
 import { EXIT } from "../exit.js";
 import { INGEST_TOKEN_PREFIX, IngestCredential, saveCredential } from "../credential.js";
@@ -82,6 +82,14 @@ export async function auth(ctx, argv, deps = {}) {
             fixes: [AUTH.argvFixPrompt, AUTH.argvFixStdin],
         }, ctx.colour));
         return EXIT.usage;
+    }
+    // `TODOS[184]`. SECOND, deliberately — VG's V3-1: a credential typed as an argument must still be
+    // flagged for revocation even if `--help` also appears in `argv`, so the refusal above (which makes
+    // exactly that a usage error) runs first. By the time this is reached, `positional.length === 0`, so
+    // `--help` still has no side effects — nothing below has read or written anything yet either way.
+    if (argv.includes("--help") || argv.includes("-h")) {
+        writeLines(ctx.stdout, [HELP.commands.auth]);
+        return EXIT.ok;
     }
     const piped = argv.includes(STDIN_FLAG) || !ctx.stdinIsTty;
     // ── `CR-226`: the browser, first, on a terminal only. ──────────────────────
