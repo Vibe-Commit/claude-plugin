@@ -20,6 +20,32 @@ That's it. Claude Code now:
   your captured history (`search_history`, `blame_commit`, `commit_coverage`,
   `get_conversation`, `diff_conversation`)
 
+## Connect this machine (once)
+
+Installing the plugin registers the hooks; **capture does nothing until this machine has a credential**,
+and until then a session shows *"VibeCommit is installed but not connected."* The plugin puts no
+`vibecommit` command on your `PATH`, so there are two ways to connect:
+
+- **Install the CLI (recommended).** It also installs the git hooks the plugin does not, and you type
+  one short command:
+
+  ```
+  npm install -g @vibe-commit/capture
+  vibecommit connect
+  ```
+
+  Run `vibecommit connect` in each repository you want captured. On a machine with no credential it
+  opens your browser to sign in and saves the credential for you; there is nothing to copy or paste.
+- **Run the bundled client.** Without npm, run the plugin's own client with Node:
+  `node <the plugin's bin/index.js> connect`. The path is inside Claude Code's plugin directory; when
+  anything needs reconnecting, the message names the exact command for your install.
+
+If capture later stops with *"this machine's credential is no longer accepted"*, the credential was
+revoked or expired. Run the command the message gives (`vibecommit auth`, or the `node … auth` form).
+Turns held in the meantime upload once you reconnect.
+
+What is uploaded is listed at [vibecommit.ai/docs/what-we-upload](https://vibecommit.ai/docs/what-we-upload).
+
 ## What gets installed
 
 The plugin installs hooks and the MCP server config:
