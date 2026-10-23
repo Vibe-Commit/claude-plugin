@@ -178,6 +178,11 @@ export function buildAuthorizeUrl(authorizationEndpoint, input) {
     url.searchParams.set("state", input.state);
     url.searchParams.set("code_challenge", input.challenge);
     url.searchParams.set("code_challenge_method", CHALLENGE_METHOD);
+    // Re-auth binds the org of the credential it replaces (plan item 2(a), brief A1). Only ever
+    // set from a FILE credential the server just confirmed; the web page drops anything that is
+    // not a UUID, and the membership check at authorize-complete is the server's.
+    if (input.orgId !== undefined)
+        url.searchParams.set("org_id", input.orgId);
     return url.toString();
 }
 //# sourceMappingURL=token.js.map

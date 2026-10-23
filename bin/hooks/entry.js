@@ -37,11 +37,13 @@ import { closeSync, openSync, readdirSync, readSync, realpathSync, statSync, wri
 import { basename, isAbsolute, join } from "node:path";
 import { zstdCompressSync } from "node:zlib";
 import { isProjectAllowed } from "../consent.js";
+import { endingSoon, noteCredentialExpiry } from "../credential_meta.js";
 import { loadCredential } from "../credential.js";
 import { EXIT } from "../exit.js";
 import { gitProbe, headRef, resolveRepoSlug } from "../git.js";
 import { redactSpan, rulesForTranscript } from "../redact.js";
-import { deliver, ingestUrl } from "../post.js";
+import { authCommandFor } from "../install.js";
+import { credentialFingerprint, deliver, ingestUrl } from "../post.js";
 import { markSkipped } from "../policy.js";
 import { fileState, loadSessionState, saveSessionState, withFileState } from "../state.js";
 import { SESSION_END_EVENT, settleDelayMs, settledSize, } from "./session_end.js";
@@ -425,12 +427,21 @@ async function hookBody(ctx, budgetMs, hookStartedAt) {
     // session-keyed states can fire BEFORE a project has been resolved at all —
     // `unsupported_runtime` fires before anything else runs. Only
     // `capture_confirmed` needs one, and only it supplies one.
-    const notice = (state, repoKey = null) => renderNotice({
+    const notice = (state, repoKey = null, rejected, endsAt) => renderNotice({
         home: ctx.home,
         sessionId: input.sessionId,
         nodeVersion: ctx.nodeVersion,
         repoKey,
         now: () => new Date(),
+        // `11A`: states 2 and 5 carry a credential. The command is the channel's, and the claim is
+        // keyed by the credential, so replacing it re-arms the message.
+        ...(rejected === undefined
+            ? {}
+            : {
+                authCommand: authCommandFor(ctx.env, ctx.selfPath ?? ""),
+                fingerprint: credentialFingerprint(rejected),
+            }),
+        ...(endsAt === undefined ? {} : { endsAt }),
     }, state);
     if (!meetsNodeFloor(ctx.nodeVersion))
         return notice("unsupported_runtime");
@@ -790,10 +801,34 @@ async function hookBody(ctx, budgetMs, hookStartedAt) {
     // "have I already said this today" check belongs here, because the atomic `wx`
     // claim already is that check, and a second one could disagree with it.
     if (delivery.kind === "attempted") {
-        if (delivery.disposition === "fatal")
-            return notice("credential_revoked");
-        if (delivery.disposition === "ok")
+        if (delivery.disposition === "fatal") {
+            // ⛔ QUIET DURING ROTATION (`11A`). This hook loaded its credential before an `auth` replaced
+            // the file; its 401 is about a credential that is already gone. If what is on disk NOW is a
+            // different credential, there is nothing to tell the user — the stop is keyed to the old
+            // fingerprint and so does not apply to the new one.
+            const current = loadCredential({ env: ctx.env, home: ctx.home });
+            if (current.kind === "ok" &&
+                credentialFingerprint(current.credential) !== credentialFingerprint(load.credential)) {
+                return null;
+            }
+            return notice("credential_revoked", null, load.credential);
+        }
+        if (delivery.disposition === "ok") {
+            // `CR-234d` (12A): a 2xx carries where the credential stands (`X-Credential-Expires`). Remember it in
+            // the SIDECAR — never in `credentials.json`, which a hook must not rewrite (R10) — and, from 14 days
+            // before the end, say so once per machine per day. It outranks the positive message: that one repeats
+            // daily, this one is the only way a person learns capture will stop on a date.
+            if (delivery.credentialExpires != null) {
+                const meta = noteCredentialExpiry(ctx.home, ctx.env, credentialFingerprint(load.credential), delivery.credentialExpires, new Date());
+                const endsAt = endingSoon(meta, Date.now());
+                if (endsAt !== null) {
+                    const ending = notice("credential_ending", null, load.credential, endsAt);
+                    if (ending !== null)
+                        return ending;
+                }
+            }
             return notice("capture_confirmed", projectKey);
+        }
     }
     return null;
 }

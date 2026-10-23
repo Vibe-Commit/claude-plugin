@@ -24,8 +24,11 @@
  * invented here: `CR-112` (W8) owns the five-absence grammar as one set, and
  * adding a variant now is what that task exists to prevent.
  */
-import { COMMANDS, CREDENTIAL, ERRORS, HELP, OFF, STATUS, URLS, relativeAge } from "../copy/index.js";
+import { COMMANDS, ERRORS, HELP, OFF, STATUS, URLS, relativeAge } from "../copy/index.js";
+import { authCommandFor } from "../install.js";
+import { credentialFingerprint } from "../post.js";
 import { isProjectAllowed, revokeProject } from "../consent.js";
+import { endDateText, endingSoon, metaFor } from "../credential_meta.js";
 import { loadCredential, savedCredentialExists } from "../credential.js";
 import { EXIT } from "../exit.js";
 import { resolveRepoSlug } from "../git.js";
@@ -33,8 +36,9 @@ import { emitJson } from "../json.js";
 import { readInferredSkipped } from "../inferred_tally.js";
 import { readPruneTally } from "../pending_prune.js";
 import { resolveProjectKeys } from "../project.js";
-import { commitsWaitingForRepo, heldAtEndForRepo, inferredUnacknowledgedForRepo, lastReceiptForRepo, lastSendForRepo, leanHeldForRepo, leanSessionsForRepo, openTailForRepo, stuckForRepo, stuckSpoolLinesForRepo, writtenOffForRepo, } from "../state.js";
+import { commitsWaitingForRepo, heldAtEndForRepo, inferredUnacknowledgedForRepo, lastReceiptForRepo, lastSendForRepo, leanHeldForRepo, leanSessionsForRepo, openTailForRepo, stuckForRepo, stoppedForRepo, stuckSpoolLinesForRepo, writtenOffForRepo, } from "../state.js";
 import { LABEL_GUTTER, WRAP_COLUMNS, glyph, labelled, paint, renderErrorBlock, tildePath, truncatePath, wrap, } from "../term.js";
+import { credentialProblem, rejectedCredentialBlock } from "./credential_problem.js";
 import { writeLines } from "./context.js";
 /** §10.3 indents the gutter rows four columns under the state line. */
 const ROW_INDENT = 4;
@@ -110,7 +114,19 @@ export function status(ctx, argv = []) {
     // counted, never touching `commitsWaitingForRepo` or its JSON number.
     const stuckSpoolLines = stuckSpoolLinesForRepo(ctx.home, projectKey, nowMs);
     const receipt = lastReceiptForRepo(ctx.home, projectKey);
+    const load = loadCredential({ env: ctx.env, home: ctx.home });
+    // `11A`: a standing 401 stop for THE CREDENTIAL IN USE. Keyed on its fingerprint like the stop
+    // itself, so a reconnect clears it with nothing to reset — which is how the user sees the fix worked.
+    const fingerprint = load.kind === "ok" ? credentialFingerprint(load.credential) : null;
+    const stopped = fingerprint === null ? null : stoppedForRepo(ctx.home, projectKey, fingerprint);
+    const authCommand = authCommandFor(ctx.env, ctx.selfPath);
+    // `CR-234d` (12A): the credential nears its absolute cap. A warning, not a stop — capture still works —
+    // from what the hook last heard (`X-Credential-Expires`), so it is as fresh as the last capture.
+    const endsAt = fingerprint === null ? null : endingSoon(metaFor(ctx.home, fingerprint), ctx.now().getTime());
+    const endsText = endsAt === null ? null : endDateText(endsAt);
     const kind = on &&
+        stopped === null &&
+        endsText === null &&
         writtenOff.gaps === 0 &&
         heldAtEnd.bytes === 0 &&
         openTail.ids.length === 0 &&
@@ -131,7 +147,6 @@ export function status(ctx, argv = []) {
         lines.push(labelled(ROW_INDENT, STATUS.lastSuccessLabel, STATUS.lastSuccessValue(relativeAge(lastSend.at, ctx.now().getTime()), lastSend.seq)));
     }
     lines.push(labelled(ROW_INDENT, STATUS.dashboardLabel, paint(ctx.colour, "accent", URLS.dashboard)));
-    const load = loadCredential({ env: ctx.env, home: ctx.home });
     // §13.3 — `--json` emits NOTHING BUT the JSON document on stdout, so the
     // screen assembled above is DISCARDED rather than printed beside it.
     //
@@ -146,7 +161,7 @@ export function status(ctx, argv = []) {
     // `outcome` carries the on/off distinction the glyph carries on screen.
     if (argv.includes("--json")) {
         if (load.kind !== "ok" && load.kind !== "absent") {
-            writeLines(ctx.stderr, credentialProblem(load, ctx.colour));
+            writeLines(ctx.stderr, credentialProblem(load, ctx.colour, authCommand));
             return EXIT.failure;
         }
         emitJson(ctx.stdout, "status", on ? "on" : "off", {
@@ -194,12 +209,15 @@ export function status(ctx, argv = []) {
             live_stuck: { bytes: stuck.liveStuck.bytes, sessions: stuck.liveStuck.sessions },
             held_idle: { bytes: stuck.heldIdle.bytes, sessions: stuck.heldIdle.sessions },
             lean_sessions: leanSessions,
+            // `11A`. `null` when no session is held by a 401 for the credential in use, else how many and
+            // when the newest stop was. ⛔ A contract change, recorded in `json-read-verbs.test.ts` (FC12).
+            credential_stopped: stopped === null ? null : { sessions: stopped.sessions, at_ms: stopped.atMs },
         });
         return on ? EXIT.ok : EXIT.notConnected;
     }
     if (load.kind !== "ok" && load.kind !== "absent") {
         writeLines(ctx.stdout, lines);
-        writeLines(ctx.stderr, credentialProblem(load, ctx.colour));
+        writeLines(ctx.stderr, credentialProblem(load, ctx.colour, authCommand));
         return EXIT.failure;
     }
     // `TODOS[184]` (VL's D4 ruling): built once, placed in one of two spots below depending on whether
@@ -263,6 +281,19 @@ export function status(ctx, argv = []) {
     // variable deliberately with no file to shadow and must not be nagged for it.
     if (load.kind === "ok" && load.credential.source === "env" && savedCredentialExists(ctx.home)) {
         lines.push("", ...wrap(STATUS.credentialShadowed, 2));
+    }
+    if (endsText !== null) {
+        lines.push("", ...wrap(STATUS.credentialEnding(endsText, authCommand), 2));
+    }
+    if (stopped !== null && fingerprint !== null) {
+        lines.push("", ...rejectedCredentialBlock({
+            home: ctx.home,
+            fingerprint,
+            nowMs,
+            authCommand,
+            colour: ctx.colour,
+            standing: true,
+        }));
     }
     lines.push("", ...actionLines(ctx, on));
     writeLines(ctx.stdout, lines);
@@ -363,52 +394,5 @@ export function off(ctx, argv = []) {
         ...wrap(OFF.note, 2),
     ]);
     return EXIT.ok;
-}
-/**
- * The three credential problems that are worth four different fixes on an
- * interactive surface. The hook collapses them to one `systemMessage`; here the
- * user can act, so §13.6 gets its full what / why / fix.
- *
- * None of these lines can carry credential bytes: the plaintext leaves
- * `IngestCredential` only through `expose()`, and no copy path calls it.
- */
-function credentialProblem(load, colour) {
-    switch (load.kind) {
-        case "wrong-class":
-            return renderErrorBlock({
-                kind: "bad",
-                what: CREDENTIAL.wrongClassWhat,
-                why: [
-                    load.source === "env"
-                        ? CREDENTIAL.wrongClassEnvWhy
-                        : CREDENTIAL.wrongClassFileWhy,
-                ],
-                fixLabel: CREDENTIAL.wrongClassFix,
-                fixes: [CREDENTIAL.wrongClassCommand],
-            }, colour);
-        case "insecure-file":
-            return renderErrorBlock({
-                kind: "bad",
-                what: CREDENTIAL.insecureFileWhat,
-                why: [
-                    `${CREDENTIAL.insecureFileWhyLabel} ${truncatePath(load.path, 60)}`,
-                    `${CREDENTIAL.insecureFileModeLabel} ${load.mode}`,
-                    CREDENTIAL.insecureFileWhy,
-                ],
-                fixLabel: CREDENTIAL.insecureFileFix,
-                fixes: [COMMANDS.chmodCredentials],
-            }, colour);
-        case "unreadable":
-            return renderErrorBlock({
-                kind: "bad",
-                what: CREDENTIAL.unreadableWhat,
-                why: [
-                    `${CREDENTIAL.insecureFileWhyLabel} ${truncatePath(load.path, 60)}`,
-                    CREDENTIAL.unreadableWhy,
-                ],
-                fixLabel: CREDENTIAL.unreadableFix,
-                fixes: [CREDENTIAL.unreadableCommand],
-            }, colour);
-    }
 }
 //# sourceMappingURL=status.js.map

@@ -326,6 +326,39 @@ export function stuckForRepo(home, repoKey, nowMs = Date.now(), windowMs = SESSI
         heldIdle: { bytes: idleBytes, sessions: idleSessions, ids: idleIds },
     };
 }
+/**
+ * Sessions of this repo that a `fatal` (401) stop is holding for THIS credential — `11A`, `status`.
+ *
+ * Keyed on the fingerprint exactly as `isStopped` is, so a reconnect clears it by itself: the stop
+ * on disk names the OLD credential and no longer applies to the new one. `atMs` is the newest stop,
+ * or null when a stop's timestamp does not parse.
+ */
+export function stoppedForRepo(home, repoKey, fingerprint) {
+    const dir = repoSessionsDir(home, repoKey);
+    if (dir === null)
+        return null;
+    let entries;
+    try {
+        entries = readdirSync(dir);
+    }
+    catch {
+        return null;
+    }
+    let sessions = 0;
+    let newest = null;
+    for (const entry of entries) {
+        if (!entry.endsWith(".json"))
+            continue;
+        const session = readStateAt(join(dir, entry));
+        if (!isStopped(session, fingerprint) || session.stop === null)
+            continue;
+        sessions += 1;
+        const at = Date.parse(session.stop.at);
+        if (Number.isFinite(at) && (newest === null || at > newest))
+            newest = at;
+    }
+    return sessions === 0 ? null : { sessions, atMs: newest };
+}
 /** Commit lines waiting in a session's spool or pending file. */
 function commitLinesFor(dir, stem, nowMs) {
     let n = 0;

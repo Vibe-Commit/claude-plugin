@@ -55,7 +55,8 @@
  * @provenance vibecommit-mcp src/transport/server.ts — POST /oauth/ingest-credential is the mint route, verified
  * @provenance vibecommit-web app/api/ingest-credentials/route.ts — the dashboard producer the paste path still serves, verified
  */
-import { AUTH, HELP, URLS } from "../copy/index.js";
+import { AUTH, COMMANDS, DEVICE, HELP, URLS } from "../copy/index.js";
+import { authCommandFor } from "../install.js";
 import { writeLines } from "./context.js";
 import { EXIT } from "../exit.js";
 import { INGEST_TOKEN_PREFIX, IngestCredential, saveCredential } from "../credential.js";
@@ -68,6 +69,8 @@ import { paint, renderErrorBlock, tildePath, wrap } from "../term.js";
 const STDIN_FLAG = "--stdin";
 /** `CR-226`. Skip the browser and go straight to the prompt. */
 const PASTE_FLAG = "--paste";
+/** `CR-234d`. Sign in by CODE, approved on another device — TTY only. */
+const DEVICE_FLAG = "--device";
 export async function auth(ctx, argv, deps = {}) {
     // ⛔ THE ARGV REFUSAL COMES FIRST, before stdin is read, resumed or opened.
     // Anything else would mean the secret in `argv` had already been accepted by
@@ -92,11 +95,33 @@ export async function auth(ctx, argv, deps = {}) {
         return EXIT.ok;
     }
     const piped = argv.includes(STDIN_FLAG) || !ctx.stdinIsTty;
+    // `CR-234d`: `--device` is TTY only (the approval is a person's) and is the opposite of `--paste`.
+    if (argv.includes(DEVICE_FLAG) && (piped || argv.includes(PASTE_FLAG))) {
+        writeLines(ctx.stderr, renderErrorBlock(piped
+            ? {
+                kind: "bad",
+                what: DEVICE.needsTerminalWhat,
+                why: [DEVICE.needsTerminalWhy],
+                fixLabel: DEVICE.needsTerminalFix,
+                fixes: [DEVICE.needsTerminalCommand(authCommandFor(ctx.env, ctx.selfPath))],
+            }
+            : {
+                kind: "bad",
+                what: DEVICE.conflictWhat,
+                why: [DEVICE.conflictWhy],
+                fixLabel: DEVICE.conflictFix,
+                fixes: [COMMANDS.auth, `${COMMANDS.auth} ${PASTE_FLAG}`],
+            }, ctx.colour));
+        return EXIT.usage;
+    }
     // ── `CR-226`: the browser, first, on a terminal only. ──────────────────────
     if (!piped && !argv.includes(PASTE_FLAG) && deps.browser !== undefined) {
-        const minted = await deps.browser(ctx, "auth");
+        const minted = await deps.browser(ctx, "auth", { device: argv.includes(DEVICE_FLAG) });
         if (minted.kind === "saved")
-            return saved(ctx);
+            return saved(ctx, minted.notes);
+        // The user said NO at the replace confirmation: not a failure of the browser, so no paste prompt.
+        if (minted.kind === "declined")
+            return EXIT.failure;
         // The reason is already on stderr. The documented fallback is the paste
         // this verb has always had, with the page that mints one named first.
         writeLines(ctx.stdout, [
@@ -142,14 +167,16 @@ export async function auth(ctx, argv, deps = {}) {
     return saved(ctx);
 }
 /** The one confirmation, whichever path wrote the file. */
-function saved(ctx) {
-    writeLines(ctx.stdout, renderErrorBlock({
-        kind: "ok",
-        what: AUTH.savedWhat,
-        why: [AUTH.savedWhy(tildePath(credentialsPath(ctx.home), ctx.home))],
-        fixLabel: AUTH.nextLabel,
-        fixes: [AUTH.nextCommand],
-    }, ctx.colour));
+function saved(ctx, notes = []) {
+    writeLines(ctx.stdout, [
+        ...renderErrorBlock({
+            kind: "ok",
+            what: AUTH.savedWhat,
+            why: [AUTH.savedWhy(tildePath(credentialsPath(ctx.home), ctx.home)), ...notes],
+            fixLabel: AUTH.nextLabel,
+            fixes: [AUTH.nextCommand],
+        }, ctx.colour),
+    ]);
     return EXIT.ok;
 }
 //# sourceMappingURL=auth.js.map

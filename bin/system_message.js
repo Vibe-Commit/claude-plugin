@@ -29,8 +29,9 @@
  */
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { SYSTEM_MESSAGE, URLS } from "./copy/index.js";
-import { repoDayNoticePath, sessionNoticePath } from "./paths.js";
+import { COMMANDS, SYSTEM_MESSAGE, URLS } from "./copy/index.js";
+import { endDateText } from "./credential_meta.js";
+import { machineDayNoticePath, repoDayNoticePath, sessionNoticePath } from "./paths.js";
 import { NODE_FLOOR_TEXT } from "./runtime.js";
 /**
  * The UTC calendar day, `YYYY-MM-DD`.
@@ -43,13 +44,32 @@ import { NODE_FLOOR_TEXT } from "./runtime.js";
 export function utcDay(now) {
     return now.toISOString().slice(0, 10);
 }
+/** `COMMANDS.auth` — what a notice names when the caller did not say how this install is run. */
+const DEFAULT_AUTH_COMMAND = COMMANDS.auth;
 /** The one-line text for a state. Never contains an escape sequence. */
-export function noticeText(state, nodeVersion) {
+export function noticeText(state, nodeVersion, authCommand = DEFAULT_AUTH_COMMAND, endsAt) {
     switch (state) {
+        case "credential_ending": {
+            const date = endsAt === undefined ? null : endDateText(endsAt);
+            // No date, no message: a "ends ..." line with a blank in it is worse than silence. The caller
+            // treats an empty text as "write nothing".
+            if (date === null)
+                return "";
+            const line = SYSTEM_MESSAGE.credentialEnding(date, authCommand);
+            return line.length <= SYSTEM_MESSAGE.credentialRejectedBudget
+                ? line
+                : SYSTEM_MESSAGE.credentialEndingFallback(date);
+        }
         case "not_connected":
             return SYSTEM_MESSAGE.notConnected;
-        case "credential_revoked":
-            return SYSTEM_MESSAGE.credentialRevoked;
+        case "credential_revoked": {
+            // ≤120 characters (`11A`). A long plugin realpath would blow it, and a truncated command is
+            // worse than no command: the fallback points at the page that always works.
+            const line = SYSTEM_MESSAGE.credentialRejected(authCommand);
+            return line.length <= SYSTEM_MESSAGE.credentialRejectedBudget
+                ? line
+                : SYSTEM_MESSAGE.credentialRejectedFallback;
+        }
         case "unsupported_runtime":
             return SYSTEM_MESSAGE.unsupportedRuntime(NODE_FLOOR_TEXT, nodeVersion);
         case "capture_confirmed":
@@ -68,8 +88,16 @@ export function noticeText(state, nodeVersion) {
  * this channel's fallback everywhere else too.
  */
 export function noticeClaimPath(ctx, state) {
+    if (state === "credential_ending") {
+        // Per MACHINE and day, and per credential: replacing it re-arms (a new credential has a new end).
+        return machineDayNoticePath(ctx.home, utcDay(ctx.now()), `${state}-${ctx.fingerprint ?? "unknown"}`);
+    }
     if (state !== "capture_confirmed") {
-        return sessionNoticePath(ctx.home, ctx.sessionId, state);
+        // State 2 is keyed by the credential too (`11A`); fingerprints are hex, so the path stays clean.
+        const key = state === "credential_revoked" && ctx.fingerprint !== undefined
+            ? `${state}-${ctx.fingerprint}`
+            : state;
+        return sessionNoticePath(ctx.home, ctx.sessionId, key);
     }
     if (ctx.repoKey === null || ctx.repoKey === "")
         return null;
@@ -113,7 +141,9 @@ export function claimSessionNotice(ctx, state) {
  */
 export function renderNotice(ctx, state) {
     try {
-        const text = noticeText(state, ctx.nodeVersion);
+        const text = noticeText(state, ctx.nodeVersion, ctx.authCommand, ctx.endsAt);
+        if (text === "")
+            return null;
         // A message carrying an escape sequence or a newline is undefined behaviour
         // in Claude Code's renderer, so it is dropped rather than sent — silence is
         // the fallback. Tested by char code, not by a regex holding a literal

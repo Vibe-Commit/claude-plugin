@@ -24,8 +24,8 @@
  * thing testable by handing in an `env`, which a subprocess-based version could
  * only fake by building a directory of shims.
  */
-import { accessSync, chmodSync, constants, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { delimiter, isAbsolute, join, resolve } from "node:path";
+import { accessSync, chmodSync, constants, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { gitProbe } from "./git.js";
 /** The command name D55 kept. */
 const BIN = "vibecommit";
@@ -51,6 +51,33 @@ export function classifyInstall(env, selfPath) {
     if (self !== null && other !== null && self === other)
         return { kind: "ours" };
     return { kind: "foreign", resolved: other ?? found };
+}
+/** The file the plugin repo pins its vendored bundle with, next to `bin/` (`claude-plugin`). */
+const PLUGIN_BUNDLE_PIN = "capture-bundle.json";
+export function installChannel(env, selfPath) {
+    const self = realpathOrNull(selfPath);
+    if (self === null)
+        return { kind: "unknown", command: BIN };
+    if (classifyInstall(env, selfPath).kind === "ours")
+        return { kind: "npm", command: BIN };
+    if (existsSync(join(dirname(dirname(self)), PLUGIN_BUNDLE_PIN))) {
+        // Quoted only when it has to be: a plugin cache path can hold a space.
+        return { kind: "plugin", command: /[\s"'$`\\]/.test(self) ? `node "${self.replace(/(["$`\\])/g, "\\$1")}"` : `node ${self}` };
+    }
+    return { kind: "npm", command: BIN };
+}
+/** What a user types to replace this machine's credential, for THIS install: `<channel command> auth`. */
+export function authCommandFor(env, selfPath) {
+    return `${installChannel(env, selfPath).command} ${AUTH_VERB}`;
+}
+const AUTH_VERB = "auth";
+/**
+ * What a user types to run the device sign-in again, for THIS install (`CR-234d`): `<channel command>
+ * connect --device`. The same channel rule as `authCommandFor`, so a plugin-only machine — which has no
+ * `vibecommit` on PATH — is not told to run a command that does not exist.
+ */
+export function connectDeviceCommandFor(env, selfPath) {
+    return `${installChannel(env, selfPath).command} connect --device`;
 }
 /** The first executable `name` on PATH, or null. */
 export function resolveOnPath(env, name) {

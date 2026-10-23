@@ -104,8 +104,12 @@ export async function signIn(deps) {
             challenge: pkce.challenge,
             state,
             redirectUri: loopback.redirectUri,
+            ...(deps.orgId === undefined ? {} : { orgId: deps.orgId }),
         });
-        deps.onAuthorizeUrl(url, deps.openBrowser(url));
+        const opened = deps.openBrowser(url);
+        if (!opened && deps.fallbackOnNoBrowser === true)
+            return { kind: "no-browser" };
+        deps.onAuthorizeUrl(url, opened);
         callback = await loopback.result;
     }
     finally {

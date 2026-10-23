@@ -28,15 +28,25 @@
  * types precisely to replace what is there.
  */
 import { hostname as osHostname } from "node:os";
+import { headlessReason } from "../device_mode.js";
+import { resolveOnPath } from "../install.js";
 import { AUTH, COMMANDS, SIGNIN } from "../copy/index.js";
-import { saveCredential } from "../credential.js";
+import { loadCredential } from "../credential.js";
 import { EXIT } from "../exit.js";
 import { mcpUrl } from "../oauth/discovery.js";
 import { machineLabel } from "../oauth/mint.js";
 import { loadSession } from "../oauth/session.js";
-import { HTTP_TIMEOUT_MS, mintWithSession, openBrowser as platformOpenBrowser, signIn, } from "../oauth/signin.js";
+import { authorizedAccessToken, HTTP_TIMEOUT_MS, mintWithSession, openBrowser as platformOpenBrowser, signIn, } from "../oauth/signin.js";
 import { paint, renderErrorBlock, wrap } from "../term.js";
 import { writeLines } from "./context.js";
+import { deviceCredential } from "./device_credential.js";
+import { finishMint } from "./finish_mint.js";
+import { probeCredential } from "./probe.js";
+// `finishMint` and its types moved to `finish_mint.ts` (`CR-234d`) so the device flow can share them without
+// a cycle. Re-exported here because this is where every caller and test has always found them.
+export { finishMint } from "./finish_mint.js";
+/** `signInBeat`'s sentinel for "no browser, go to the device flow". Never an exit code a verb returns. */
+export const NO_BROWSER = -1;
 /**
  * The browser sign-in beat — `CR-084d`.
  *
@@ -46,8 +56,18 @@ import { writeLines } from "./context.js";
  */
 export async function signInBeat(ctx, options) {
     if (options.replace !== true && loadSession(ctx.home).kind === "ok") {
-        writeLines(ctx.stdout, wrap(SIGNIN.alreadySignedIn, 2));
-        return EXIT.ok;
+        const live = options.verify === true
+            ? await authorizedAccessToken({
+                home: ctx.home,
+                fetch: options.fetch ?? fetch,
+                nowMs: () => ctx.now().getTime(),
+            })
+            : null;
+        if (live === null || live.kind !== "expired") {
+            writeLines(ctx.stdout, wrap(SIGNIN.alreadySignedIn, 2));
+            return EXIT.ok;
+        }
+        // The refresh grant was refused: the session is over. Sign in again below.
     }
     const endpoint = mcpUrl(ctx.env);
     if (endpoint === null) {
@@ -60,6 +80,9 @@ export async function signInBeat(ctx, options) {
         fetch: options.fetch ?? fetch,
         nowMs: () => ctx.now().getTime(),
         openBrowser: options.openBrowser ?? platformOpenBrowser,
+        ...(options.orgId === undefined ? {} : { orgId: options.orgId }),
+        ...(options.deadlineMs === undefined ? {} : { deadlineMs: options.deadlineMs }),
+        ...(options.fallbackToDevice === true ? { fallbackOnNoBrowser: true } : {}),
         onAuthorizeUrl: (url, opened) => {
             writeLines(ctx.stdout, [
                 "",
@@ -77,6 +100,8 @@ export async function signInBeat(ctx, options) {
         writeLines(ctx.stdout, ["", ...wrap(SIGNIN.done, 2)]);
         return EXIT.ok;
     }
+    if (outcome.kind === "no-browser")
+        return NO_BROWSER;
     writeLines(ctx.stderr, ["", ...signInFailure(ctx, options.retry, outcome)]);
     return EXIT.failure;
 }
@@ -117,7 +142,7 @@ function signInError(ctx, retry, what, why, fixLabel = SIGNIN.noServerFix) {
  * because what comes next differs by caller (`auth` ends, `connect` goes on to
  * capture) and a confirmation here would be a second one.
  */
-export async function browserCredential(ctx, retry, deps = {}) {
+export async function browserCredential(ctx, retry, deps = {}, options = {}) {
     // Resolved ONCE and handed to both halves, so the session and the credential
     // cannot come from two different servers.
     const endpoint = mcpUrl(ctx.env);
@@ -125,11 +150,45 @@ export async function browserCredential(ctx, retry, deps = {}) {
         writeLines(ctx.stderr, signInError(ctx, retry, SIGNIN.noServerWhat, SIGNIN.noServerRefusedWhy));
         return { kind: "failed" };
     }
-    if ((await signInBeat(ctx, { ...deps, retry })) !== EXIT.ok)
+    const fetchImpl = deps.fetch ?? fetch;
+    // ⛔ THE CREDENTIAL THIS RE-AUTH REPLACES, and only from the FILE (plan item 2). `VIBECOMMIT_TOKEN`
+    // wins `loadCredential`, so an exported variable makes `source` "env" and `prior` null: an
+    // environment credential is the CI path (D56) and is never probed, bound or retired from here.
+    const loaded = loadCredential({ env: ctx.env, home: ctx.home });
+    const prior = loaded.kind === "ok" && loaded.credential.source === "file"
+        ? {
+            credential: loaded.credential,
+            // Not recorded: it is about to be replaced, and its facts must not outlive it.
+            who: await probeCredential(ctx, loaded.credential, fetchImpl, { record: false }),
+        }
+        : null;
+    // ⛔ DEVICE MODE (`CR-234d`, plan item 7). By request (`--device`), or because this machine has no browser
+    // of its own: an SSH session, or a Linux box with no display. The loopback sign-in would open a browser
+    // nobody can see and wait out its deadline, so the machine asks for a code instead. The prefilled link is
+    // opened only where a browser plausibly exists — `--device` on a desktop — never on a headless box.
+    const headless = headlessReason(ctx.env, deps.platform ?? process.platform);
+    if (options.device === true || headless !== null) {
+        return await deviceCredential(ctx, { endpoint, prior, openLink: headless === null }, deps);
+    }
+    const signedIn = await signInBeat(ctx, {
+        ...deps,
+        retry,
+        // 2(a): ask the authorize page to bind the org the old credential belongs to. Only on a 200 —
+        // an org the server would not vouch for is not worth asking for.
+        ...(prior?.who.kind === "ok" ? { orgId: prior.who.orgId } : {}),
+        // A browser that cannot be opened is a headless machine the check above did not recognise: go to
+        // the device flow rather than print a URL and wait for a callback nobody can make.
+        fallbackToDevice: true,
+        openBrowser: deps.openBrowser ?? ((url) => canOpenBrowser(ctx.env, deps.platform ?? process.platform) && platformOpenBrowser(url)),
+    });
+    if (signedIn === NO_BROWSER) {
+        return await deviceCredential(ctx, { endpoint, prior, openLink: false }, deps);
+    }
+    if (signedIn !== EXIT.ok) {
         return { kind: "failed" };
+    }
     const label = machineLabel((deps.hostname ?? osHostname)());
     writeLines(ctx.stdout, ["", ...wrap(AUTH.minting(label), 2)]);
-    const fetchImpl = deps.fetch ?? fetch;
     const mint = () => mintWithSession(endpoint, label, {
         home: ctx.home,
         fetch: fetchImpl,
@@ -151,13 +210,27 @@ export async function browserCredential(ctx, retry, deps = {}) {
         outcome = await mint();
     }
     if (outcome.kind === "ok") {
-        // Through the CR-216 writer, so the 0700/0600 double-chmod and the
-        // wrong-class refusal apply exactly as they do to a pasted credential.
-        saveCredential(ctx.home, outcome.credential);
-        return { kind: "saved", credential: outcome.credential };
+        return await finishMint(ctx, {
+            minted: outcome.credential,
+            facts: outcome.facts,
+            prior,
+            endpoint,
+            fetch: fetchImpl,
+            // The block guards a re-auth that lands in a DIFFERENT workspace. The device flow passes
+            // "always" — there the approver is not the person at this terminal.
+            confirm: "on-replace",
+        });
     }
     writeLines(ctx.stderr, ["", ...renderErrorBlock({ kind: "bad", what: AUTH.mintFailedWhat, why: [mintWhy(outcome)] }, ctx.colour)]);
     return { kind: "failed" };
+}
+/**
+ * Is there anything on this machine that could open a URL? `openBrowser` reports `true` once `spawn` returns,
+ * and a missing `xdg-open` only surfaces later as an asynchronous error — so on Linux the answer is checked
+ * up front. macOS and Windows ship `open` and `start`.
+ */
+function canOpenBrowser(env, platform) {
+    return platform !== "linux" || resolveOnPath(env, "xdg-open") !== null;
 }
 /** One `why` per way the mint can fail. No status codes on screen (§13.6). */
 function mintWhy(outcome) {
