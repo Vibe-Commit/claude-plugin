@@ -24,6 +24,7 @@ import { Writable } from "node:stream";
 import { resolveAgentId } from "./agents/registry.js";
 import { auth } from "./commands/auth.js";
 import { browserCredential } from "./commands/browser_credential.js";
+import { updateNudge } from "./update_nudge.js";
 import { connect } from "./commands/connect.js";
 import { finalize } from "./commands/finalize.js";
 import { off, status } from "./commands/status.js";
@@ -160,6 +161,24 @@ async function main(argv) {
         return EXIT.usage;
     }
     const ctx = interactiveContext(argv);
+    const code = await runVerb(verb, argv, ctx);
+    // `13A`: the nudge is the LAST line of a verb that SUCCEEDED — never after an error (the §13.6 fix
+    // line must stay last) and never with `--json`. It lives here, not in the verbs, so no verb's own
+    // output or exit path can reach it by accident; `updateNudge` itself fails silent.
+    if (code === EXIT.ok &&
+        (verb === "status" || verb === "connect" || verb === "auth") &&
+        !argv.includes("--json") &&
+        !argv.includes("--help") &&
+        !argv.includes("-h")) {
+        const lines = await updateNudge(ctx);
+        if (lines.length > 0)
+            process.stdout.write(`${lines.join("\n")}\n`);
+    }
+    return code;
+}
+/** The real browser beat for `auth` and `connect`: the real network and the real clock, plus `--device`. */
+const realBrowser = (ctx, retry, options) => browserCredential(ctx, retry, {}, options);
+async function runVerb(verb, argv, ctx) {
     switch (verb) {
         case "auth":
             // `CR-216/U2`. Both readers are injected here rather than reached for
@@ -171,7 +190,7 @@ async function main(argv) {
                 // `CR-226`. The browser mint, first on a terminal; the two readers above
                 // stay the fallback. Injected HERE and nowhere else — the verb's default
                 // is paste-only, so this line is what makes the route reachable.
-                browser: browserCredential,
+                browser: realBrowser,
             });
         case "connect":
             // `--sign-in` (CR-084d) is a FLAG, not a verb: `VERBS` is what `renderHelp`
@@ -182,7 +201,12 @@ async function main(argv) {
             // route is unreachable from the install path.
             // `TODOS[184]`: `help` added — `connect` has no `argv` param, so its `--help`/`-h` check reads this
             // option field, computed the same way `signIn` already is.
-            return await connect(ctx, { signIn: argv.includes("--sign-in"), help: argv.includes("--help") || argv.includes("-h") }, { browser: browserCredential });
+            return await connect(ctx, {
+                signIn: argv.includes("--sign-in"),
+                // `CR-234d`: sign in by code.
+                device: argv.includes("--device"),
+                help: argv.includes("--help") || argv.includes("-h"),
+            }, { browser: realBrowser });
         case "status":
             // `argv.slice(1)` for the same reason `why` and `report` take it: `status`
             // reads its own `--json` flag rather than this package acquiring an
@@ -449,6 +473,8 @@ if (invokedAsBinary()) {
             // and this branch is never taken.
             agentId: resolveAgentId(argv),
             readStdin,
+            // `11A`: state 2 names the command that reconnects THIS install.
+            selfPath: process.argv[1] ?? "",
         });
     }
     else {

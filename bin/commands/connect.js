@@ -26,7 +26,7 @@
  *
  * @provenance vibecommit-mcp src/transport/server.ts — POST /oauth/ingest-credential now mints one, verified
  */
-import { AUTH, CONNECT, COMMANDS, AGENT_HOOKS, COMMIT_HOOK, ERRORS, HELP, PATH_CLASH, RUNTIME, URLS, } from "../copy/index.js";
+import { AUTH, CONNECT, COMMANDS, AGENT_HOOKS, COMMIT_HOOK, ERRORS, HELP, PATH_CLASH, REJECTED, DEVICE, RUNTIME, URLS, } from "../copy/index.js";
 import { dialectFor } from "../agents/registry.js";
 import { grantProject, isAffirmative, isProjectAllowed } from "../consent.js";
 import { loadCredential } from "../credential.js";
@@ -34,12 +34,14 @@ import { EXIT } from "../exit.js";
 import { resolveRepoSlug } from "../git.js";
 import { confinementRoots, readSpan, DEFAULT_HOOK_BUDGET_MS } from "../hooks/entry.js";
 import { installAgentHooks } from "../agent_install.js";
-import { classifyInstall, installPostCommitHook } from "../install.js";
-import { CAPTURE_NOT_APPROVED, deliver, ingestUrl, } from "../post.js";
+import { authCommandFor, classifyInstall, installPostCommitHook } from "../install.js";
+import { CAPTURE_NOT_APPROVED, deliver, credentialFingerprint, ingestUrl, } from "../post.js";
 import { resolveProjectKeys } from "../project.js";
 import { meetsNodeFloor, NODE_FLOOR_TEXT } from "../runtime.js";
 import { credentialsPath } from "../paths.js";
 import { paint, renderErrorBlock, tildePath, truncatePath, wrap } from "../term.js";
+import { credentialProblem, rejectedCredentialBlock } from "./credential_problem.js";
+import { probeCredential } from "./probe.js";
 import { writeLines } from "./context.js";
 import { signInBeat } from "./browser_credential.js";
 export async function connect(ctx, options = {}, deps = {}) {
@@ -49,6 +51,17 @@ export async function connect(ctx, options = {}, deps = {}) {
     if (options.help === true) {
         writeLines(ctx.stdout, [HELP.commands.connect]);
         return EXIT.ok;
+    }
+    // `CR-234d`: sign-in by code waits on a person and ends in a question — a terminal or nothing.
+    if (options.device === true && !ctx.stdinIsTty) {
+        writeLines(ctx.stderr, renderErrorBlock({
+            kind: "bad",
+            what: DEVICE.needsTerminalWhat,
+            why: [DEVICE.needsTerminalWhy],
+            fixLabel: DEVICE.needsTerminalFix,
+            fixes: [DEVICE.needsTerminalCommand(authCommandFor(ctx.env, ctx.selfPath))],
+        }, ctx.colour));
+        return EXIT.usage;
     }
     // (1) The runtime floor refuses LOUDLY here, unlike in the hook: the user is
     // watching and can act, and D57 §DX11 asks for exactly that asymmetry.
@@ -120,11 +133,13 @@ export async function connect(ctx, options = {}, deps = {}) {
  */
 async function afterConsent(ctx, keys, options, deps) {
     if (options.signIn === true) {
-        const code = await signInBeat(ctx, { retry: "sign-in" });
+        // `G8a`: `verify` — a session file that loads but that the server refuses to renew is expired,
+        // and "already signed in" over it was the bug.
+        const code = await signInBeat(ctx, { retry: "sign-in", verify: true, ...(deps.fetch === undefined ? {} : { fetch: deps.fetch }) });
         if (code !== EXIT.ok)
             return code;
     }
-    return await credentialBeat(ctx, keys, deps);
+    return await credentialBeat(ctx, keys, deps, options);
 }
 /**
  * The disclosure block — `CR-111d`, style guide §10.2 transcribed.
@@ -184,10 +199,29 @@ function disclosure(ctx) {
  * name, and on npm >= 7 the clash surfaces as EEXIST during the first install of
  * exactly the population that installs commit tooling.
  */
-async function credentialBeat(ctx, keys, deps) {
+async function credentialBeat(ctx, keys, deps, options = {}) {
     const load = loadCredential({ env: ctx.env, home: ctx.home });
     if (load.kind === "ok") {
-        return await captureBeat(ctx, keys, load.credential);
+        // ⛔ ASK THE SERVER BEFORE SENDING — `R12` (D13 = A), G1. `connect` used to send whatever loaded
+        // and print "Recording… Connected." over the 401, and the hook's own 401 copy sent users here to
+        // reconnect. The probe runs FIRST so a dead credential never writes a stop (the send is skipped
+        // and the turns stay held), and so nothing below can say "Connected" without the server's yes.
+        const probe = await probeCredential(ctx, load.credential, deps.fetch);
+        if (probe.kind === "unauthorized") {
+            writeLines(ctx.stderr, rejectedCredentialBlock({
+                home: ctx.home,
+                fingerprint: credentialFingerprint(load.credential),
+                nowMs: ctx.now().getTime(),
+                authCommand: authCommandFor(ctx.env, ctx.selfPath),
+                colour: ctx.colour,
+                standing: false,
+            }));
+            return EXIT.notConnected;
+        }
+        // Only a 401 proves the credential dead. A 5xx, a 404 from a server that predates the route, a
+        // timeout or a network error says nothing about it — and "a blip is not a failed install" is the
+        // rule `captureBeat` already keeps for the send. So: today's ending, plus one muted line.
+        return await captureBeat(ctx, keys, load.credential, probe.kind === "unavailable");
     }
     // ⛔ ONLY FOR `absent`, AND ONLY WITH A HUMAN AT THE TERMINAL (`CR-226`).
     //   - `absent`: a credential that is present but wrong-class, unreadable or
@@ -197,19 +231,29 @@ async function credentialBeat(ctx, keys, deps) {
     //     opened there waits five minutes for nobody. The old warning is the
     //     right answer for them, and it is what they still get.
     if (load.kind === "absent" && ctx.stdinIsTty && deps.browser !== undefined) {
-        const minted = await deps.browser(ctx, "connect");
+        const minted = await deps.browser(ctx, "connect", { device: options.device === true });
         if (minted.kind === "saved") {
             writeLines(ctx.stdout, [
                 "",
                 ...renderErrorBlock({
                     kind: "ok",
                     what: AUTH.savedWhat,
-                    why: [AUTH.savedWhy(tildePath(credentialsPath(ctx.home), ctx.home))],
+                    why: [AUTH.savedWhy(tildePath(credentialsPath(ctx.home), ctx.home)), ...(minted.notes ?? [])],
                 }, ctx.colour),
             ]);
-            return await captureBeat(ctx, keys, minted.credential);
+            // Already probed by the mint (`finishMint`), so no second probe here.
+            return await captureBeat(ctx, keys, minted.credential, false);
         }
+        // Declined at the replace confirmation: the reason is already on screen, and the user said NO.
+        if (minted.kind === "declined")
+            return EXIT.failure;
         // Failed: the reason is already on stderr. Fall through to the paste path.
+    }
+    // ⛔ R15: a FAULTY file is named as the fault it is, not as "no credential". The fix for a fault is
+    // `auth` (or a `chmod`), and `connect` still never mints over one (D206 §5).
+    if (load.kind !== "absent") {
+        writeLines(ctx.stderr, credentialProblem(load, ctx.colour, authCommandFor(ctx.env, ctx.selfPath)));
+        return EXIT.notConnected;
     }
     writeLines(ctx.stderr, renderErrorBlock({
         kind: "warn",
@@ -236,7 +280,9 @@ async function credentialBeat(ctx, keys, deps) {
  *     there was no credential to start with — by the time this function runs,
  *     the credential exists however it arrived.
  */
-async function captureBeat(ctx, keys, credential) {
+async function captureBeat(ctx, keys, credential, 
+/** The probe could not answer (`R12`): say so once, last, and carry on. Never changes the exit. */
+unconfirmed) {
     // ⚠ EVERY USE BELOW BUT ONE IS THE TOPLEVEL ROLE — locating the transcript,
     // the `repoKey` binding, the slug, the hook install and the copy the user
     // reads. The exception is the redaction root set at `readSpan`, which takes
@@ -337,6 +383,14 @@ async function captureBeat(ctx, keys, credential) {
     // beside the global one, in that order, is what makes the scope difference
     // legible rather than a detail in a sentence.
     agentHookBeat(ctx);
+    if (unconfirmed) {
+        writeLines(ctx.stdout, [
+            "",
+            // Two short lines, never one wrapped: the backticked command must not be split (see `REJECTED`).
+            `  ${paint(ctx.colour, "muted", REJECTED.unconfirmedWhat)}`,
+            `  ${paint(ctx.colour, "muted", REJECTED.unconfirmedFix)}`,
+        ]);
+    }
     return pathClash(ctx);
 }
 /**

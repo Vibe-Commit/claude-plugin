@@ -31,9 +31,10 @@
  *   403 { error: "not_a_member" } · 400 · 429 · 500     refused; no retry helps
  * ```
  *
- * ⚠ Only the `token` field is read out of a 201. The rest is the server's
- * record of the row and this client has no use for it: the credential is opaque,
- * and its expiry is the server's to enforce.
+ * ⚠ The `token` field is the only one a mint cannot do without. `credential.id`,
+ * `credential.expires_at` and `account` are read when present and never required
+ * (`MintFacts`): the credential is opaque and its expiry is the server's to
+ * enforce, so these only feed the sidecar the client says "expired" from.
  *
  * @provenance vibecommit-mcp src/transport/server.ts — POST /oauth/ingest-credential request and response shapes, retyped
  */
@@ -71,7 +72,10 @@ export function machineLabel(hostname) {
  * refused before the server touches the table, so a retry cannot leave two live
  * credentials where the user expected one.
  */
-export async function requestMint(endpoint, access, label, deps) {
+export async function requestMint(endpoint, 
+// A session's access token (the loopback path) or a device approval's `vcmt_` ticket (`CR-234`): the
+// route takes either, and this function only ever spends it as the bearer.
+access, label, deps) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), deps.timeoutMs);
     let res;
@@ -115,6 +119,15 @@ export async function requestMint(endpoint, access, label, deps) {
     }
     if (typeof doc.token !== "string" || !MINTED_SHAPE.test(doc.token))
         return { kind: "malformed" };
-    return { kind: "ok", credential: new IngestCredential(doc.token, "file") };
+    const text = (v) => (typeof v === "string" && v !== "" ? v : null);
+    return {
+        kind: "ok",
+        credential: new IngestCredential(doc.token, "file"),
+        facts: {
+            credentialId: text(doc.credential?.id),
+            expiresAt: text(doc.credential?.expires_at),
+            account: text(doc.account),
+        },
+    };
 }
 //# sourceMappingURL=mint.js.map

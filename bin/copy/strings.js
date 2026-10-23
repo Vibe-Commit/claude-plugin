@@ -120,6 +120,11 @@ export const STATUS = {
      * states the precedence and the undo, and makes no claim about which of the
      * two is correct — the client cannot know that.
      */
+    /**
+     * `CR-234d`, decision 12A: the same fact as the hook's state 5, in `status`'s own register — a sentence
+     * after the rows, with the glyph turned `warn`. The date is absolute and in UTC.
+     */
+    credentialEnding: (date, authCommand) => `This machine's credential ends ${date}. Run \`${authCommand}\` to renew it.`,
     credentialShadowed: "VIBECOMMIT_TOKEN is set and takes precedence over the credential saved on this machine. Unset it to use the saved one.",
     /**
      * `CR-228`, `TODOS[142]` — bytes the client ADVANCED PAST without delivering.
@@ -1290,10 +1295,157 @@ export const FINALIZE = {
      */
     inferredSetAside: (n) => `${n} inferred-squash ${n === 1 ? "pair" : "pairs"} ${n === 1 ? "was" : "were"} given up on: the server kept acknowledging less than was sent.`,
 };
+/**
+ * The credential-rejected block — `11A`, style guide §13.6 what / why / fix, fix LAST.
+ *
+ * Shown by `connect` (exit 3) and `status`. The `why` is true on both of its branches, and says
+ * so: a 401 holds the offset, so reconnecting uploads what was held. The server cannot say whether
+ * the credential was revoked or expired (opaque 401), so the generic `why` names both; a local
+ * `expires_at` in the past lets the client say "expired" outright (`whyExpired`).
+ */
+export const REJECTED = {
+    what: "This machine's credential is no longer accepted.",
+    why: "It was revoked in Settings, or it expired. Held turns upload once reconnected; nothing is lost.",
+    whyExpired: (day) => `It expired on ${day}. Held turns upload once reconnected; nothing is lost.`,
+    fixLabel: "Reconnect this machine:",
+    /**
+     * `R12`. The server did not answer the probe: not a verdict on the credential, so not an error.
+     * TWO lines (`unconfirmedWhat`, `unconfirmedFix`) so the 80-column wrap can never split the backticked
+     * command across lines; `unconfirmed` is their join, the sentence the plan wrote.
+     */
+    unconfirmedWhat: "Couldn't confirm this machine's credential with the server.",
+    unconfirmedFix: "Run `vibecommit status` later.",
+    unconfirmed: "Couldn't confirm this machine's credential with the server. Run `vibecommit status` later.",
+};
+/** `TODOS[184]`-style one-sentence facts the retire step prints; every one is true whatever the server did. */
+export const RETIRE = {
+    retired: "The credential this one replaces is retired.",
+    /** `retired: false` is the server's one uniform answer — it will not say why, so neither do we. */
+    notRetired: "The credential this one replaces was left as it was.",
+    /** A 404: a server that predates the route. */
+    unknown: "Whether the credential this one replaces was retired is unknown: this server cannot retire it.",
+    failed: "The credential this one replaces could not be retired. It stays valid until it expires, and it is listed in Settings.",
+    /** `VIBECOMMIT_TOKEN` shadows the file `auth` just wrote — D206 §4 — and nothing is retired. */
+    envShadows: "VIBECOMMIT_TOKEN is set and takes precedence over the credential just saved. Nothing was retired.",
+};
+/**
+ * The replace confirmation — the `5B` block, in the one case slice 1 shows it: a re-auth that
+ * lands in a DIFFERENT workspace than the credential it replaces. One question, default NO.
+ */
+export const REPLACE = {
+    accountLabel: "account",
+    workspaceLabel: "workspace",
+    replacesLabel: "replaces",
+    /** `R8`: the handle was null — shown as an explicit gap, never a blank. */
+    accountUnavailable: "(GitHub handle unavailable)",
+    /**
+     * A4 §3. The probe of the new credential was not answered, so the workspace match cannot be shown.
+     * The block says so on the `workspace` row, in the gutter's own shape, rather than hiding the row.
+     */
+    workspaceUnconfirmed: "(couldn't confirm with the server)",
+    /** …and the question then names NO workspace — it has none to name. ≤80 columns with the `[y/N]`. */
+    questionUnconfirmed: "Upload this machine's transcripts to the workspace you signed in to?",
+    replacesValue: (org) => `credential for ${org}`,
+    question: (org) => `Upload this machine's transcripts to ${org}?`,
+    declined: "Nothing was saved. The approval is discarded.",
+    /** Ctrl+C at the question (the prompt was aborted): the same outcome as N, said as what it was. */
+    cancelled: "Cancelled. Nothing was saved.",
+    /**
+     * The new credential was created and then declined, so it was never saved. The client revokes it with
+     * the retire route's self form (brief A3); this is what it says when that worked.
+     */
+    /**
+     * A4 §3, fail closed: the device flow's confirmation has nothing to show (no probe, no ticket
+     * workspace), and it never saves without asking. §13.6 what / why / fix, fix last.
+     */
+    unconfirmableWhat: "The workspace for this credential could not be confirmed.",
+    unconfirmableWhyRevoked: "Nothing was saved, and the credential just created was revoked.",
+    unconfirmableWhyOrphan: "Nothing was saved. The credential just created is unused; revoke it in Settings if you want it gone.",
+    unconfirmableFix: "Run the command again:",
+    declinedRevoked: "The credential just created was revoked.",
+    /**
+     * …and when it did not (a server without the self form, or any failure): the credential is live but
+     * unused, so say where to remove it.
+     */
+    declinedOrphan: "The credential just created is unused. Revoke it in Settings if you want it gone.",
+    declinedFix: "Settings:",
+};
+/**
+ * The device sign-in (`CR-234d`, D219, style guide §10.2): the waiting block, its terminal states and the
+ * copy the 5B confirmation reuses from `REPLACE`.
+ *
+ * ⚠ The waiting block is STATIC: no spinner and no ticking countdown (DESIGN.md §13.8). The expiry is an
+ * absolute local time, so the screen is still true when someone reads it ten minutes later over a
+ * scrollback. With `NO_COLOR` or a non-TTY it is identical minus the escapes.
+ */
+export const DEVICE = {
+    /** RFC 8628 §3.3.1: the bare URL and the code are ALWAYS printed, whether or not a browser was opened. */
+    heading: "Approve this machine in a browser on any device:",
+    codeLabel: "Code",
+    expires: (time) => `The code works once and expires at ${time}.`,
+    /** The remote-phishing mitigation: whoever enters the code picks the account this machine uploads to. */
+    shareWarning: "Don't share it: whoever enters it chooses the account this machine uploads to.",
+    waiting: "Waiting for approval…  (Ctrl+C to cancel)",
+    /** Ctrl+C. §13.7: exit 1. Not a failure block — nothing went wrong. */
+    cancelled: "Cancelled. Nothing was changed on this machine.",
+    deniedWhat: "The request was denied in the browser.",
+    deniedWhy: "Nothing was changed on this machine.",
+    deniedFix: "If this was you, run it again:",
+    /** 16C, brief A7: one block for the poll's `access_denied` (gate) and the mint's 403 `code_signin_off`. */
+    gateOffWhat: "Code sign-in is off for this account.",
+    gateOffWhy: "Nothing was approved, and nothing was changed on this machine.",
+    gateOffFix: "Turn on \"Allow approving machines with a code\" in Settings → Machines, then run it again:",
+    expiredWhat: "The code expired before it was approved.",
+    expiredWhy: "Codes last 5 minutes.",
+    expiredFix: "Run it again for a new code:",
+    rateLimitedWhat: "Too many sign-in attempts from this network.",
+    rateLimitedWhy: "Shared networks can hit this limit.",
+    rateLimitedFix: (time) => `Try again after ${time} by running:`,
+    /** The server gave no `retry_after`. */
+    rateLimitedFixUnknown: "Try again in a few minutes by running:",
+    /** No `device_authorization_endpoint` in the discovery document: a server older than this client. */
+    unsupportedWhat: "This server does not offer sign-in by code.",
+    unsupportedWhy: "The sign-in service does not list a device endpoint, so it may be older than this version.",
+    refusedWhat: "The service refused to start a sign-in by code.",
+    refusedWhy: "Nothing was changed on this machine.",
+    unreachableWhat: "Sign-in by code could not reach the service.",
+    unreachableWhy: "The service stopped answering. Nothing was changed on this machine.",
+    malformedWhat: "Sign-in by code got an answer this version cannot use.",
+    malformedWhy: "The service answered in a form this version does not understand. Nothing was changed on this machine.",
+    /** `invalid_grant`: the code is unknown or already spent. */
+    invalidWhat: "The service no longer recognises this code.",
+    invalidWhy: "It may have been used already. Nothing was changed on this machine.",
+    retryFix: "To try again, run:",
+    /** `--device` is TTY only: the approval is a person's, and nothing attached can answer for them. */
+    needsTerminalWhat: "Sign-in by code needs a terminal.",
+    needsTerminalWhy: "It waits for a person to approve, and the question at the end needs an answer.",
+    needsTerminalFix: "To save a credential without a terminal, run:",
+    /** The CHANNEL's auth command (`authCommandFor`), so a plugin-only machine is not told to run a bare name. */
+    needsTerminalCommand: (authCommand) => `${authCommand} --stdin`,
+    conflictWhat: "--device and --paste cannot be used together.",
+    conflictWhy: "One waits for an approval elsewhere; the other asks for a credential here.",
+    conflictFix: "Pick one:",
+    /** The ticket could not be redeemed (expired, spent, or the service refused the mint). */
+    redeemFailedWhy: "The approval could not be exchanged for a credential. It may have expired or been used already. Nothing was written.",
+};
+/**
+ * `13A` — the update nudge: `muted` sentence, the command on its own line in `accent`.
+ *
+ * Two lines, not the one the plan sketches: "capture 0.4.6 is available (you have 0.4.5): npm i -g
+ * @vibe-commit/capture@latest" is 82 columns before the indent, and §13.4 caps every line at 80. The
+ * command stays the LAST line either way, which is the point of 13A.
+ */
+export const UPDATE = {
+    npm: (latest, current) => `capture ${latest} is available (you have ${current}):`,
+    npmCommand: "npm i -g @vibe-commit/capture@latest",
+    plugin: (latest) => `capture ${latest} is available: update the VibeCommit plugin in Claude Code.`,
+};
 export const ERRORS = {
     notConnected: "This repository is not connected. Run `vibecommit connect`.",
     networkLater: "Could not reach VibeCommit. This session will be recorded on the next turn.",
-    authFatal: "VibeCommit could not authenticate. Run `vibecommit connect` to reconnect.",
+    // `11A`. The `what` of the §13.6 rejected-credential block (`REJECTED`), not a second sentence: the
+    // old line sent users to `connect`, which printed "Connected" over the same dead credential (G1).
+    authFatal: "This machine's credential is no longer accepted.",
     payloadNever: "This session was too large to record and has been skipped.",
     notAGitRepo: "Not a git repository.",
 };
@@ -1406,6 +1558,8 @@ export const AUTH = {
      * that worked before this, unchanged. `auth` prints this and then prompts.
      */
     pasteInsteadLabel: "Paste one instead. Create it here, then paste it below:",
+    /** `R5`/`8A`: the mint came back unusable (the probe of the NEW credential was refused). */
+    mintUnconfirmedWhy: "The service created a credential and then refused it. Nothing was written.",
 };
 /**
  * The Node floor (D57 plan §DX11). `NODE_FLOOR_TEXT` and the running version are
@@ -1434,7 +1588,25 @@ export const RUNTIME = {
  */
 export const SYSTEM_MESSAGE = {
     notConnected: "VibeCommit is installed but not connected. Run `vibecommit connect` to start capturing.",
-    credentialRevoked: "VibeCommit capture stopped: this machine's credential was revoked. Run `vibecommit connect`.",
+    /**
+     * State 2 — `11A`. House prefix kept, ONE line, and the cause is no longer named: the server's 401
+     * body is opaque on purpose (it cannot say "revoked" vs "expired"), so "revoked" was a guess that
+     * read as an accusation after a normal expiry. The command is the channel's (`installChannel`):
+     * `vibecommit auth` on npm, `node <path> auth` for the plugin bundle — `connect` is not on offer
+     * because it never replaced a credential that loads.
+     */
+    credentialRejected: (authCommand) => `VibeCommit capture stopped: this machine's credential is no longer accepted. Run \`${authCommand}\`.`,
+    /** State 2 when the channel's command would blow `CREDENTIAL_REJECTED_BUDGET` (a long plugin realpath). */
+    credentialRejectedFallback: "VibeCommit capture stopped: this machine's credential is no longer accepted. Reconnect: vibecommit.ai/install",
+    /** The ≤120-character budget style guide §10.1 gives a one-line state. */
+    credentialRejectedBudget: 120,
+    /**
+     * State 5 — `CR-234d`, decision 12A. A WARNING, not a failure: capture is still working. House prefix,
+     * ONE line, an ABSOLUTE date (a relative one would be wrong by the time it is read), and the channel's
+     * own `auth` command — a re-auth retires and replaces with no gap. Same ≤120 budget and fallback as state 2.
+     */
+    credentialEnding: (date, authCommand) => `VibeCommit: this machine's credential ends ${date}. Run \`${authCommand}\` to renew it.`,
+    credentialEndingFallback: (date) => `VibeCommit: this machine's credential ends ${date}. Renew it: vibecommit.ai/install`,
     /** Templated on both versions — style guide §10.1 state 3. */
     unsupportedRuntime: (floor, running) => `VibeCommit needs Node ${floor} or newer; hooks are running on Node ${running}. Nothing is being captured.`,
     /**
@@ -1540,7 +1712,9 @@ export const COMMANDS = {
  */
 export const URLS = {
     dashboard: "https://vibecommit.ai/app",
-    settings: "https://vibecommit.ai/app/settings",
+    // `7A`/A4 §3b: every use of this constant is about MACHINE credentials (`auth`'s paste fallback,
+    // `status`'s revoke line), and every such link goes to the section, not the page.
+    settings: "https://vibecommit.ai/app/settings#machines",
     /**
      * The captures INDEX — `CR-025`. Style guide §10.2 draws
      * `/app/commits/<a-sha>`, and that route DOES NOT EXIST: `CR-114` (W3) created
@@ -1581,5 +1755,7 @@ export const URLS = {
      * disclosed in the PR rather than silently shipped.
      */
     pluginBundle: "https://github.com/Vibe-Commit/claude-plugin",
+    /** The reconnect page `SYSTEM_MESSAGE.credentialRejectedFallback` points at. */
+    install: "https://vibecommit.ai/install",
 };
 //# sourceMappingURL=strings.js.map

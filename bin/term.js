@@ -106,6 +106,21 @@ export function truncatePath(path, max) {
         return path;
     return `…${path.slice(path.length - (max - 1))}`;
 }
+/**
+ * Shorten from the MIDDLE to `max` columns, keeping both ends — §13.4 for values whose start and
+ * end both identify them (a workspace name, a handle). `truncatePath` cuts the left, which suits a
+ * path whose tail is the name; here the head is just as much the name.
+ */
+export function truncateMiddle(text, max) {
+    const chars = [...text];
+    if (chars.length <= max)
+        return text;
+    if (max <= 1)
+        return "…".slice(0, max);
+    const head = Math.ceil((max - 1) / 2);
+    const tail = max - 1 - head;
+    return `${chars.slice(0, head).join("")}…${tail === 0 ? "" : chars.slice(chars.length - tail).join("")}`;
+}
 /** §13.5 — key/value output on the fixed label gutter. */
 export function labelled(indent, key, value) {
     return `${" ".repeat(indent)}${key.padEnd(LABEL_GUTTER)}${value}`;

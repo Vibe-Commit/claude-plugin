@@ -144,6 +144,11 @@ export async function discover(resourceUrl, deps) {
             return { kind: "malformed", url: asUrl, detail: "insecure_endpoint" };
         }
     }
+    // Optional, but if it is published it takes the same rule: the person's machine code and label go there.
+    const deviceEndpoint = doc.device_authorization_endpoint;
+    if (deviceEndpoint !== undefined && (typeof deviceEndpoint !== "string" || !isAllowedIngestUrl(deviceEndpoint))) {
+        return { kind: "malformed", url: asUrl, detail: "insecure_endpoint" };
+    }
     // Absent means "unstated", and RFC 8414 §2 says a client that needs S256 must
     // not assume it. We need it: it is the only method this client can produce.
     const methods = doc.code_challenge_methods_supported;
@@ -156,6 +161,7 @@ export async function discover(resourceUrl, deps) {
             issuer,
             authorization_endpoint: doc.authorization_endpoint,
             token_endpoint: doc.token_endpoint,
+            ...(typeof deviceEndpoint === "string" ? { device_authorization_endpoint: deviceEndpoint } : {}),
             code_challenge_methods_supported: methods,
         },
     };

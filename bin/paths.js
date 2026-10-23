@@ -51,6 +51,20 @@ export function stateDir(home) {
     return join(rootDir(home), "state");
 }
 /**
+ * What this machine knows ABOUT its credentials, keyed by fingerprint — `R10`.
+ *
+ * A SIDECAR and not extra keys in `credentials.json`: hooks learn things about a credential (the
+ * server's expiry header) and must never rewrite the secret file, because a hook holding the old
+ * token could race a re-auth and write it back. `credentials.json` stays `{ token }`.
+ */
+export function credentialMetaPath(home) {
+    return join(stateDir(home), "credential-meta.json");
+}
+/** The update nudge's 24-hour cache of what `GET /client/latest` said — `13A`. */
+export function updateCheckPath(home) {
+    return join(stateDir(home), "update-check.json");
+}
+/**
  * Once-per-session marker for a `systemMessage` state.
  *
  * Keyed on `(session, state)` and NOT on the transcript file: `ER23` keys client
@@ -87,6 +101,17 @@ export function sessionNoticePath(home, sessionId, state) {
  */
 export function repoDayNoticePath(home, repoKey, day, state) {
     return join(stateDir(home), "notices", "repo-day", repoDigest(repoKey), sanitise(day), `${sanitise(state)}.json`);
+}
+/**
+ * Once-per-`(machine, day)` marker — `CR-234d`, state 5 ("this machine's credential ends …", decision 12A).
+ *
+ * State 4's rule applied to a thing that is about the MACHINE and not a repo: `PreCompact` mints a new
+ * `session_id` mid-task, and a repo key would repeat the warning once per checkout. `key` is the state name
+ * plus the credential's fingerprint, so replacing the credential re-arms it (the new one has a new end date).
+ * `day` is a UTC `YYYY-MM-DD` supplied by the caller, never read from a local clock here.
+ */
+export function machineDayNoticePath(home, day, key) {
+    return join(stateDir(home), "notices", "machine-day", sanitise(day), `${sanitise(key)}.json`);
 }
 /**
  * Per-`(repo, session)` send state — `CR-018`'s offset ledger, backlog and

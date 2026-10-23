@@ -342,6 +342,19 @@ function parseCommitsRetry(raw) {
         .map((s) => s.trim().toLowerCase())
         .filter((s) => isFullSha(s));
 }
+/**
+ * `X-Credential-Expires`: an ISO 8601 instant, or null. Only a string that parses as a date is believed —
+ * the value is printed (as a date) to a person and compared against the clock, so a header that is not one
+ * must read as "the server did not say", never as a date in 1970.
+ */
+export function parseCredentialExpires(raw) {
+    if (raw === null)
+        return null;
+    const value = raw.trim();
+    if (!/^\d{4}-\d{2}-\d{2}T/.test(value))
+        return null;
+    return Number.isFinite(Date.parse(value)) ? value : null;
+}
 /** `X-Rewrites-Inferred-Stored` → a non-negative integer, or `null` for absent/malformed. NEVER THROWS. */
 function parseInferredStored(raw) {
     if (raw === null)
@@ -387,6 +400,7 @@ export async function send(url, headers, body, timeoutMs) {
             commitsRetry: parseCommitsRetry(res.headers.get("x-commits-retry")),
             finalAck: parseFinalAck(res.headers.get("x-session-final")),
             inferredStored: parseInferredStored(res.headers.get("x-rewrites-inferred-stored")),
+            credentialExpires: parseCredentialExpires(res.headers.get("x-credential-expires")),
         };
     }
     catch {
@@ -804,6 +818,7 @@ export async function deliver(ctx, eof, readBody) {
         finalAck: outcome.kind === "response" ? outcome.finalAck : null,
         inferredStored: outcome.kind === "response" ? outcome.inferredStored : null,
         inferredSetAsidePairs,
+        credentialExpires: outcome.kind === "response" && disposition === "ok" ? (outcome.credentialExpires ?? null) : null,
     };
 }
 //# sourceMappingURL=post.js.map

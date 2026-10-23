@@ -34,8 +34,9 @@
  *
  * @provenance vibecommit-mcp src/oauth/ingest_credential.ts — wire contract, retyped
  */
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, statSync, writeFileSync, } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, statSync, } from "node:fs";
 import { inspect } from "node:util";
+import { writeFileAtomic } from "./atomic_write.js";
 import { headerSafe } from "./header_safety.js";
 import { credentialsPath, rootDir } from "./paths.js";
 /**
@@ -207,8 +208,10 @@ export function saveCredential(home, credential) {
     const path = credentialsPath(home);
     mkdirSync(rootDir(home), { recursive: true, mode: 0o700 });
     chmodSync(rootDir(home), 0o700);
-    writeFileSync(path, `${JSON.stringify({ token: secret }, null, 2)}\n`, { mode: 0o600 });
-    chmodSync(path, 0o600);
+    // ⛔ TEMP + RENAME (`FC5`). Hooks read this file on every run with no lock, and an in-place
+    // `writeFileSync` truncates before it writes: a hook landing in that window parsed half a file
+    // and reported `unreadable`. The old file stays whole until the new one replaces it.
+    writeFileAtomic(path, `${JSON.stringify({ token: secret }, null, 2)}\n`, 0o600);
 }
 /**
  * Is there a saved credential for `VIBECOMMIT_TOKEN` to be shadowing?
@@ -334,6 +337,41 @@ export class AccessToken extends OpaqueToken {
     marker() {
         return REDACTED_ACCESS;
     }
+}
+/** What a redacted mint ticket renders as. Contains no bytes of the secret. */
+export const REDACTED_TICKET = "ticket…redacted";
+/** What a redacted device code renders as. Contains no bytes of the secret. */
+export const REDACTED_DEVICE_CODE = "device_code…redacted";
+/** A device-flow mint ticket's prefix (`CR-234`, R4): opaque, single-use, redeemable ONLY at the mint route. */
+export const MINT_TICKET_PREFIX = "vcmt_";
+/**
+ * The single-use ticket a device approval yields (R4): it buys exactly one ingest credential at
+ * `POST /oauth/ingest-credential` and nothing else. Held opaque like the other secrets — the same four
+ * renderers — because a ticket in a log line inside its five-minute window is a credential in a log line.
+ */
+export class MintTicket extends OpaqueToken {
+    constructor(secret) {
+        super(secret);
+    }
+    marker() {
+        return REDACTED_TICKET;
+    }
+}
+/**
+ * The device flow's polling secret (RFC 8628 §3.2). Never printed — the person is shown the `user_code`,
+ * and this one only ever travels in the poll's body.
+ */
+export class DeviceCode extends OpaqueToken {
+    constructor(secret) {
+        super(secret);
+    }
+    marker() {
+        return REDACTED_DEVICE_CODE;
+    }
+}
+/** Is this string a mint ticket? A CLASS check, like the others: `vcmt_` then base64url, nothing live-or-dead. */
+export function isMintTicketShape(value) {
+    return new RegExp(`^${MINT_TICKET_PREFIX}[A-Za-z0-9_-]+$`).test(value);
 }
 /**
  * Is this string a refresh token rather than something else in the wrong slot?
