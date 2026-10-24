@@ -304,25 +304,12 @@ const MAX_ERROR_BODY_BYTES = 64 * 1024;
  * opts in to reading ONE field of a 2xx body through `readConversationId`
  * below; nothing else ever calls that.
  */
-async function readErrorDetail(res) {
+async function readErrorDetail(res, signal) {
     if (res.ok)
         return null;
-    // The declared length, when there is one. The abort signal already bounds the
-    // read in TIME; this bounds it in BYTES for a fast, huge response.
-    const declared = Number(res.headers.get("content-length"));
-    if (Number.isFinite(declared) && declared > MAX_ERROR_BODY_BYTES)
-        return null;
-    let body;
-    try {
-        const text = await res.text();
-        if (text.length > MAX_ERROR_BODY_BYTES)
-            return null;
-        body = JSON.parse(text);
-    }
-    catch {
-        return null;
-    }
-    if (body === null || typeof body !== "object" || Array.isArray(body))
+    // Bounded in BYTES (declared or streamed) and in TIME (raced against `signal`) by `readCappedJson`.
+    const body = await readCappedJson(res, signal);
+    if (body === null || body === undefined || typeof body !== "object" || Array.isArray(body))
         return null;
     const { error, owners_notified: owners } = body;
     if (typeof error !== "string" || error === "")
@@ -333,33 +320,29 @@ async function readErrorDetail(res) {
     const ownersNotified = owners === null ? null : typeof owners === "number" && Number.isFinite(owners) ? owners : undefined;
     return { code: error, ownersNotified };
 }
-/** A UUID, any version. The only shape `conversation_id` is believed in, so nothing else reaches a terminal. */
-const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /**
- * ⭐ `conversation_id` from a 2xx body, for `connect`'s session link — or `undefined`.
- * **NEVER THROWS, on any input, and never changes the outcome.**
+ * ⛔ THE ONE CAPPED, TIMED BODY READER — `readErrorDetail` (non-2xx) and `readConversationId` (`connect`'s opt-in
+ * 2xx) both read through it, so neither bound can drift from the other.
  *
- * ⛔ **ONLY `connect` CALLS THIS** (`SendOptions.readConversationId`, eng-2 D2 = A). The hook's
- * hot path never reads a 2xx body — that property is why it cannot stall or throw on one —
- * and an unconditional read here would put a new wait and a new failure point on the hook that
- * runs after every turn, to serve a line only `connect` prints.
+ * Returns the parsed JSON (which may legitimately be `null`, an array or a scalar — the caller shapes it), or
+ * `undefined` for EVERY failure: no body, a declared length over the cap, a streamed body that crosses the cap,
+ * an abort, a stalled or reset stream, invalid JSON. **NEVER THROWS, on any input.**
  *
- * Bounded like `readErrorDetail` in bytes (here by streaming and cancelling, so a response with
- * no `content-length` cannot be buffered whole) and in time (the caller's own abort timer). A
- * stalled or reset body lands in the `catch` and reads as "no id": the 2xx stays a 2xx.
- * Only a UUID-shaped string is believed, which also keeps a terminal escape sequence out.
+ *   - BYTES: the declared `content-length` is checked first, and the stream is then counted chunk by chunk and
+ *     CANCELLED the moment it crosses `MAX_ERROR_BODY_BYTES` — so a chunked body with no length cannot be
+ *     buffered whole before a post-hoc check (the old `await res.text()` did exactly that, contradicting
+ *     `readErrorDetail`'s own comment that a hostile endpoint cannot make a hook buffer an arbitrary response).
+ *   - TIME: every read is RACED against the request's abort signal rather than trusting the abort to reach the
+ *     stream. Aborting is supposed to reject a pending `reader.read()` (it does, in a direct probe), but the
+ *     bound is then a property of this function and not of the HTTP client's internals.
  */
-async function readConversationId(res, signal) {
-    if (!res.ok || res.body === null)
+async function readCappedJson(res, signal) {
+    if (res.body === null)
         return undefined;
     const declared = Number(res.headers.get("content-length"));
     if (Number.isFinite(declared) && declared > MAX_ERROR_BODY_BYTES)
         return undefined;
     const reader = res.body.getReader();
-    // ⛔ THE TIMER IS RACED EXPLICITLY, not trusted to reach the stream. Aborting the request's signal is
-    // supposed to reject a pending `reader.read()`, and mostly does — but measured here, a body that stalls
-    // after the headers could leave the read pending past the abort, which would hang `connect` for good.
-    // Racing the signal ourselves makes the bound a property of THIS function.
     let onAbort;
     const aborted = new Promise((_resolve, reject) => {
         onAbort = () => reject(new Error("aborted"));
@@ -378,19 +361,15 @@ async function readConversationId(res, signal) {
                 break;
             size += value.byteLength;
             if (size > MAX_ERROR_BODY_BYTES) {
+                // Not awaited: a cancel on a stalled stream is the other thing that may never settle.
                 reader.cancel().catch(() => undefined);
                 return undefined;
             }
             chunks.push(value);
         }
-        const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-        if (body === null || typeof body !== "object" || Array.isArray(body))
-            return undefined;
-        const id = body.conversation_id;
-        return typeof id === "string" && UUID_SHAPE.test(id) ? id.toLowerCase() : undefined;
+        return JSON.parse(Buffer.concat(chunks).toString("utf8"));
     }
     catch {
-        // Not awaited: a cancel on a stalled stream is the other thing that may never settle.
         reader.cancel().catch(() => undefined);
         return undefined;
     }
@@ -398,6 +377,30 @@ async function readConversationId(res, signal) {
         if (onAbort !== undefined)
             signal.removeEventListener("abort", onAbort);
     }
+}
+/** A UUID, any version. The only shape `conversation_id` is believed in, so nothing else reaches a terminal. */
+const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/**
+ * ⭐ `conversation_id` from a 2xx body, for `connect`'s session link — or `undefined`.
+ * **NEVER THROWS, on any input, and never changes the outcome.**
+ *
+ * ⛔ **ONLY `connect` CALLS THIS** (`SendOptions.readConversationId`, eng-2 D2 = A). The hook's
+ * hot path never reads a 2xx body — that property is why it cannot stall or throw on one —
+ * and an unconditional read here would put a new wait and a new failure point on the hook that
+ * runs after every turn, to serve a line only `connect` prints.
+ *
+ * Reads through `readCappedJson`, the same capped, signal-raced reader `readErrorDetail` uses, so the byte
+ * and time bounds are one definition. A stalled or reset body reads as "no id": the 2xx stays a 2xx.
+ * Only a UUID-shaped string is believed, which also keeps a terminal escape sequence out.
+ */
+async function readConversationId(res, signal) {
+    if (!res.ok)
+        return undefined;
+    const body = await readCappedJson(res, signal);
+    if (body === null || body === undefined || typeof body !== "object" || Array.isArray(body))
+        return undefined;
+    const id = body.conversation_id;
+    return typeof id === "string" && UUID_SHAPE.test(id) ? id.toLowerCase() : undefined;
 }
 /**
  * `X-Commits-Retry` → the shas to keep, or `null` when the header is absent.
@@ -458,7 +461,7 @@ export async function send(url, headers, body, timeoutMs, options = {}) {
         return {
             kind: "response",
             status: res.status,
-            detail: await readErrorDetail(res),
+            detail: await readErrorDetail(res, controller.signal),
             ...(conversationId === undefined ? {} : { conversationId }),
             // `null` when the server does not send it at all — see `captureId` above.
             captureId: res.headers.get("x-capture-id"),
