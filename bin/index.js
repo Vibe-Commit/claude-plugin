@@ -191,6 +191,11 @@ async function runVerb(verb, argv, ctx) {
                 // stay the fallback. Injected HERE and nowhere else — the verb's default
                 // is paste-only, so this line is what makes the route reachable.
                 browser: realBrowser,
+                // `CR-236`. After a save inside a git work tree on a terminal, `auth` continues into `connect`.
+                // ⛔ NO `browser` HERE, AND THAT IS THE "ONE AUTH" GUARANTEE: this verb just saved a credential, so
+                // the chained `connect` finds one; were it ever absent it falls to the old warning, never to a
+                // second sign-in. `test/auth-connect-chain.test.ts` brace-matches this call to keep it so.
+                connect: (c) => connect(c, {}, {}),
             });
         case "connect":
             // `--sign-in` (CR-084d) is a FLAG, not a verb: `VERBS` is what `renderHelp`

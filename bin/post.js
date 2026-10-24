@@ -121,7 +121,9 @@ export function buildIngestHeaders(credential, delta) {
     // ⚠ **NOT "silently", and the correction is worth its line**: the server
     // ECHOES `agent_rewind` in the ingest 200 body (D169 §1), so the RE-PIN is
     // reported. What is NOT reported is the shed itself. ⚠ And nothing on this
-    // side reads either — `send()` parses a body only on a non-2xx. So the case
+    // side reads either — on the hook path `send()` parses a body only on a
+    // non-2xx (`connect` alone opts in to one 2xx field, `conversation_id`, and
+    // reads nothing else from it). So the case
     // against sending rests on the turn being LOST, not on the loss being
     // invisible; a designed, reported rewind (D164 §4) is survivable, and this
     // client would simply be causing them for no gain.
@@ -297,8 +299,10 @@ const MAX_ERROR_BODY_BYTES = 64 * 1024;
  * caller to the branch that asserts nothing. That is the honest default,
  * because `null` already means *not determinable*.
  *
- * ⚠ Read ONLY on a non-2xx. A 2xx body is not read, not awaited, and not
- * parsed, so the hook's hot path is untouched.
+ * ⚠ Read ONLY on a non-2xx. On the hook path a 2xx body is not read, not
+ * awaited, and not parsed, so the hook's hot path is untouched. `connect`
+ * opts in to reading ONE field of a 2xx body through `readConversationId`
+ * below; nothing else ever calls that.
  */
 async function readErrorDetail(res) {
     if (res.ok)
@@ -328,6 +332,72 @@ async function readErrorDetail(res) {
     // into a number, because a count invented here is a claim invented here.
     const ownersNotified = owners === null ? null : typeof owners === "number" && Number.isFinite(owners) ? owners : undefined;
     return { code: error, ownersNotified };
+}
+/** A UUID, any version. The only shape `conversation_id` is believed in, so nothing else reaches a terminal. */
+const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/**
+ * ⭐ `conversation_id` from a 2xx body, for `connect`'s session link — or `undefined`.
+ * **NEVER THROWS, on any input, and never changes the outcome.**
+ *
+ * ⛔ **ONLY `connect` CALLS THIS** (`SendOptions.readConversationId`, eng-2 D2 = A). The hook's
+ * hot path never reads a 2xx body — that property is why it cannot stall or throw on one —
+ * and an unconditional read here would put a new wait and a new failure point on the hook that
+ * runs after every turn, to serve a line only `connect` prints.
+ *
+ * Bounded like `readErrorDetail` in bytes (here by streaming and cancelling, so a response with
+ * no `content-length` cannot be buffered whole) and in time (the caller's own abort timer). A
+ * stalled or reset body lands in the `catch` and reads as "no id": the 2xx stays a 2xx.
+ * Only a UUID-shaped string is believed, which also keeps a terminal escape sequence out.
+ */
+async function readConversationId(res, signal) {
+    if (!res.ok || res.body === null)
+        return undefined;
+    const declared = Number(res.headers.get("content-length"));
+    if (Number.isFinite(declared) && declared > MAX_ERROR_BODY_BYTES)
+        return undefined;
+    const reader = res.body.getReader();
+    // ⛔ THE TIMER IS RACED EXPLICITLY, not trusted to reach the stream. Aborting the request's signal is
+    // supposed to reject a pending `reader.read()`, and mostly does — but measured here, a body that stalls
+    // after the headers could leave the read pending past the abort, which would hang `connect` for good.
+    // Racing the signal ourselves makes the bound a property of THIS function.
+    let onAbort;
+    const aborted = new Promise((_resolve, reject) => {
+        onAbort = () => reject(new Error("aborted"));
+        if (signal.aborted)
+            onAbort();
+        else
+            signal.addEventListener("abort", onAbort, { once: true });
+    });
+    aborted.catch(() => undefined);
+    try {
+        const chunks = [];
+        let size = 0;
+        for (;;) {
+            const { done, value } = await Promise.race([reader.read(), aborted]);
+            if (done)
+                break;
+            size += value.byteLength;
+            if (size > MAX_ERROR_BODY_BYTES) {
+                reader.cancel().catch(() => undefined);
+                return undefined;
+            }
+            chunks.push(value);
+        }
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        if (body === null || typeof body !== "object" || Array.isArray(body))
+            return undefined;
+        const id = body.conversation_id;
+        return typeof id === "string" && UUID_SHAPE.test(id) ? id.toLowerCase() : undefined;
+    }
+    catch {
+        // Not awaited: a cancel on a stalled stream is the other thing that may never settle.
+        reader.cancel().catch(() => undefined);
+        return undefined;
+    }
+    finally {
+        if (onAbort !== undefined)
+            signal.removeEventListener("abort", onAbort);
+    }
 }
 /**
  * `X-Commits-Retry` → the shas to keep, or `null` when the header is absent.
@@ -362,18 +432,7 @@ function parseInferredStored(raw) {
     const n = Number(raw.trim());
     return Number.isInteger(n) && n >= 0 ? n : null;
 }
-/**
- * One attempt. No retry, no backoff, no classification — `CR-018` owns all three.
- *
- * The timeout is mandatory rather than optional: a hook has a wall-clock budget
- * it must not exceed (DESIGN.md §13.7), and `fetch` without a signal waits on the
- * platform default, which is far longer than any hook timeout.
- *
- * Never throws. A hook that takes an exception from the network has already
- * broken the contract; returning `unreachable` keeps the decision with the
- * caller.
- */
-export async function send(url, headers, body, timeoutMs) {
+export async function send(url, headers, body, timeoutMs, options = {}) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -391,10 +450,16 @@ export async function send(url, headers, body, timeoutMs) {
         // The body read happens INSIDE the try and BEFORE the timer is cleared, so
         // the same `AbortController` that bounds the request also bounds the read.
         // A slow body cannot outlive the hook's wall-clock budget.
+        //
+        // ⛔ THE 2xx READ IS OPT-IN AND HAS ITS OWN `try` (inside `readConversationId`): bare in this
+        // one, a stalled or reset body would throw to the `catch` below and turn a DELIVERED 2xx into
+        // `unreachable` — `later`, offset held, span sent again.
+        const conversationId = options.readConversationId === true ? await readConversationId(res, controller.signal) : undefined;
         return {
             kind: "response",
             status: res.status,
             detail: await readErrorDetail(res),
+            ...(conversationId === undefined ? {} : { conversationId }),
             // `null` when the server does not send it at all — see `captureId` above.
             captureId: res.headers.get("x-capture-id"),
             commitsRetry: parseCommitsRetry(res.headers.get("x-commits-retry")),
@@ -464,7 +529,10 @@ async function attemptSend(ctx, agent, seq, span, body, lean) {
     // on a guess.
     if (!headersConstructible(headers))
         return { kind: "unsafe", header: "" };
-    return { kind: "sent", outcome: await send(ctx.url, headers, body, ctx.timeoutMs) };
+    return {
+        kind: "sent",
+        outcome: await send(ctx.url, headers, body, ctx.timeoutMs, { readConversationId: ctx.readConversationId === true }),
+    };
 }
 /**
  * A pre-send refusal: the header that failed never reached `fetch`, so there
@@ -819,6 +887,10 @@ export async function deliver(ctx, eof, readBody) {
         inferredStored: outcome.kind === "response" ? outcome.inferredStored : null,
         inferredSetAsidePairs,
         credentialExpires: outcome.kind === "response" && disposition === "ok" ? (outcome.credentialExpires ?? null) : null,
+        // Carried the way `credentialExpires` is: only on `ok`, and only when there is one to carry.
+        ...(outcome.kind === "response" && disposition === "ok" && outcome.conversationId !== undefined
+            ? { conversationId: outcome.conversationId }
+            : {}),
     };
 }
 //# sourceMappingURL=post.js.map

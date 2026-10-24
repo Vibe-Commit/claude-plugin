@@ -52,6 +52,24 @@
  * ⚠ So there is no path on which `CR-226` makes the pre-existing flow worse:
  * every failure lands on the prompt that was the whole verb before it.
  *
+ * ## ⭐ Inside a git work tree, a save CONTINUES INTO `connect` (0.6.0, `CR-236`)
+ *
+ * `/install` and this verb's own ending used to make a new user run two commands back to back — `auth`,
+ * then `connect` — for what is one intent. So on a TERMINAL, inside any git work tree
+ * (`resolveProjectKeys(cwd) !== null`, the precondition `connect` checks for itself), a SAVED credential
+ * goes straight on into `connect`, which asks its own consent question first, and `auth` returns
+ * `connect`'s exit code. The gate (`shouldConnect`) is checked on BOTH save paths — the browser's `saved`
+ * result and the TTY paste.
+ *
+ * ⛔ Never on `--stdin` or a non-TTY: CI must keep exit 0 and never meet a consent refusal. Never on
+ * `declined`, an empty paste or a wrong-class paste: nothing was saved. Outside a repo the output and
+ * the exit are byte-identical to before — that is the escape hatch for a renewal that should not touch
+ * the repo you are standing in.
+ *
+ * ⛔ **NEVER A SECOND SIGN-IN.** `src/index.ts` hands the chained `connect` NO `browser`, so an `absent`
+ * credential falls to its warning and never to a mint; this verb just saved one, so it is not absent.
+ * `test/auth-connect-chain.test.ts` brace-matches the inner call to keep it so.
+ *
  * @provenance vibecommit-mcp src/transport/server.ts — POST /oauth/ingest-credential is the mint route, verified
  * @provenance vibecommit-web app/api/ingest-credentials/route.ts — the dashboard producer the paste path still serves, verified
  */
@@ -61,6 +79,7 @@ import { writeLines } from "./context.js";
 import { EXIT } from "../exit.js";
 import { INGEST_TOKEN_PREFIX, IngestCredential, saveCredential } from "../credential.js";
 import { credentialsPath } from "../paths.js";
+import { resolveProjectKeys } from "../project.js";
 import { paint, renderErrorBlock, tildePath, wrap } from "../term.js";
 /**
  * `--stdin` forces the pipe even on a terminal — the CI shape, where a job may
@@ -118,7 +137,7 @@ export async function auth(ctx, argv, deps = {}) {
     if (!piped && !argv.includes(PASTE_FLAG) && deps.browser !== undefined) {
         const minted = await deps.browser(ctx, "auth", { device: argv.includes(DEVICE_FLAG) });
         if (minted.kind === "saved")
-            return saved(ctx, minted.notes);
+            return await saved(ctx, deps, piped, minted.notes);
         // The user said NO at the replace confirmation: not a failure of the browser, so no paste prompt.
         if (minted.kind === "declined")
             return EXIT.failure;
@@ -164,19 +183,28 @@ export async function auth(ctx, argv, deps = {}) {
         return EXIT.failure;
     }
     saveCredential(ctx.home, new IngestCredential(secret, "file"));
-    return saved(ctx);
+    return await saved(ctx, deps, piped);
 }
-/** The one confirmation, whichever path wrote the file. */
-function saved(ctx, notes = []) {
+/**
+ * The one confirmation, whichever path wrote the file — and the chain's single gate.
+ *
+ * `shouldConnect` is read here, AFTER a save and nowhere else, so `declined`, empty and wrong-class input
+ * (which return before this) can never chain. When it holds, the "Next, connect a repository" fix line is
+ * dropped — `connect`'s own output follows — and `connect`'s exit code is returned. When it does not, the
+ * block and the exit are exactly what they were.
+ */
+async function saved(ctx, deps, piped, notes = []) {
+    const shouldConnect = !piped && deps.connect !== undefined && resolveProjectKeys(ctx.cwd) !== null;
     writeLines(ctx.stdout, [
         ...renderErrorBlock({
             kind: "ok",
             what: AUTH.savedWhat,
             why: [AUTH.savedWhy(tildePath(credentialsPath(ctx.home), ctx.home)), ...notes],
-            fixLabel: AUTH.nextLabel,
-            fixes: [AUTH.nextCommand],
+            ...(shouldConnect ? {} : { fixLabel: AUTH.nextLabel, fixes: [AUTH.nextCommand] }),
         }, ctx.colour),
     ]);
+    if (shouldConnect && deps.connect !== undefined)
+        return await deps.connect(ctx);
     return EXIT.ok;
 }
 //# sourceMappingURL=auth.js.map

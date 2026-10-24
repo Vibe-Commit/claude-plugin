@@ -26,9 +26,12 @@ export const HELP = {
     usage: "vibecommit <command> [options]",
     tagline: "Record Claude Code sessions against the commits they produced.",
     commands: {
-        // `CR-216/U2`. FIRST in the list because it is first in the sequence: on a
-        // new machine there is nothing for `connect` to use until this has run.
-        auth: "Save this machine's ingest credential.",
+        // `CR-216/U2`. FIRST in the list by habit, not by sequence: that "nothing for `connect` to use until
+        // this has run" reason has been false since `CR-226` (`connect` signs in itself on a machine with no
+        // credential). `connect` is the golden path; this verb renews or replaces the credential, and inside a
+        // git work tree it then continues into `connect`. Outside one it saves the credential and stops there
+        // — the escape hatch for a renewal that should not touch the repo you happen to be standing in.
+        auth: "Renew or replace this machine's credential. In a git repo it then connects that repo; elsewhere it only saves the credential.",
         connect: "Connect this repo and capture the current session.",
         status: "Show whether capture is on for this repo and when it last succeeded.",
         off: "Stop capturing for this repo.",
@@ -1727,6 +1730,13 @@ export const URLS = {
      * deepening this constant is that task's, not a later guess.
      */
     commits: "https://vibecommit.ai/app/commits",
+    /**
+     * One recorded session — the ending's link when the ingest 2xx carried a `conversation_id` (`DX D8`).
+     * Verified by file: `vibecommit-web` `app/app/conversations/[id]/page.tsx` exists on `main`, and an
+     * unknown or cross-tenant id is a 404 there (RLS), not a leak. Callers pass a UUID-shaped id only
+     * (`post.ts` `readConversationId` guarantees it), and fall back to `commits` when there is none.
+     */
+    conversation: (id) => `https://vibecommit.ai/app/conversations/${id}`,
     /**
      * Where an org member goes to see their pending capture request — `CR-110`.
      *
