@@ -270,11 +270,28 @@ async function credentialBeat(ctx, keys, deps, options = {}) {
  * The install does not end on "configured", it ends on EVIDENCE: record this
  * session, then hand over a URL that resolves. §10.2 draws it.
  *
+ * ## Order: setup first, payoff last (`DX D9`)
+ *
+ * The git hook and the agent hooks are installed and REPORTED FIRST, on every
+ * branch — no transcript, approval pending, or the normal ending — so the last
+ * thing a new user sees is "Connected." and the session link, not ten lines of
+ * hook paths that scrolled it away. After the outcome come, in this order, the
+ * unconfirmed note and `pathClash`, which runs EXACTLY ONCE, here, and not in
+ * any branch (`approvalPendingBeat` used to end in its own call; with a shared
+ * tail the clash block would print twice on the pending path).
+ *
+ * ⚠ Both pre-existing holes this closes were the same shape: the two hook beats
+ * sat AFTER two early returns (no transcript, approval pending), so an org
+ * awaiting approval, and a repo Claude Code had never run in, got NO hooks while
+ * the screen said "Capture is armed" / "Capture starts on its own". Neither was
+ * true on the npm channel.
+ *
  * Two things §10.2 draws that are deliberately NOT here:
  *   - **`4 turns · 1 commit`.** Counting turns means parsing the transcript, and
  *     the client may render but may not analyze (D60 §D6). It is not obtainable
- *     from the server either: `send()` returns a status and discards the body,
- *     so no id, sha or count exists on this side of the wire.
+ *     from the server either: `send()` returns a status, and on `connect`'s opt-in
+ *     reads ONE field of a 2xx body — the `conversation_id` for the session link
+ *     (`DX D8`) — so no sha or count exists on this side of the wire.
  *   - **`Opening your browser to sign in...`.** That beat runs BEFORE this one
  *     now (`credentialBeat` → `browser_credential.ts`, `CR-226`), and only when
  *     there was no credential to start with — by the time this function runs,
@@ -290,6 +307,16 @@ unconfirmed) {
     // throughout, so the diff shows the line whose ROLE changed and not fourteen
     // that did not.
     const projectKey = keys.worktree;
+    // ⛔ COMMIT CAPTURE IS INSTALLED AND REPORTED HERE (`CR-170`, D154), BEFORE ANY BRANCH — see "Order"
+    // in the docblock. Three of its failure modes are silent no-ops, so every outcome prints — including
+    // success, which is the only place the PER-CLONE cost can be stated at a moment the user can act on it.
+    commitHookBeat(ctx, projectKey);
+    // ⛔ SESSION CAPTURE IS REGISTERED AND REPORTED NEXT (`CR-195`/U4b). This is the beat `/install` has
+    // been describing since before it existed — until it, `connect` wrote GIT hooks only and the npm path
+    // gave a user no session capture at all. It runs AFTER the commit beat because the two are independent
+    // and the commit one is per-clone: reporting the per-clone thing beside the global one, in that order,
+    // is what makes the scope difference legible rather than a detail in a sentence.
+    agentHookBeat(ctx);
     // ⛔ SKIPPED ENTIRELY ON A DIALECT WITH NO LOCATOR — `CR-183`. `connect` is
     // typed by a human and is handed no `transcript_path`, so finding the running
     // session is a per-agent capability rather than something this verb can do.
@@ -300,14 +327,26 @@ unconfirmed) {
     const locate = dialectFor(ctx.agentId).locateCurrentTranscript;
     const found = locate === undefined ? null : locate(ctx.home, ctx.env, projectKey);
     if (locate !== undefined && found === null) {
-        writeLines(ctx.stderr, renderErrorBlock({
-            kind: "warn",
-            what: CONNECT.noTranscriptWhat,
-            why: [CONNECT.noTranscriptWhy],
-            fixLabel: CONNECT.noTranscriptFix,
-            fixes: [COMMANDS.status],
-        }, ctx.colour));
-        return EXIT.failure;
+        // ⛔ STDOUT AND EXIT `pathClash`'s — `eng-review D4 = A`. The hooks are installed above, so this is
+        // no longer "a silent nothing": setup is complete and capture starts on its own the next time Claude
+        // Code runs here. This file's stream rule (`approvalPendingBeat`) puts stderr with a NON-ZERO exit
+        // and an install's OUTCOME on stdout.
+        // ⚠ This REVERSES the W6 brief rule "When there is no transcript, say so and exit non-zero"
+        // (`AGENT_BRIEFS/capture-refactor/_drafts/w6-capture-plugin.py:620`). Its reason — a plain-shell run
+        // doing nothing, silently — no longer holds: the warning still prints and the hooks are installed.
+        // And a fresh user's first `vibecommit auth` in a new repo (which now chains here) lands on exactly
+        // this path and must not report failure after a complete setup. A PATH clash still exits 1.
+        writeLines(ctx.stdout, [
+            "",
+            ...renderErrorBlock({
+                kind: "warn",
+                what: CONNECT.noTranscriptWhat,
+                why: [CONNECT.noTranscriptWhy],
+                fixLabel: CONNECT.noTranscriptFix,
+                fixes: [COMMANDS.status],
+            }, ctx.colour),
+        ]);
+        return tail(ctx, unconfirmed);
     }
     const url = ingestUrl(ctx.env);
     let delivery = null;
@@ -335,6 +374,9 @@ unconfirmed) {
             // ⛔ NOT A HOOK. `connect` backfills the located transcript, which is not evidence that the session is alive: it
             // would otherwise rewrite an old session's state file and (under the mtime clock) make it "live" — the D2 shape.
             byHook: false,
+            // ⛔ THE ONLY CALLER THAT READS A 2xx BODY (`eng-2 D2 = A`): for the session link. Hooks and
+            // `finalize` leave this unset, so the hook's hot path never reads, awaits or parses one.
+            readConversationId: true,
         }, found.size, 
         // ⛔ THE ROOT SET, and it is `confinementRoots` — THE SAME FUNCTION THE
         // HOOK PATH CALLS (`entry.ts`), not a set built here. `D184 §3`: the
@@ -356,33 +398,35 @@ unconfirmed) {
     // below still stands: `later` and `never` are transient or per-payload (D58)
     // and the offset holds, so a 503 must still print the ordinary ending.
     const pending = approvalPending(delivery);
-    if (pending !== null)
-        return approvalPendingBeat(ctx, projectKey, pending.ownersNotified);
+    if (pending !== null) {
+        approvalPendingBeat(ctx, projectKey, pending.ownersNotified);
+        return tail(ctx, unconfirmed);
+    }
     // The beat, then the URL on its own line, then what-now. Every OTHER outcome
     // of the send is deliberately not branched on: telling a user their install
     // failed because one POST 503'd would be false.
+    //
+    // The URL is the recorded session's own page when the 2xx carried its id (`DX D8`) and the captures
+    // index otherwise: a missing, malformed, stalled or `nothing-to-send` delivery all land on the index,
+    // and never on `/conversations/undefined`. `conversationId` is only ever set on an `ok` attempt.
+    const conversationId = delivery?.kind === "attempted" ? delivery.conversationId : undefined;
     writeLines(ctx.stdout, [
         "",
         ...wrap(`${CONNECT.capturing} ${CONNECT.doneHeading}`, 2),
         "",
-        `  ${paint(ctx.colour, "accent", URLS.commits)}`,
+        `  ${paint(ctx.colour, "accent", conversationId === undefined ? URLS.commits : URLS.conversation(conversationId))}`,
         "",
         ...wrap(CONNECT.doneForRepo(truncatePath(projectKey, 52)), 2),
         ...wrap(`${CONNECT.stopLabel}: ${COMMANDS.off}`, 2),
     ]);
-    // ⛔ COMMIT CAPTURE IS INSTALLED AND REPORTED HERE (`CR-170`, D154). Three of
-    // its failure modes are silent no-ops, so every outcome prints — including
-    // success, which is the only place the PER-CLONE cost can be stated at a
-    // moment the user can act on it.
-    commitHookBeat(ctx, projectKey);
-    // ⛔ SESSION CAPTURE IS REGISTERED AND REPORTED HERE (`CR-195`/U4b). This is
-    // the beat `/install` has been describing since before it existed — until it,
-    // `connect` wrote GIT hooks only and the npm path gave a user no session
-    // capture at all. It runs AFTER the commit beat because the two are
-    // independent and the commit one is per-clone: reporting the per-clone thing
-    // beside the global one, in that order, is what makes the scope difference
-    // legible rather than a detail in a sentence.
-    agentHookBeat(ctx);
+    return tail(ctx, unconfirmed);
+}
+/**
+ * What follows the outcome on EVERY branch of `captureBeat`, in this order: the unconfirmed note, then
+ * the PATH-clash check. The one place `pathClash` is called — a branch that called it too would print
+ * the clash block twice.
+ */
+function tail(ctx, unconfirmed) {
     if (unconfirmed) {
         writeLines(ctx.stdout, [
             "",
@@ -527,8 +571,9 @@ function approvalPending(delivery) {
 /**
  * The fifth beat — style guide §10.2, D65 §DR6, D81.
  *
- * ⚠ `warn`, never `bad`. ⚠ **`EXIT.ok`, never `EXIT.failure` and never
- * `EXIT.notConnected`** — the user is correctly installed and capture is armed.
+ * ⚠ `warn`, never `bad`. ⚠ **The exit is `captureBeat`'s `tail`'s — `EXIT.ok` unless a PATH clash, never
+ * `EXIT.failure` for the 403 and never `EXIT.notConnected`** — the user is correctly installed and capture
+ * is armed (the hooks were installed before this beat, so "armed" is true on the npm channel).
  * That 403 means *later*, not *failed*: `policy.ts` classes it `later`, so the
  * offset holds and the backlog uploads in order once an owner approves. A red
  * exit here tells a correctly-installed user they broke something.
@@ -564,9 +609,8 @@ function approvalPendingBeat(ctx, projectKey, ownersNotified) {
         "",
         ...wrap(CONNECT.pendingArmed(truncatePath(projectKey, 52)), 2),
     ]);
-    // The PATH clash still runs — it is about the verbs a human types and is
-    // orthogonal to whether capture is approved. It can still exit 1.
-    return pathClash(ctx);
+    // No `pathClash` here: `captureBeat`'s `tail` runs it once for every branch. It is about the verbs a
+    // human types and orthogonal to whether capture is approved, and it can still exit 1.
 }
 /**
  * Does the `vibecommit` a user types belong to us? — `DESIGN.md` §13.6's worked
