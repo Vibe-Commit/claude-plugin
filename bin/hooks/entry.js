@@ -42,7 +42,7 @@ import { loadCredential } from "../credential.js";
 import { EXIT } from "../exit.js";
 import { gitProbe, headRef, onceRepoSlug } from "../git.js";
 import { redactSpan, rulesForTranscript } from "../redact.js";
-import { authCommandFor } from "../install.js";
+import { authCommandFor, connectCommandFor } from "../install.js";
 import { installOnce, sessionStartPayload } from "./session_start.js";
 import { credentialFingerprint, deliver, ingestUrl } from "../post.js";
 import { markSkipped } from "../policy.js";
@@ -428,12 +428,16 @@ async function hookBody(ctx, budgetMs, hookStartedAt) {
     // session-keyed states can fire BEFORE a project has been resolved at all —
     // `unsupported_runtime` fires before anything else runs. Only
     // `capture_confirmed` needs one, and only it supplies one.
-    const notice = (state, repoKey = null, rejected, endsAt, cloneKey) => renderNotice({
+    const notice = (state, repoKey = null, rejected, endsAt, cloneKey, account) => renderNotice({
         home: ctx.home,
         sessionId: input.sessionId,
         nodeVersion: ctx.nodeVersion,
         repoKey,
         ...(cloneKey === undefined ? {} : { cloneKey }),
+        // State 1 names the channel's `connect` (the same rule as state 2's `auth`): a plugin-only machine has no `vibecommit` on PATH.
+        ...(state === "not_connected" ? { connectCommand: connectCommandFor(ctx.env, ctx.selfPath ?? "") } : {}),
+        // State 10: the epoch keys its once-per-epoch claim; the count is the sentence.
+        ...(account === undefined ? {} : { accountEpoch: account.epoch, unnamedOwners: account.owners, unnamedRepos: account.repos }),
         now: () => new Date(),
         // `11A`: states 2 and 5 carry a credential. The command is the channel's, and the claim is
         // keyed by the credential, so replacing it re-arms the message.
@@ -460,6 +464,8 @@ async function hookBody(ctx, budgetMs, hookStartedAt) {
             selfPath: ctx.selfPath ?? "",
             cwd: input.cwd,
             notice,
+            // The one bounded GET is limited by what is left of this hook's own wall clock as well as by its 1,000 ms.
+            budgetLeftMs: () => budgetMs - (Date.now() - hookStartedAt),
         });
     }
     // --- CONSENT GATE. Nothing above this line has opened the transcript. ---

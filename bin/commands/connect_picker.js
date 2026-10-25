@@ -12,15 +12,19 @@
 import { dialectFor } from "../agents/registry.js";
 import { AGENT_HOOKS, COMMANDS, COMMIT_HOOK, CONNECT, PICKER, SCAN, URLS } from "../copy/index.js";
 import { EMPTY_GRANTS, GrantsUnreadableError, grantsUnreadable, isAffirmative, normalizeOwner, normalizeSlug, ownerOfSlug, readGrants, revokeProject, updateGrants, } from "../consent.js";
+import { loadCredential } from "../credential.js";
 import { EXIT } from "../exit.js";
+import { mergePending } from "../grants_sync.js";
+import { readAccountView, syncForVerb } from "../grants_verb.js";
 import { channelCommand, connectCommandFor, installCaptureHooks } from "../install.js";
 import { machineCapture, machineSummary, readPerClone } from "../machine_state.js";
-import { buildModel, grantQuestion, hasAdditions, isNoChange, notUnderstoodLines, parseTyped, preChange, renderGrantBlock, renderTyped, } from "../picker.js";
+import { buildModel, grantQuestion, hasAdditions, isNoChange, NO_CHANGE, notUnderstoodLines, parseTyped, preChange, renderGrantBlock, renderTyped, } from "../picker.js";
 import { runChecklist } from "../picker_checklist.js";
 import { credentialFingerprint } from "../post.js";
 import { metaFor } from "../credential_meta.js";
 import { paint, renderErrorBlock, tildePath, truncatePath, wrap } from "../term.js";
 import { signInBeat } from "./browser_credential.js";
+import { accountChange, accountNoteLines, changeOps, commitG, joiningMachine, lastAccountState, mintForG, settleG, splitAccountExclusions, } from "./connect_account.js";
 import { agentHookBeat, approvalPending, approvalPendingBeat, askOrCancel, cancelled, disclosure, grantsUnreadableBlock, obtainCredential, sendTestCapture, tail, } from "./connect.js";
 import { writeLines } from "./context.js";
 import { pickerNotListedLines, sawNoSession, scanMachine } from "./scan.js";
@@ -36,6 +40,18 @@ import { pickerNotListedLines, sawNoSession, scanMachine } from "./scan.js";
 export async function connectPicker(ctx, options, deps, here, 
 /** The working folder's keys, when it is a work tree: the in-repo path probes its session (VQ item 7). */
 keys = null) {
+    // ⛔ ONE `finally` FOR `g` (VQ + VT, #88): whatever way a run that holds a credential `g` made ends without committing it — a no,
+    // Ctrl+C, Enter, an empty account, a removals-only yes, a failed write, an unexpected throw — it makes one best-effort revoke and
+    // clears its write-ahead row. Nothing else revokes: the branches below only SAY how the run ended (`g.end`).
+    const g = { credential: null, snapshot: null, origin: "", notes: [], committed: false, end: null };
+    try {
+        return await connectPickerRun(ctx, options, deps, here, keys, g);
+    }
+    finally {
+        await settleG(ctx, deps, g);
+    }
+}
+async function connectPickerRun(ctx, options, deps, here, keys, g) {
     if (grantsUnreadable(ctx.home)) {
         writeLines(ctx.stderr, grantsUnreadableBlock(ctx));
         return EXIT.failure;
@@ -66,41 +82,102 @@ keys = null) {
         ctx.stdout.write(`\n${beat}`);
     const scanned = (deps.scan ?? scanMachine)(ctx.home, ctx.env);
     ctx.stdout.write(ctx.colour ? `\r${beat}   ${SCAN.beatDone}\n` : `\n${beat}   ${SCAN.beatDone}\n`);
+    // ⛔ SLICE 2 (S4 part 3). `deps.account` is the account's network; left out, `connect` talks to nobody about grants and behaves as
+    // 0.7.0 did. A machine that ALREADY has a credential syncs first, before the model is built, so the "on your account" group is
+    // what the server last said; a machine without one has no account to read until it signs in (`g` is how it asks).
+    const account = deps.account ?? null;
+    const loaded = loadCredential({ env: ctx.env, home: ctx.home });
+    const credentialAtStart = loaded.kind === "ok";
+    // The first-sync line is said once per run: if this one prints it, the sync after the writes does not.
+    let firstSyncSaid = false;
+    if (account !== null && credentialAtStart) {
+        const first = await syncForVerb(ctx, false, account);
+        firstSyncSaid = first.kind === "ran" && first.disclosed === true;
+    }
     const read = readGrants(ctx.home);
     const grants = read.kind === "ok" ? read.grants : EMPTY_GRANTS;
+    const perClone = readPerClone(ctx.home);
+    const accountView = account !== null && credentialAtStart
+        ? readAccountView(ctx.home, perClone.flatMap((clone) => (clone.slug === null ? [] : [clone.slug])), { kind: "skipped" })
+        : null;
     const model = buildModel({
         repos: scanned.repos,
         grants,
-        perClone: readPerClone(ctx.home),
+        perClone,
         notListed: pickerNotListedLines(scanned.notListed, connectCommandFor(ctx.env, ctx.selfPath)),
         sawNothing: sawNoSession(scanned.notListed, ctx.home),
         here,
+        accountNotHere: accountView === null ? [] : accountView.notHere,
     });
-    const pick = await choose(ctx, options, deps, model);
-    if (pick.kind === "cancel")
-        return cancelled(ctx);
+    // ⛔ `g` IS OFFERED ONLY WHERE THE CREDENTIAL BEAT WOULD MINT (exception 3): no credential at all (an `absent` file, not a faulty
+    // one), a terminal, and a browser to sign in with. The `auth` chain passes no browser and always leaves a credential, so it can
+    // never reach this; the same gate as `obtainCredential`'s keeps the two in step.
+    const offerAccount = account !== null && loaded.kind === "absent" && ctx.stdinIsTty && deps.browser !== undefined;
+    let pick = await choose(ctx, options, deps, model, offerAccount);
+    /** The grant block's heading and the repos `g` named, when the list is the account's own. */
+    let accountList = null;
+    if (pick.kind === "account" && account !== null) {
+        const minted = await mintForG(ctx, options, deps, account);
+        if (minted.kind === "exit")
+            return minted.code;
+        g.credential = minted.credential;
+        g.notes = minted.notes;
+        g.snapshot = minted.snapshot;
+        g.origin = minted.origin;
+        const change = minted.snapshot === null ? NO_CHANGE : accountChange(minted.snapshot);
+        if (isNoChange(change)) {
+            // Screen 1c: the account grants nothing (or could not be read). The credential is held; the person chooses here, and a run
+            // that ends with nothing granted revokes it (`settleG`).
+            writeLines(ctx.stdout, [
+                "",
+                ...wrap(minted.snapshot === null ? PICKER.gUnavailable(connectCommandFor(ctx.env, ctx.selfPath)) : PICKER.gEmpty, 2),
+            ]);
+            pick = await choose(ctx, options, deps, model, false);
+        }
+        else {
+            const known = new Set(model.owners.flatMap((group) => group.repos.map((repo) => repo.slug)));
+            accountList = { noClone: new Set(change.addRepos.filter((slug) => !known.has(slug))) };
+            pick = { kind: "change", change, noClone: accountList.noClone };
+        }
+    }
+    /** Nothing was granted: say how the run ended. With a credential `g` made, `settleG` (the `finally`) revokes it and prints the line. */
+    const abandon = (ctrlC) => {
+        if (g.credential === null)
+            return ctrlC ? cancelled(ctx) : EXIT.ok;
+        g.end = ctrlC ? "cancelled" : "declined";
+        return ctrlC ? EXIT.failure : EXIT.ok;
+    };
+    if (pick.kind === "cancel" || pick.kind === "account")
+        return abandon(true);
     if (pick.kind === "none" || isNoChange(pick.change)) {
         // Enter is "change nothing" (D5): no grant, no credential, and a completed consent flow (§13.7).
         const on = machineCapture(ctx.home);
         const line = on.kind === "on" ? PICKER.noChanges(machineSummary(on)) : PICKER.nothingGranted(connectCommandFor(ctx.env, ctx.selfPath));
         writeLines(ctx.stdout, ["", ...wrap(line, 2)]);
-        return EXIT.ok;
+        return abandon(false);
     }
-    const { change } = pick;
+    // A repo the ACCOUNT turned off, picked as an ordinary add, is a re-include: it gets its own `turn on` row (the yes wins).
+    const accountState = account !== null && accountList === null ? lastAccountState(ctx.home) : null;
+    const split = splitAccountExclusions(pick.change, accountState === null ? [] : accountState.excluded);
+    const change = split.change;
     // One disclosure and one y/N cover additions and removals together, and a No changes nothing. Removals alone skip the
     // disclosure and ask the stop question (§10.12 "The grant y/N").
-    const facts = { reposHere: reposByOwner(model), noClone: pick.noClone };
+    const facts = { reposHere: reposByOwner(model), noClone: pick.noClone, accountOff: split.accountOff };
     writeLines(ctx.stdout, hasAdditions(change) ? ["", ...disclosure(ctx, true)] : [""]);
-    writeLines(ctx.stdout, renderGrantBlock(change, facts, ctx.colour));
+    writeLines(ctx.stdout, renderGrantBlock(change, facts, ctx.colour, accountList === null ? PICKER.chose : PICKER.accountGrants));
     const answer = await askOrCancel(ctx, grantQuestion(change, ctx.colour, CONNECT.consentAnswers));
     if (answer === null)
-        return cancelled(ctx);
+        return abandon(true);
     if (!isAffirmative(answer)) {
-        writeLines(ctx.stdout, ["", ...wrap(CONNECT.declined, 2)]);
-        return EXIT.ok;
+        if (g.credential === null)
+            writeLines(ctx.stdout, ["", ...wrap(CONNECT.declined, 2)]);
+        return abandon(false);
     }
+    // The ops the account is to hear about go into the SAME write as the grants: one `updateGrants`, so a crash cannot leave one
+    // without the other. The account's own list (`g`) is already on the account and needs none.
+    const queueOps = account !== null && accountList === null;
     try {
-        applyChange(ctx, model, change);
+        applyChange(ctx, model, change, queueOps);
     }
     catch (error) {
         if (!(error instanceof GrantsUnreadableError))
@@ -111,16 +188,57 @@ keys = null) {
     }
     if (!hasAdditions(change)) {
         writeLines(ctx.stdout, ["", ...wrap(PICKER.stopped, 2)]);
-        return EXIT.ok;
+        // Removals reach the account too; nothing more to say about it.
+        if (queueOps && credentialAtStart)
+            await syncForVerb(ctx, false, account, { quietFirst: firstSyncSaid });
+        // A removals-only yes grants nothing: a credential `g` is holding is not kept (`settleG` revokes it).
+        return abandon(false);
     }
     if (options.signIn === true) {
         const code = await signInBeat(ctx, { retry: "sign-in", verify: true, ...(deps.fetch === undefined ? {} : { fetch: deps.fetch }) });
         if (code !== EXIT.ok)
             return code;
     }
+    // ⛔ THE COMMIT, in this order: the grants (written above), then `credentials.json`, then the write-ahead row's deletion.
+    const committed = g.credential === null ? "committed" : commitG(ctx, g);
+    if (committed !== "committed") {
+        // The row was settled by another command, or a concurrent mint holds credentials.json: nothing is saved, the finally revokes the
+        // token held in memory, the grants already written stay, and the exit is 1 — never the exit-3 "connected over a dead credential".
+        g.end = committed;
+        return EXIT.failure;
+    }
     const got = await obtainCredential(ctx, deps, options, "repos");
     if (got.kind === "exit")
         return got.code;
+    // The credential exists now. A machine that had none was just minted one (by the beat above, or by `g`): its first sync is the
+    // moment the server learns what this machine named; one that already had one syncs again only if this run queued something.
+    const minted = !credentialAtStart;
+    let joined = [];
+    /** What the sync after the writes answered, or `null` when none was needed. A sync that did not tell the account is said under "Capture is on". */
+    let accountSync = null;
+    /** Ctrl+C at the joining question: a No, and nothing more is asked (the backfill offer below is a question). */
+    let askedNoMore = false;
+    if (account !== null) {
+        if (minted || queueOps) {
+            // ONE bounded sync after the writes and before "Capture is on" (VQ, on VT's question): a repo granted or re-included in this
+            // run is admitted in this run, not at the next verb. Silent on failure; `pending` is kept and the line below says so.
+            const after = await syncForVerb(ctx, false, account, { quietFirst: firstSyncSaid });
+            accountSync = after;
+            if (after.kind === "ran" && after.disclosed === true)
+                firstSyncSaid = true;
+        }
+        // ⛔ SCREEN 2 — only for a machine that did NOT know the account when it showed the picker, after its own y/N, the credential
+        // and the first sync, and BEFORE the hooks step so the hooks cover every clone named. A machine that already had a credential
+        // saw the account's grants in the picker's "on your account" group and chose among them there.
+        if (minted && g.credential === null) {
+            const join = await joiningMachine(ctx, account, CONNECT.consentAnswers, firstSyncSaid);
+            joined = join.names;
+            askedNoMore = join.cancelled;
+            // The joining question's sync is the latest word on whether the account was told: it gets the same handling.
+            if (join.sync !== null)
+                accountSync = join.sync;
+        }
+    }
     // L11: the hooks print first. Commit hooks for every clone found of what is now on, then the agent hooks.
     const on = onSlugs(ctx, model, change);
     const onRepos = scanned.repos.filter((repo) => on(normalizeSlug(repo.slug)));
@@ -156,11 +274,11 @@ keys = null) {
     // The block cannot know whether an organization has approved capture for a repo it did not probe: it says one may need to,
     // when a granted owner is not the person's own account. In a repo the owner the test capture CHECKED is left out.
     const checkedOwner = probe !== null && here !== null && answeredWith2xx(probe.delivery) ? ownerOfSlug(normalizeSlug(here.slug)) : null;
-    captureOnBlock(ctx, model, change, clones.length === 0, otherOwnersCaveat(ctx, got.credential, checkedOwner));
+    captureOnBlock(ctx, model, change, clones.length === 0, otherOwnersCaveat(ctx, got.credential, checkedOwner), joined, accountNoteLines(ctx, accountSync));
     // The backfill offer. Left out (`deps.backfill`), no offer is made and the ending is the one after a no. The URL follows
     // what LANDED (D19): the conversations list once at least one session was uploaded, whether the run finished or stopped.
     let url = probeUrl(probe);
-    if (deps.backfill !== undefined && onRepos.length > 0) {
+    if (deps.backfill !== undefined && onRepos.length > 0 && !askedNoMore) {
         const outcome = await deps.backfill(ctx, onRepos);
         if (outcome.kind !== "declined" && outcome.uploaded > 0)
             url = URLS.conversations;
@@ -227,34 +345,40 @@ function useChecklist(ctx, options, model) {
     // of 0 or none is a terminal that does not say, which is not a narrow one.
     if (out.columns !== undefined && out.columns > 0 && out.columns < 80)
         return false;
-    return model.onNow.length + model.owners.length + model.turnedOff.length > 0;
+    return model.onNow.length + model.owners.length + model.account.length + model.turnedOff.length > 0;
 }
-async function choose(ctx, options, deps, model) {
+async function choose(ctx, options, deps, model, 
+/** Slice 2: `g` is a choice here (screen 1a). */
+offerAccount) {
     const nowMs = ctx.now().getTime();
     if (useChecklist(ctx, options, model)) {
-        const result = await runChecklist(model, { colour: ctx.colour, nowMs, typedCommand: channelCommand(ctx.env, ctx.selfPath, COMMANDS.connectTyped) }, { input: deps.checklist?.input ?? process.stdin, output: ctx.stdout, ...deps.checklist });
+        const result = await runChecklist(model, { colour: ctx.colour, nowMs, typedCommand: channelCommand(ctx.env, ctx.selfPath, COMMANDS.connectTyped), offerAccount }, { input: deps.checklist?.input ?? process.stdin, output: ctx.stdout, ...deps.checklist });
         if (result.kind === "cancel")
             return { kind: "cancel" };
+        if (result.kind === "account")
+            return { kind: "account" };
         if (result.kind === "done")
             return { kind: "change", change: result.change, noClone: new Set() };
         // `t`: the typed prompt, from the same model.
     }
-    return await typedPick(ctx, model, nowMs);
+    return await typedPick(ctx, model, nowMs, offerAccount);
 }
 /** How many answers in a row the typed prompt will refuse before it gives up. */
 const MAX_MISSES = 10;
 /** The typed prompt (§10.12 "The picker, typed"): re-asks on any token it does not understand, never applying part. */
-async function typedPick(ctx, model, nowMs) {
+async function typedPick(ctx, model, nowMs, offerAccount) {
     const pre = preChange(model);
     let showAll = false;
     for (;;) {
-        writeLines(ctx.stdout, renderTyped(model, { colour: ctx.colour, nowMs, showAll }));
+        writeLines(ctx.stdout, renderTyped(model, { colour: ctx.colour, nowMs, showAll, offerAccount }));
         let misses = 0;
         for (;;) {
             const answer = await askOrCancel(ctx, `  ${PICKER.promptMark}`);
             if (answer === null)
                 return { kind: "cancel" };
-            const parsed = parseTyped(answer, model, showAll);
+            const parsed = parseTyped(answer, model, showAll, offerAccount);
+            if (parsed.kind === "account")
+                return { kind: "account" };
             if (parsed.kind === "more") {
                 // `more` reprints with every repo shown and numbered afresh, then asks again. Nothing is chosen yet.
                 showAll = true;
@@ -287,9 +411,9 @@ function reposByOwner(model) {
  * `excluded` is the exclusion lifting, and only this yes does it (`off`'s contract). It joins `repos` unless an owner
  * grant already covers it.
  */
-function applyChange(ctx, model, change) {
+function applyChange(ctx, model, change, queueOps) {
     updateGrants(ctx.home, (g) => {
-        const owners = [...g.owners.filter((o) => !change.stopOwners.includes(o)), ...change.addOwners];
+        const owners = [...new Set([...g.owners.filter((o) => !change.stopOwners.includes(o)), ...change.addOwners])];
         const covered = (slug) => owners.includes(ownerOfSlug(slug));
         return {
             disclosed_at: hasAdditions(change) ? ctx.now().toISOString() : g.disclosed_at,
@@ -301,6 +425,9 @@ function applyChange(ctx, model, change) {
             ],
             excluded: g.excluded.filter((x) => !change.turnOn.includes(x)),
             refused: g.refused,
+            // Slice 2: what the account is to hear, queued in the same write (the last word on each axis wins: `mergePending`).
+            pending: queueOps ? mergePending(g.pending, changeOps(change, covered), ctx.now()) : g.pending,
+            synced_at: g.synced_at,
         };
     });
     for (const slug of change.stopClones) {
@@ -382,7 +509,11 @@ function commitHooksStep(ctx, clones) {
  */
 function captureOnBlock(ctx, model, change, noClones, 
 /** The "other owners" caveat, for owners the test capture did not check: see `otherOwnersCaveat`. */
-caveat) {
+caveat, 
+/** What the joining-machine question (screen 2) named here, for the new-laptop line. */
+joined = [], 
+/** Muted lines under the block when the sync after the writes did not tell the account (`accountNoteLines`). */
+untold = []) {
     // What is on NOW, read back from disk after the write: the same counts `status` and `auth` give.
     const summary = machineSummary(machineCapture(ctx.home));
     if (noClones) {
@@ -391,6 +522,7 @@ caveat) {
             ...change.addOwners.map((o) => `${o}/`),
             ...change.addRepos,
             ...change.turnOn,
+            ...joined,
         ];
         writeLines(ctx.stdout, [
             "",
@@ -399,6 +531,7 @@ caveat) {
                 what: PICKER.onNewLaptop(names.length <= 3 ? names.join(", ") : summary),
                 why: [PICKER.onNewLaptopProof, AGENT_HOOKS.codexTrust, ...(caveat ? [PICKER.ownerApproval(channelCommand(ctx.env, ctx.selfPath, COMMANDS.status))] : [])],
             }, ctx.colour),
+            ...untold,
         ]);
         return;
     }
@@ -409,6 +542,7 @@ caveat) {
             what: PICKER.onFor(summary),
             why: [PICKER.onProof, AGENT_HOOKS.codexTrust, ...(caveat ? [PICKER.ownerApproval(channelCommand(ctx.env, ctx.selfPath, COMMANDS.status))] : [])],
         }, ctx.colour),
+        ...untold,
         ...wrap(`${PICKER.stopOne} ${channelCommand(ctx.env, ctx.selfPath, COMMANDS.off)}`, 2),
     ]);
 }

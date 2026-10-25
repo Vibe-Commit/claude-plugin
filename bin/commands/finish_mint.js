@@ -16,7 +16,7 @@ import { authCommandFor } from "../install.js";
 import { CONNECT, REPLACE, RETIRE, AUTH } from "../copy/index.js";
 import { loadedFingerprints, recordCredentialMeta } from "../credential_meta.js";
 import { saveCredential } from "../credential.js";
-import { retireCredential, selfRevokeCredential } from "../oauth/retire.js";
+import { REVOKE_TIMEOUT_MS, retireCredential, selfRevokeCredential, selfRevokeOutcome } from "../oauth/retire.js";
 import { credentialFingerprint } from "../post.js";
 import { paint, labelled, renderErrorBlock, truncateMiddle, wrap, WRAP_COLUMNS, LABEL_GUTTER } from "../term.js";
 import { writeLines } from "./context.js";
@@ -38,6 +38,13 @@ import { probeCredential } from "./probe.js";
  */
 export async function finishMint(ctx, input) {
     const { minted, facts, prior } = input;
+    // ⛔ WRITE-AHEAD (`g`): the row exists before the probe, the question, or anything that can be interrupted. If it cannot be
+    // written, nothing may keep this credential alive that the client does not remember: revoke it now, in memory.
+    if (input.hold !== undefined && !input.hold.record(minted, input.endpoint)) {
+        const revoked = await selfRevokeOutcome(input.endpoint, minted, { fetch: input.fetch, timeoutMs: REVOKE_TIMEOUT_MS });
+        // A 404 (`unknown`) is a server with no revoke route: the credential may still be live, so it is NOT "revoked" ("0.8.0 truth fixes" F7).
+        return { kind: "unrecorded", revoked: revoked.kind === "retired" || revoked.kind === "gone" };
+    }
     const fresh = await probeCredential(ctx, minted, input.fetch, { record: false });
     if (fresh.kind === "unauthorized") {
         writeLines(ctx.stderr, ["", ...renderErrorBlock({ kind: "bad", code: "MINT_FAILED", what: AUTH.mintFailedWhat, why: [AUTH.mintUnconfirmedWhy] }, ctx.colour)]);
@@ -62,6 +69,8 @@ export async function finishMint(ctx, input) {
             : { account: facts.account, orgName: null };
     if (input.confirm === "always" && unconfirmed && shown?.orgName == null) {
         const revoked = await selfRevokeCredential(input.endpoint, minted, { fetch: input.fetch });
+        if (revoked.kind === "retired")
+            input.hold?.release(minted);
         writeLines(ctx.stderr, [
             "",
             ...renderErrorBlock({
@@ -105,6 +114,8 @@ export async function finishMint(ctx, input) {
             // credential this machine holds in that workspace is the one to remove. Anything but a clean
             // "retired" leaves it live, and the sentence says where to remove it.
             const revoked = await selfRevokeCredential(input.endpoint, minted, { fetch: input.fetch });
+            if (revoked.kind === "retired")
+                input.hold?.release(minted);
             writeLines(ctx.stdout, [
                 "",
                 ...wrap(answer === null ? REPLACE.cancelled : REPLACE.declined, 2),
@@ -113,8 +124,9 @@ export async function finishMint(ctx, input) {
             return { kind: "declined" };
         }
     }
-    // y — or no question was called for.
-    saveCredential(ctx.home, minted);
+    // y — or no question was called for. A held credential (`g`) is NOT written here: the caller writes it after ITS yes.
+    if (input.hold === undefined)
+        saveCredential(ctx.home, minted);
     recordCredentialMeta(ctx.home, credentialFingerprint(minted), {
         expires_at: fresh.kind === "ok" ? fresh.expiresAt ?? facts.expiresAt : facts.expiresAt,
         credential_id: fresh.kind === "ok" ? fresh.credentialId : facts.credentialId,
@@ -143,6 +155,6 @@ export async function finishMint(ctx, input) {
                         : RETIRE.failed);
         }
     }
-    return { kind: "saved", credential: minted, notes };
+    return input.hold === undefined ? { kind: "saved", credential: minted, notes } : { kind: "held", credential: minted, notes };
 }
 //# sourceMappingURL=finish_mint.js.map

@@ -5,8 +5,9 @@
  * answer — "Not a git repository" — was the very precondition 0.7.0 removes from `connect`. So it answers for the machine:
  * what is on, what is turned off, when anything last sent, where the dashboard is, and the three things to do next.
  *
- * Reads `grants.json`, `projects.json` and session state; opens no transcript, makes no request and writes nothing. It
- * spawns one `git remote get-url` per per-clone consent (to count them as repos), and nothing else.
+ * Reads `grants.json`, `grants-account.json`, `projects.json` and session state; opens no transcript, makes no request and
+ * writes nothing — the one bounded account sync (slice 2) is `statusVerb`'s, which runs before this and hands in its outcome.
+ * It spawns one `git remote get-url` per per-clone consent (to count them as repos), and nothing else.
  *
  * ⚠ **`last sent` names no repo.** The drawn screen says `4 minutes ago · alexvibecommit/example-repo`, but session state
  * is kept under a one-way digest of the repo's path, so the machine-wide scan can say WHEN and not WHICH. Naming the repo
@@ -26,6 +27,7 @@ import { listOrgPending } from "../org_pending.js";
 import { lastSendOnMachine } from "../state.js";
 import { LABEL_GUTTER, WRAP_COLUMNS, glyph, labelled, paint, wrap } from "../term.js";
 import { writeFailure, writeLines } from "./context.js";
+import { readAccountView } from "../grants_verb.js";
 /** §10.3 indents the gutter rows four columns under the state line. */
 const ROW_INDENT = 4;
 /** `rows` on the label gutter: the first carries the label, the rest hang under it. Values wrap at 80 columns. */
@@ -50,6 +52,42 @@ function rows(label, values) {
     flush();
     return out;
 }
+/** A labelled row whose VALUE is a sentence: wrapped at 80 columns, the continuation hanging under the value. */
+function sentenceRow(label, text) {
+    const hang = ROW_INDENT + LABEL_GUTTER;
+    const lines = wrap(text, hang);
+    return lines.map((line, i) => (i === 0 ? labelled(ROW_INDENT, label, line.slice(hang)) : line));
+}
+/**
+ * Slice 2 (S4), brief §3.3: what the user's account grants that this machine has not named, and the changes queued for it.
+ * Between `off` and `held`; and on a machine that names nothing, right under the heading.
+ */
+function accountRows(ctx, view) {
+    const out = [];
+    if (view.notHere.length > 0) {
+        out.push(...rows(STATUS.accountLabel, view.notHere));
+        out.push(...wrap(STATUS.accountNotHere(channelCommand(ctx.env, ctx.selfPath, COMMANDS.connect)), ROW_INDENT + LABEL_GUTTER));
+    }
+    const retrying = view.pending - view.pendingRejected;
+    if (view.pendingRejected > 0)
+        out.push(...sentenceRow(STATUS.pendingLabel, STATUS.pendingRejectedValue(view.pendingRejected)));
+    if (retrying > 0)
+        out.push(...sentenceRow(view.pendingRejected > 0 ? "" : STATUS.pendingLabel, STATUS.pendingValue(retrying)));
+    return out;
+}
+/**
+ * "0.8.0 truth fixes" F6: the same `on account` and `pending` rows, for the screen of a repo. They are about the machine and the
+ * account, not the repo, but they are what notice 10, `connect`'s "They stay granted on your account" and the README say `status`
+ * lists, and a person reads `status` from inside a clone. Empty when there is nothing to say (or `grants.json` is unreadable).
+ * Text only: the in-repo `--json` document is unchanged.
+ */
+export function accountRowsFor(ctx, sync) {
+    const capture = machineCapture(ctx.home);
+    if (capture.kind === "unreadable")
+        return [];
+    const view = readAccountView(ctx.home, capture.kind === "on" ? capture.perClone.flatMap((c) => (c.slug === null ? [] : [normalizeSlug(c.slug)])) : [], sync);
+    return view === null ? [] : accountRows(ctx, view);
+}
 /**
  * The repos waiting on an organization's approval: every standing marker in `org_pending.ts`'s slug directory (written when
  * THAT repo's own upload got `403 capture_not_approved`, cleared by a 2xx from ANY clone of it), reduced by VT's conditions.
@@ -72,8 +110,12 @@ function waitingRepos(ctx, capture) {
     }
     return [...waiting].sort();
 }
-export function machineStatus(ctx, argv) {
+export function machineStatus(ctx, argv, sync = { kind: "skipped" }) {
     const capture = machineCapture(ctx.home);
+    // Slice 2 (S4). `null` when `grants.json` is unreadable: the pending queue is unknowable, so no account rows.
+    const view = capture.kind === "unreadable"
+        ? null
+        : readAccountView(ctx.home, capture.kind === "on" ? capture.perClone.flatMap((c) => (c.slug === null ? [] : [normalizeSlug(c.slug)])) : [], sync);
     const waiting = capture.kind === "on" ? waitingRepos(ctx, capture) : [];
     const load = loadCredential({ env: ctx.env, home: ctx.home });
     const last = lastSendOnMachine(ctx.home);
@@ -94,6 +136,20 @@ export function machineStatus(ctx, argv) {
             // named). A machine key for the release paragraph; it does not change the exit code.
             org_pending: waiting,
             grants_unreadable: capture.kind === "unreadable",
+            // Slice 2 (S4): the last synced account state (`null` before the first sync); what it grants that this machine has not
+            // named (an owner as `owner/`); the changes queued for it; and how many of those the server refused in this run.
+            account: view === null || view.account === null
+                ? null
+                : {
+                    owners: view.account.owners,
+                    repos: view.account.repos,
+                    excluded: view.account.excluded,
+                    epoch: view.account.epoch,
+                    synced_at: view.account.synced_at,
+                },
+            account_not_here: view === null ? [] : view.notHere,
+            pending: view === null ? 0 : view.pending,
+            pending_rejected: view === null ? 0 : view.pendingRejected,
             last_send: last === null ? null : { at_ms: last.at, seq: last.seq },
             dashboard: URLS.dashboard,
             credential: load.kind === "ok" ? load.credential.source : null,
@@ -121,11 +177,16 @@ export function machineStatus(ctx, argv) {
         ];
         lines.push(...rows(STATUS.reposLabel, [...new Set(repos)]));
         lines.push(...rows(STATUS.offLabel, grants.excluded));
+        if (view !== null)
+            lines.push(...accountRows(ctx, view));
         // §10.2's held vocabulary: the beat word and "the org must approve capture". One row, naming the repos; never an unnamed one.
         if (waiting.length > 0) {
             lines.push(...rows(STATUS.heldLabel, waiting), `${" ".repeat(ROW_INDENT + LABEL_GUTTER)}${STATUS.heldReason}`);
         }
     }
+    // A machine that names nothing still shows what its account grants and what is queued, right under the heading.
+    if (capture.kind === "none" && view !== null)
+        lines.push(...accountRows(ctx, view));
     if (last !== null)
         lines.push(labelled(ROW_INDENT, STATUS.lastSuccessLabel, relativeAge(last.at, nowMs)));
     lines.push(labelled(ROW_INDENT, STATUS.dashboardLabel, paint(ctx.colour, "accent", URLS.dashboard)));

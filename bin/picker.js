@@ -14,6 +14,8 @@
  *               row (D9: at most 8 repos before `+ N more`).
  *   turned off  slugs in `excluded`. Choosing one is a re-include; the grant block names it on a `turn on` row, inside
  *               the same y/N (D7 · 3A), and only a yes clears the exclusion.
+ *   on your account  (slice 2) what the account grants that this machine has not named. Unticked until chosen, like any
+ *               row: choosing one is an ordinary addition, so it goes through the same disclosure and y/N (R3-8, R3-9).
  *
  * ⛔ **A pre-tick is not a consent** (D34): the working folder's repo starts ticked, and Enter on it leads to the naming
  * y/N, which defaults to N. It is an ADDITION to the diff, never part of the baseline.
@@ -152,9 +154,19 @@ export function buildModel(input) {
     const turnedOff = [...excluded]
         .sort()
         .map((slug) => ({ slug, counts: countsOf(slug), pre: slug === hereSlug }));
+    // ⛔ THE SCAN ROW WINS: an owner that already has a group above, and a repo already listed under one, are not repeated under "on
+    // your account" — choosing the scan row is the same change, and one row per thing is what a person can read.
+    const shownOwners = new Set(owners.map((group) => group.owner));
+    const shownRepos = new Set(owners.flatMap((group) => group.repos.map((repo) => repo.slug)));
+    const account = (input.accountNotHere ?? [])
+        .map((name) => name.endsWith("/")
+        ? { kind: "owner", key: normalizeOwner(name.slice(0, -1)) }
+        : { kind: "repo", key: normalizeSlug(name) })
+        .filter((row) => (row.kind === "owner" ? !shownOwners.has(row.key) : !shownRepos.has(row.key)));
     return {
         onNow,
         owners,
+        account,
         turnedOff,
         notListed: input.notListed,
         found: input.repos.length,
@@ -172,6 +184,8 @@ export function numberedRows(model, showAll) {
         for (const repo of shown)
             rows.push({ kind: "repo", repo });
     }
+    for (const row of model.account)
+        rows.push({ kind: "account", row });
     for (const row of model.turnedOff)
         rows.push({ kind: "off", row });
     return rows;
@@ -182,13 +196,20 @@ const REPO_TOKEN = /^[^\s/]+(?:\/[^\s/]+)*\/[^\s/]+$/u;
  * Parse one typed answer (D8 · 4A). ⛔ **Never applies part of an answer:** any token that is not understood returns
  * `error` naming each such token, and nothing is chosen. `owner/` and `owner/repo` are always accepted, a clone here or
  * not, because a new laptop needs them; the grant block flags `(no clone here yet)`.
+ *
+ * ⛔ **`g` STANDS ALONE** (exception 3, R3-12): where `offerAccount` is true, `g` alone is the account's grants, and `g` mixed with
+ * any other token is refused with nothing applied, so the y/N after it always names a single list. Where it was not offered `g` is
+ * an ordinary token nobody understands.
  */
-export function parseTyped(input, model, showAll) {
+export function parseTyped(input, model, showAll, offerAccount = false) {
     const tokens = input.split(/[\s,]+/u).filter((t) => t !== "");
     if (tokens.length === 0)
         return { kind: "empty" };
     if (tokens.length === 1 && tokens[0].toLowerCase() === "more")
         return { kind: "more" };
+    if (offerAccount && tokens.some((t) => t.toLowerCase() === "g")) {
+        return tokens.length === 1 ? { kind: "account" } : { kind: "error", tokens: [PICKER.gMixedToken] };
+    }
     const rows = numberedRows(model, showAll);
     const bad = [];
     const addOwners = new Set();
@@ -236,6 +257,12 @@ export function parseTyped(input, model, showAll) {
                 bad.push(PICKER.alreadyOn(token, `-${token}`));
             else if (row.kind === "off")
                 turnOn.add(row.row.slug);
+            else if (row.kind === "account") {
+                if (row.row.kind === "owner")
+                    addOwners.add(row.row.key);
+                else
+                    addSlug(row.row.key, token);
+            }
             else
                 addSlug(row.repo.slug, token);
         }
@@ -377,7 +404,11 @@ export function notListedBlock(model, colour) {
 export function renderTyped(model, options) {
     const { colour, nowMs, showAll } = options;
     const lines = [""];
-    if (model.found === 0 && model.onNow.length === 0 && model.turnedOff.length === 0 && model.owners.length === 0) {
+    if (model.found === 0 &&
+        model.onNow.length === 0 &&
+        model.turnedOff.length === 0 &&
+        model.owners.length === 0 &&
+        model.account.length === 0) {
         return [
             ...lines,
             ...wrap(model.sawNothing ? PICKER.emptyNone : SCAN.noneListable, 2).map((l) => paint(colour, "strong", l)),
@@ -385,6 +416,7 @@ export function renderTyped(model, options) {
             ...notListedBlock(model, colour),
             "",
             ...wrap(model.sawNothing ? PICKER.emptyType : PICKER.emptyListable, 2),
+            ...(options.offerAccount === true ? wrap(PICKER.gLine, 2) : []),
             `  ${PICKER.enterNothing}`,
         ];
     }
@@ -392,12 +424,17 @@ export function renderTyped(model, options) {
     const onNow = model.onNow.map((row) => onNowDisplay(row, nowMs));
     const shown = (g) => (showAll ? g.repos : g.repos.slice(0, GROUP_CAP));
     const repoRows = model.owners.flatMap((g) => shown(g).map((r) => repoDisplay(r, nowMs)));
+    const account = model.account.map((row) => ({
+        name: row.kind === "owner" ? `${row.key}/` : row.key,
+        meta: PICKER.onAccountHint,
+        agents: "",
+    }));
     const off = model.turnedOff.map((row) => ({
         name: row.slug,
         meta: PICKER.turnOnHint,
         agents: "",
     }));
-    const { cut, column, withAgents } = layout([...onNow, ...repoRows, ...off]);
+    const { cut, column, withAgents } = layout([...onNow, ...repoRows, ...account, ...off]);
     const row = (n, display) => `${String(n).padStart(6)}  ${paint(colour, "text", cut(display.name).padEnd(column))}${" ".repeat(GAP)}${paint(colour, "muted", withAgents(display))}`;
     let n = 0;
     if (model.onNow.length > 0) {
@@ -414,6 +451,11 @@ export function renderTyped(model, options) {
             lines.push(paint(colour, "muted", `     +  ${PICKER.moreTyped(hidden, group.owner)}`));
         }
     }
+    if (account.length > 0) {
+        lines.push(paint(colour, "muted", `  ${PICKER.onAccount}`));
+        for (const d of account)
+            lines.push(row(++n, d));
+    }
     if (model.turnedOff.length > 0) {
         lines.push(paint(colour, "muted", `  ${PICKER.turnedOff}`));
         for (const d of off)
@@ -421,6 +463,8 @@ export function renderTyped(model, options) {
     }
     lines.push(...notListedBlock(model, colour), "");
     lines.push(`  ${paint(colour, "text", PICKER.choose(model.owners.length > 0))}`);
+    if (options.offerAccount === true)
+        lines.push(...wrap(PICKER.gLine, 2).map((l) => paint(colour, "text", l)));
     if (model.onNow.length > 0)
         lines.push(`  ${paint(colour, "text", PICKER.removeHint)}`);
     const pre = preChange(model);
@@ -437,8 +481,10 @@ export function notUnderstoodLines(tokens) {
  * change; an owner row says how many repos are here and that later clones are covered, and a typed name with no clone
  * on this machine says so, so a typo shows BEFORE the question.
  */
-export function renderGrantBlock(change, facts, colour) {
-    const lines = [`  ${paint(colour, "strong", PICKER.chose)}`];
+export function renderGrantBlock(change, facts, colour, 
+/** `You chose:` for the person's picks; the account's own list (`g`, screen 1b) is headed `Your account grants:`. */
+heading = PICKER.chose) {
+    const lines = [`  ${paint(colour, "strong", heading)}`];
     const rows = [
         [
             PICKER.labelOwners,
@@ -451,7 +497,10 @@ export function renderGrantBlock(change, facts, colour) {
             PICKER.labelRepos,
             change.addRepos.map((r) => (facts.noClone.has(r) ? `${r}  ${PICKER.noCloneHere}` : r)),
         ],
-        [PICKER.labelTurnOn, [...change.turnOn]],
+        [
+            PICKER.labelTurnOn,
+            change.turnOn.map((slug) => (facts.accountOff?.has(slug) === true ? `${slug}  ${PICKER.turnedOffOnAccount}` : slug)),
+        ],
         [
             PICKER.labelStop,
             [

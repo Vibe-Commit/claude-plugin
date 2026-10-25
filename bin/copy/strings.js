@@ -33,7 +33,7 @@ export const HELP = {
         // nothing yet. With `--stdin` or no terminal it saves the credential and stops there.
         auth: "Renew or replace this machine's credential. On a terminal it then goes on to connect: in a git repo, or on a machine that captures nothing yet. Otherwise it only saves the credential.",
         // 0.7.0 (D34): from any folder. A repo with a remote is chosen in the picker; a repo with no remote keeps the old flow.
-        connect: "Choose the repositories to capture, from any folder, and connect them. On a machine with no credential it signs in first.",
+        connect: "Choose the repositories to capture, from any folder, and connect them. On a machine with no credential it signs you in after you say yes, unless you choose g, which signs in first to read your account's grants.",
         // `D33 · 27A`. A public verb so an AI agent can list capturable repos without entering a consent
         // flow. It opens no session file and changes no setting, which is what lets it be run before `connect`.
         // ⚠ NOT "changes nothing" (PR 1 F1): opening Codex's index read-only makes SQLite create its own
@@ -238,6 +238,33 @@ export const STATUS = {
     basisOwner: (owner) => `owner grant ${owner}/`,
     basisRepo: "repo grant",
     basisClone: "per clone",
+    /**
+     * Slice 2 (S4), brief §3.3: inside a repo that is NOT on, the account may still grant it. The account never admits a repo on
+     * its own (R3-22): naming it here is `connect`'s picker, and the action row already offers `connect`.
+     */
+    basisAccountOnly: "granted on your account, not on this machine",
+    /**
+     * Slice 2 (S4), brief §3.3: the machine screen's account rows, after `off` and before `held`. `on account` lists what the
+     * user's account grants that THIS machine has not named (an owner as `owner/`); the second line says what to do about it.
+     */
+    accountLabel: "on account",
+    accountNotHere: (connect) => `not on this machine · to capture them here, run: ${connect}`,
+    /** Changes queued for the account that no sync has delivered yet. They go out with the next sync; only `connect`, `status`, `off` and a terminal `auth` sync. */
+    pendingLabel: "pending",
+    pendingValue: (n) => `${n} ${n === 1 ? "change" : "changes"} not yet sent to your account · sent at the next sync`,
+    /**
+     * VQ's ruling (ii): a queued change the server refused with 400 is kept (a consent statement is never dropped) but a retry
+     * fails again, so this row does not say "the next command retries". The URL is the one the web app's error state uses.
+     */
+    pendingRejectedValue: (n) => `${n} ${n === 1 ? "change" : "changes"} your account didn't accept · report this: github.com/Vibe-Commit/claude-plugin/issues`,
+    /**
+     * The first sync uploads what this machine already named (per-clone consents made under 0.6.x/0.7.0 reach the account, R3-21).
+     * Slugs only, never paths; more than three names shows two and "and N more", and the full list follows, one per line. The names arrive as ONE string, a name per line, because the copy corpus renders every template with string arguments.
+     */
+    accountSaving: (namesOnePerLine) => {
+        const names = namesOnePerLine.split("\n");
+        return `Saving this machine's repository choices to your VibeCommit account: ${names.length > 3 ? `${names.slice(0, 2).join(", ")} and ${names.length - 2} more` : names.join(", ")}.`;
+    },
     /** The machine-level screen (any folder that is not a work tree). */
     offMachine: "Capture is not on for any repository on this machine.",
     ownersLabel: "owners",
@@ -469,7 +496,7 @@ export const CONNECT = {
      * ONE sentence, not a paragraph, added on the picker path only (design doc step 2, "The disclosure"): what the grant
      * covers beyond the repos named on screen. The four paragraphs under either heading stay byte-identical.
      */
-    consentScope: "The choice covers future clones of these repositories too, and adds commit hooks to each clone where it can.",
+    consentScope: "The choice covers future clones of these repositories too, adds commit hooks to each clone where it can, and is saved to your VibeCommit account so your other machines running VibeCommit 0.8.0 or later can offer it.",
     /**
      * ⚠ "private-repo paths" IS THE APPROVED WORDING, and it is the reason
      * `private` is deliberately NOT registered in `claims.ts`: a substring gate on
@@ -1169,6 +1196,79 @@ export const PICKER = {
     ownerApproval: (status) => `An organization can require an owner's approval before its repos are captured; once a session in one of its repos has tried to upload, ${status} shows any that are waiting.`,
     onNewLaptop: (names) => `Capture is on for ${names} on this machine.`,
     onNewLaptopProof: "No clone of it is here yet. Clone one and open a coding agent in it; that session is captured.",
+    // --- Slice 2 (S4 part 3, capture 0.8.0): the account's grants in `connect`. Brief §2-§3, VQ's rulings 2026-10-24. ---
+    /** The group of account grants this machine has not named (§2): numbered, unticked until chosen, like any other row. */
+    onAccount: "on your account",
+    onAccountHint: "choose it to capture it here",
+    /** A `turn on` row whose repo was turned off on the ACCOUNT (not only here): the yes re-includes it everywhere. */
+    turnedOffOnAccount: "(turned off on your account)",
+    /** Screen 1a: the second line of the prompt block, on a machine with no credential, a terminal and a browser to sign in with. */
+    gLine: "Or type g for the repositories your account already grants. It signs in first.",
+    /** The one token a mixed answer is refused for; `notUnderstood` wraps it in D8's line. */
+    gMixedToken: "g can't be combined with other choices",
+    /** Screen 1b: the grant block's heading when the list is the account's, not the person's picks. */
+    accountGrants: "Your account grants:",
+    /** Screen 1b, N: the credential `g` signed in with is revoked. The removed-here variant is a revoke that could not reach the server. */
+    gDeclinedRevoked: "Nothing is captured on this machine. The credential made for this was revoked.",
+    gDeclinedRemoved: "Nothing is captured on this machine. The credential made for this was removed here; the server will be told on the next vibecommit command that contacts the server.",
+    /** Ctrl+C after a mint (VQ's correction): never "Nothing was changed", because a credential was made and then removed. */
+    gCancelledRevoked: "Cancelled. Nothing is captured on this machine. The credential made for this was revoked.",
+    gCancelledRemoved: "Cancelled. Nothing is captured on this machine. The credential made for this was removed here; the server will be told on the next vibecommit command that contacts the server.",
+    /**
+     * `g` stopped because this machine could not make the write-ahead record of the credential it had just been given (an unwritable,
+     * unreadable or full queue). The credential is revoked at once (`REPLACE.declinedRevoked`), or `REPLACE.declinedOrphan` says where
+     * to remove it. An insecure queue file gets the insecure-file block instead of this line.
+     */
+    gNotRecorded: "g stopped: this machine couldn't keep a record of the credential it was just given.",
+    /**
+     * The yes found `g`'s own record of the credential UNUSABLE (the queue file became insecure or unreadable while the question was
+     * open): nothing was revoked by anyone, this machine just cannot keep the record, so no credential is kept.
+     */
+    gRecordUnusable: (connect) => `This machine's record of the credential this run had made couldn't be used, so none was kept. The repositories you chose stay named here; run \`${connect}\` again to sign in.`,
+    /**
+     * The yes found a `credentials.json` already there (another run saved one while the question was open): that one is kept, this run's
+     * is not, and the grants the yes wrote are saved — capture IS on, so this never says nothing is captured. The fate of the
+     * credential this run made follows on its own line (`REPLACE.declinedRevoked`, `gRemovedWillTell`, or `REPLACE.declinedOrphan`).
+     */
+    gOccupied: (connect) => `A credential was saved on this machine while this question was open, so that one is kept and the one this run made was not. The repositories you chose are saved; run \`${connect}\` again to finish.`,
+    /** The fate line for `gOccupied` when a readable row still holds the credential this run made. */
+    gRemovedWillTell: "The credential just created was removed here; the server will be told on the next vibecommit command that contacts the server.",
+    /**
+     * The yes found `g`'s own record of the credential gone: another vibecommit command (a retry that ran while the question was open)
+     * had already revoked it. No credential is kept, and the grants the yes wrote stay. `connect` is THIS install's command.
+     */
+    gRevokedElsewhere: (connect) => `Another vibecommit command revoked the credential this run had made, so none was kept. The repositories you chose stay named here; run \`${connect}\` again to sign in.`,
+    /** Screen 1c: `g` found no grants on the account. The credential is kept and the person chooses here. */
+    gEmpty: "Your account doesn't grant any repositories yet. Choose them here instead:",
+    /**
+     * `g` signed in but the account's grants could not be read (the server did not answer, or answered off-contract). It must not
+     * say the account is empty, and it says what to do: run `connect` again. `connect` is THIS install's command (a function of it).
+     */
+    gUnavailable: (connect) => `The repositories your account grants couldn't be read right now. Run \`${connect}\` again to choose from them.`,
+    /** Screen 2: a machine joining an account by picking local repos is asked about the rest of the account's grants. */
+    joinAlso: (namesOnePerLine) => {
+        const names = namesOnePerLine.split("\n");
+        const head = names.length > 3
+            ? `${names.slice(0, 2).join(", ")} and ${names.length - 2} more`
+            : names.length > 1
+                ? `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`
+                : names[0];
+        return `Your account also grants ${head}.`;
+    },
+    joinQuestion: "Capture those here too?",
+    /**
+     * Under "Capture is on" when the sync after `connect`'s writes did not reach the server (VQ, on VT's question). Capture IS on —
+     * local grants admit the repo — so this is not a warning; it only tells the truth about the account. Only `connect`, `status` and
+     * `off` sync, so it names `status` (the install channel's command); a 400 and a 401 have their own lines (below and `ERRORS`).
+     */
+    accountNotTold: (status) => `Your account hasn't been told yet; running \`${status}\` retries.`,
+    /**
+     * "0.8.0 truth fixes" F2: the same line on a machine that HAS SYNCED before. There a grant the account has not been told about
+     * holds the repository's sessions on this machine (`isCaptureAllowed`, step 3), so "Capture is on" needs the truth about it.
+     * A machine that has never synced holds nothing and keeps `accountNotTold`.
+     */
+    accountNotToldHeld: (status) => `Your account hasn't been told yet. Until it is, sessions in the repositories you just chose that it doesn't grant wait on this machine; running \`${status}\` retries.`,
+    joinDeclined: (status) => `They stay granted on your account and aren't captured on this machine. ${status} lists them.`,
 };
 /** `vibecommit off`. */
 export const OFF = {
@@ -1186,6 +1286,21 @@ export const OFF = {
     grantsUnreadableWhy: "Capture is already stopped for this repository while the file can't be read, and this clone's own consent was withdrawn.",
     grantsUnreadableFixLabel: "Fix the file or move it aside, then run:",
     alreadyOff: "Capture was already off for this repository.",
+    /**
+     * Slice 2 (S4), brief §2 and §5. On a machine with a credential the exclusion is also queued for the account and synced
+     * (3 s), so the success line says where else it reaches; `unsyncedOthers` says who keeps capturing until they sync; and
+     * `notSentYet` is the design's sentence for a write that could not reach the server (it stays queued).
+     */
+    doneSlugAccount: (slug) => `Turned off ${slug} for every clone on this machine, and on your other machines running VibeCommit 0.8.0 or later once they sync.`,
+    // ⛔ A 0.6.x/0.7.0 machine never syncs, so every sentence about "your other machines" names the version that does (VQ, on #87).
+    unsyncedOthers: (n) => n === 1
+        ? "1 of your machines hasn't synced and keeps capturing it until it syncs on VibeCommit 0.8.0 or later."
+        : `${n} of your machines haven't synced and keep capturing it until they sync on VibeCommit 0.8.0 or later.`,
+    notSentYet: "Stopped here. Your other machines running VibeCommit 0.8.0 or later don't know yet; it will retry.",
+    /** The write was stopped, not just unsent (a 400, a 401, too large, unreadable): "it will retry" would be false, so it does not say so. */
+    notSentStopped: "Stopped here. Your other machines running VibeCommit 0.8.0 or later don't know yet.",
+    /** The account already had it turned off (another machine, or the dashboard); this machine now agrees. */
+    alreadyOffAccount: "Already off on your account; now off on this machine too.",
     note: "Sessions already recorded are unaffected.",
     // `TODOS[184]`. `off` used to ignore `argv` entirely and always run — a stray
     // argument, including `--help`'s own flag landing here by a bug, must never
@@ -2130,7 +2245,14 @@ export const RUNTIME = {
  *   4. No URL longer than the line.
  */
 export const SYSTEM_MESSAGE = {
-    notConnected: "VibeCommit is installed but not connected. Run `vibecommit connect` to start capturing.",
+    /**
+     * State 1. The command is the channel's (`installChannel`): `vibecommit connect` on npm, `node <path> connect` for the plugin
+     * bundle, which has no `vibecommit` on PATH (slice 2, design Next Steps 6, the mechanism state 2 already uses). On npm the line is
+     * the same bytes it always was.
+     */
+    notConnected: (connectCommand) => `VibeCommit is installed but not connected. Run \`${connectCommand}\` to start capturing.`,
+    /** State 1 when the channel's command would blow `credentialRejectedBudget` (a long plugin realpath). */
+    notConnectedFallback: "VibeCommit is installed but not connected. Connect it: vibecommit.ai/install",
     /**
      * State 2 — `11A`. House prefix kept, ONE line, and the cause is no longer named: the server's 401
      * body is opaque on purpose (it cannot say "revoked" vs "expired"), so "revoked" was a guess that
@@ -2182,6 +2304,23 @@ export const SYSTEM_MESSAGE = {
     hooksPathSet: "VibeCommit captures sessions here, not commits: core.hooksPath is set. Run `vibecommit status` here for the fix.",
     ownCommitHook: "VibeCommit didn't add its commit hook here: this clone has its own. Run `vibecommit connect` here to chain it.",
     grantsUnreadable: "VibeCommit capture stopped on this machine: ~/.vibecommit/grants.json can't be read. Run `vibecommit status`.",
+    /**
+     * State 10 — slice 2 (`CR-259`, brief §3 item 4). Emitted by the `SessionStart` hook, once per (machine, account epoch), when its one
+     * bounded `GET` found account grants this machine has not named. SessionStart-only like states 6-9 (the plugin registers no
+     * SessionStart), so it names the CLI by its own name, in backticks as 7-9 do; ≤120 characters.
+     *
+     * The counts are of what `status` lists under "on account", split: `owners` are the account's owner grants this machine has not named
+     * (`octocat/`), `repos` its repository grants not named here, not under a named owner, and not turned off. The forms: "2 repositories",
+     * "1 owner and 3 repositories", "2 owners"; the singulars are "1 repository" and "1 owner".
+     */
+    accountGrantsNotHere: (owners, repos) => {
+        const o = `${owners} ${owners === 1 ? "owner" : "owners"}`;
+        const r = `${repos} ${repos === 1 ? "repository" : "repositories"}`;
+        const what = owners > 0 && repos > 0 ? `${o} and ${r}` : owners > 0 ? o : r;
+        return `Your account grants ${what} not captured on this machine yet. Run \`vibecommit status\`.`;
+    },
+    /** State 10 when the counts would blow the ≤120 budget (an absurd number of grants): no counts, the same command. */
+    accountGrantsNotHereFallback: "Your account grants repositories not captured on this machine yet. Run `vibecommit status`.",
 };
 /**
  * The out-of-tree redaction marker — `CR-024d`, D57 §OV8d.

@@ -45,9 +45,12 @@ import { probeCredential } from "./probe.js";
 // `finishMint` and its types moved to `finish_mint.ts` (`CR-234d`) so the device flow can share them without
 // a cycle. Re-exported here because this is where every caller and test has always found them.
 export { finishMint } from "./finish_mint.js";
-/** The question's scope, passed down only when set (exactOptionalPropertyTypes). */
+/** The question's scope and the hold, passed down only when set (exactOptionalPropertyTypes). */
 function scopeOf(options) {
-    return options.scope === undefined ? {} : { scope: options.scope };
+    return {
+        ...(options.scope === undefined ? {} : { scope: options.scope }),
+        ...(options.hold === undefined ? {} : { hold: options.hold }),
+    };
 }
 /** `signInBeat`'s sentinel for "no browser, go to the device flow". Never an exit code a verb returns. */
 export const NO_BROWSER = -1;

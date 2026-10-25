@@ -202,6 +202,7 @@ export async function deviceCredential(ctx, input, deps = {}) {
         ticket: { account: polled.account, orgName: polled.orgName },
         rerun,
         ...(input.scope === undefined ? {} : { scope: input.scope }),
+        ...(input.hold === undefined ? {} : { hold: input.hold }),
     });
 }
 function gateOffBlock(ctx, rerun) {

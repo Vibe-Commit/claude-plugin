@@ -31,7 +31,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { COMMANDS, SYSTEM_MESSAGE, URLS } from "./copy/index.js";
 import { endDateText } from "./credential_meta.js";
-import { cloneMarkerPath, machineDayNoticePath, repoDayNoticePath, sessionNoticePath } from "./paths.js";
+import { cloneMarkerPath, machineDayNoticePath, machineEpochNoticePath, repoDayNoticePath, sessionNoticePath, } from "./paths.js";
 import { NODE_FLOOR_TEXT } from "./runtime.js";
 /**
  * The UTC calendar day, `YYYY-MM-DD`.
@@ -46,8 +46,9 @@ export function utcDay(now) {
 }
 /** `COMMANDS.auth` — what a notice names when the caller did not say how this install is run. */
 const DEFAULT_AUTH_COMMAND = COMMANDS.auth;
+const DEFAULT_CONNECT_COMMAND = COMMANDS.connect;
 /** The one-line text for a state. Never contains an escape sequence. */
-export function noticeText(state, nodeVersion, authCommand = DEFAULT_AUTH_COMMAND, endsAt) {
+export function noticeText(state, nodeVersion, authCommand = DEFAULT_AUTH_COMMAND, endsAt, extras = {}) {
     switch (state) {
         case "credential_ending": {
             const date = endsAt === undefined ? null : endDateText(endsAt);
@@ -60,8 +61,12 @@ export function noticeText(state, nodeVersion, authCommand = DEFAULT_AUTH_COMMAN
                 ? line
                 : SYSTEM_MESSAGE.credentialEndingFallback(date);
         }
-        case "not_connected":
-            return SYSTEM_MESSAGE.notConnected;
+        case "not_connected": {
+            // The same ≤120 budget and fallback as state 2: a long plugin realpath would blow it, and a truncated command is worse
+            // than the page that always works. On npm the line is 87 characters and the bytes are what they always were.
+            const line = SYSTEM_MESSAGE.notConnected(extras.connectCommand ?? DEFAULT_CONNECT_COMMAND);
+            return line.length <= SYSTEM_MESSAGE.credentialRejectedBudget ? line : SYSTEM_MESSAGE.notConnectedFallback;
+        }
         case "credential_revoked": {
             // ≤120 characters (`11A`). A long plugin realpath would blow it, and a truncated command is
             // worse than no command: the fallback points at the page that always works.
@@ -82,6 +87,16 @@ export function noticeText(state, nodeVersion, authCommand = DEFAULT_AUTH_COMMAN
             return SYSTEM_MESSAGE.ownCommitHook;
         case "grants_unreadable":
             return SYSTEM_MESSAGE.grantsUnreadable;
+        case "account_grants_unnamed":
+            {
+                // No count, no message: "grants 0 repositories" is not a thing to say. The caller treats an empty text as "write nothing".
+                const owners = extras.unnamedOwners ?? 0;
+                const repos = extras.unnamedRepos ?? 0;
+                if (!(owners > 0 || repos > 0))
+                    return "";
+                const line = SYSTEM_MESSAGE.accountGrantsNotHere(owners, repos);
+                return line.length <= SYSTEM_MESSAGE.credentialRejectedBudget ? line : SYSTEM_MESSAGE.accountGrantsNotHereFallback;
+            }
     }
 }
 /**
@@ -100,6 +115,11 @@ export function noticeClaimPath(ctx, state) {
     // in every checkout, and "once ever" would go quiet for a file that is still broken tomorrow.
     if (state === "grants_unreadable")
         return machineDayNoticePath(ctx.home, utcDay(ctx.now()), state);
+    // State 10 is about the ACCOUNT's grants, so it is once per (machine, account epoch): spoken again only when the grants changed.
+    // No epoch means no claim, and no claim is silence — never a shared key.
+    if (state === "account_grants_unnamed") {
+        return ctx.accountEpoch === undefined ? null : machineEpochNoticePath(ctx.home, ctx.accountEpoch, state);
+    }
     // States 6-8 are once per CLONE. No clone key means no claim, and no claim is silence — never a shared key.
     if (state === "hooks_added" || state === "hooks_path_set" || state === "own_commit_hook") {
         return ctx.cloneKey === undefined || ctx.cloneKey === ""
@@ -159,7 +179,11 @@ export function claimSessionNotice(ctx, state) {
  */
 export function renderNotice(ctx, state) {
     try {
-        const text = noticeText(state, ctx.nodeVersion, ctx.authCommand, ctx.endsAt);
+        const text = noticeText(state, ctx.nodeVersion, ctx.authCommand, ctx.endsAt, {
+            ...(ctx.connectCommand === undefined ? {} : { connectCommand: ctx.connectCommand }),
+            ...(ctx.unnamedOwners === undefined ? {} : { unnamedOwners: ctx.unnamedOwners }),
+            ...(ctx.unnamedRepos === undefined ? {} : { unnamedRepos: ctx.unnamedRepos }),
+        });
         if (text === "")
             return null;
         // A message carrying an escape sequence or a newline is undefined behaviour

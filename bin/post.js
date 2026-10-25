@@ -20,10 +20,11 @@
 import { createHash } from "node:crypto";
 import { agentForTranscript } from "./agents/registry.js";
 import { UNKNOWN_AGENT_ID } from "./agents/types.js";
+import { noteGrantEpoch, recordRefused } from "./consent.js";
 import { headerSafe, sessionIdSafe } from "./header_safety.js";
 import { recordInferredSkipped } from "./inferred_tally.js";
 import { clearOrgPending, markOrgPending } from "./org_pending.js";
-import { MAX_DELTA_FRAME_BYTES, MAX_DELTA_RAW_BYTES, classify, markDelivered, markHeld, markSkipped, nextSpan, planChunk, resolveCaps, splitPoint, } from "./policy.js";
+import { MAX_DELTA_FRAME_BYTES, MAX_DELTA_RAW_BYTES, REPOSITORY_EXCLUDED, classify, markDelivered, markHeld, markSkipped, nextSpan, planChunk, resolveCaps, splitPoint, } from "./policy.js";
 import { fileState, isStopped, loadSessionState, saveSessionState, withFileState, } from "./state.js";
 import { INFERRED_SET_ASIDE_AFTER, dropInferredGroups, dropRewrites, dropSpooled, isFullSha, recordInferredAttempt, setAsideInferredGroup, settleSpooled, } from "./spool.js";
 import { CLIENT_VERSION, CLIENT_VERSION_HEADER } from "./version.js";
@@ -288,7 +289,7 @@ export const CAPTURE_NOT_APPROVED = "capture_not_approved";
  * this client parses — a cap so a misconfigured or hostile endpoint cannot make
  * a hook buffer an arbitrary response into memory.
  */
-const MAX_ERROR_BODY_BYTES = 64 * 1024;
+export const MAX_ERROR_BODY_BYTES = 64 * 1024;
 /**
  * Parse an error body, or return null. **NEVER THROWS, on any input.**
  *
@@ -300,10 +301,12 @@ const MAX_ERROR_BODY_BYTES = 64 * 1024;
  * caller to the branch that asserts nothing. That is the honest default,
  * because `null` already means *not determinable*.
  *
- * ⚠ Read ONLY on a non-2xx. On the hook path a 2xx body is not read, not
+ * ⚠ Read ONLY on a non-2xx. On the hook path an INGEST reply's 2xx body is not read, not
  * awaited, and not parsed, so the hook's hot path is untouched. `connect`
  * opts in to reading ONE field of a 2xx body through `readConversationId`
- * below; nothing else ever calls that.
+ * below; nothing else ever calls that. (Slice 2: SessionStart's one bounded GET of the
+ * account's grants reads a 2xx body too, through `readCappedJson` in `fetchAccountGrants` —
+ * a separate request, once an hour at most, never on an ingest reply.)
  */
 async function readErrorDetail(res, signal) {
     if (res.ok)
@@ -322,26 +325,26 @@ async function readErrorDetail(res, signal) {
     return { code: error, ownersNotified };
 }
 /**
- * ⛔ THE ONE CAPPED, TIMED BODY READER — `readErrorDetail` (non-2xx) and `readConversationId` (`connect`'s opt-in
- * 2xx) both read through it, so neither bound can drift from the other.
+ * ⛔ THE ONE CAPPED, TIMED BODY READER — `readErrorDetail` (non-2xx), `readConversationId` (`connect`'s opt-in
+ * 2xx) and `grants_sync.ts`'s two grants reads all read through it, so no bound can drift from another.
  *
  * Returns the parsed JSON (which may legitimately be `null`, an array or a scalar — the caller shapes it), or
  * `undefined` for EVERY failure: no body, a declared length over the cap, a streamed body that crosses the cap,
  * an abort, a stalled or reset stream, invalid JSON. **NEVER THROWS, on any input.**
  *
  *   - BYTES: the declared `content-length` is checked first, and the stream is then counted chunk by chunk and
- *     CANCELLED the moment it crosses `MAX_ERROR_BODY_BYTES` — so a chunked body with no length cannot be
+ *     CANCELLED the moment it crosses `maxBytes` (`MAX_ERROR_BODY_BYTES`, 64 KiB, unless a CLI verb asks for more) — so a chunked body with no length cannot be
  *     buffered whole before a post-hoc check (the old `await res.text()` did exactly that, contradicting
  *     `readErrorDetail`'s own comment that a hostile endpoint cannot make a hook buffer an arbitrary response).
  *   - TIME: every read is RACED against the request's abort signal rather than trusting the abort to reach the
  *     stream. Aborting is supposed to reject a pending `reader.read()` (it does, in a direct probe), but the
  *     bound is then a property of this function and not of the HTTP client's internals.
  */
-async function readCappedJson(res, signal) {
+export async function readCappedJson(res, signal, maxBytes = MAX_ERROR_BODY_BYTES) {
     if (res.body === null)
         return undefined;
     const declared = Number(res.headers.get("content-length"));
-    if (Number.isFinite(declared) && declared > MAX_ERROR_BODY_BYTES)
+    if (Number.isFinite(declared) && declared > maxBytes)
         return undefined;
     const reader = res.body.getReader();
     let onAbort;
@@ -361,7 +364,7 @@ async function readCappedJson(res, signal) {
             if (done)
                 break;
             size += value.byteLength;
-            if (size > MAX_ERROR_BODY_BYTES) {
+            if (size > maxBytes) {
                 // Not awaited: a cancel on a stalled stream is the other thing that may never settle.
                 reader.cancel().catch(() => undefined);
                 return undefined;
@@ -386,9 +389,10 @@ const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
  * **NEVER THROWS, on any input, and never changes the outcome.**
  *
  * ⛔ **ONLY `connect` CALLS THIS** (`SendOptions.readConversationId`, eng-2 D2 = A). The hook's
- * hot path never reads a 2xx body — that property is why it cannot stall or throw on one —
+ * hot path never reads an ingest reply's 2xx body — that property is why it cannot stall or throw on one —
  * and an unconditional read here would put a new wait and a new failure point on the hook that
- * runs after every turn, to serve a line only `connect` prints.
+ * runs after every turn, to serve a line only `connect` prints. (The one 2xx body a hook does read is
+ * SessionStart's GET of the account's grants — a different request, bounded at 1,000 ms and 64 KiB.)
  *
  * Reads through `readCappedJson`, the same capped, signal-raced reader `readErrorDetail` uses, so the byte
  * and time bounds are one definition. A stalled or reset body reads as "no id": the 2xx stays a 2xx.
@@ -415,6 +419,18 @@ function parseCommitsRetry(raw) {
         .split(",")
         .map((s) => s.trim().toLowerCase())
         .filter((s) => isFullSha(s));
+}
+/**
+ * `X-Grant-Epoch`: a non-negative integer, or null. Digits only (and a sane length), so a header that is not one reads as
+ * "the server did not say" and never as `NaN`, a negative, or a float that could equal nothing.
+ */
+export function parseGrantEpoch(raw) {
+    if (raw === null)
+        return null;
+    const value = raw.trim();
+    if (!/^\d{1,15}$/.test(value))
+        return null;
+    return Number(value);
 }
 /**
  * `X-Credential-Expires`: an ISO 8601 instant, or null. Only a string that parses as a date is believed —
@@ -470,6 +486,7 @@ export async function send(url, headers, body, timeoutMs, options = {}) {
             finalAck: parseFinalAck(res.headers.get("x-session-final")),
             inferredStored: parseInferredStored(res.headers.get("x-rewrites-inferred-stored")),
             credentialExpires: parseCredentialExpires(res.headers.get("x-credential-expires")),
+            grantEpoch: parseGrantEpoch(res.headers.get("x-grant-epoch")),
         };
     }
     catch {
@@ -959,6 +976,11 @@ async function deliverChunk(ctx, eof, readBody, cutter) {
             break;
     }
     saveSessionState(ctx.home, key, next);
+    // Slice 2: the server's grants epoch rides every credential-lane ingest answer. A different one than this machine last recorded marks
+    // `grants-account.json` stale, which is all SessionStart's one bounded GET waits for — nothing else changes, and nothing here reads
+    // a body. A write only on a change, `grants-account.json` only (never `grants.json`), and `noteGrantEpoch` cannot throw.
+    if (outcome.kind === "response")
+        noteGrantEpoch(ctx.home, outcome.grantEpoch);
     // 0.7.0: remember, for `status`, that THIS repo's upload was refused because its org has not approved capture — and
     // forget it on the next delivery. Only that one error code sets it; a 5xx or a timeout neither sets nor clears it.
     if (disposition === "ok")
@@ -966,6 +988,12 @@ async function deliverChunk(ctx, eof, readBody, cutter) {
     else if (disposition === "later" && outcome.kind === "response" && outcome.detail?.code === CAPTURE_NOT_APPROVED) {
         // The slug is the CLIENT's (`ctx.repoSlug`), never the response body's: the 403 names nobody.
         markOrgPending(ctx.home, ctx.nowMs, outcome.detail.ownersNotified ?? null, ctx.repoSlug);
+    }
+    else if (disposition === "never" && outcome.kind === "response" && outcome.detail?.code === REPOSITORY_EXCLUDED) {
+        // Slice 2: the account turned this repo off. Remember it in `grants-account.json` — NEVER `grants.json`, which a hook does not
+        // write (`consent.ts`) — so the next hook's gate stops before it reads this repo's transcript. Same rule as above: the slug is
+        // the client's. `recordRefused` cannot throw.
+        recordRefused(ctx.home, ctx.repoSlug);
     }
     // `outcome.detail` is null on every path except a non-2xx with a parseable
     // error body, so this is a pass-through and not a second decision.

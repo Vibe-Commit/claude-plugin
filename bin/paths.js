@@ -36,6 +36,24 @@ export function grantsPath(home) {
     return join(rootDir(home), "grants.json");
 }
 /**
+ * What the SERVER told this machine about the account, and the refusals a hook saw (slice 2, S4). ⛔ A separate file
+ * from `grants.json` on purpose: hooks write this one and never write `grants.json`, whose `updateGrants`
+ * read-modify-write has no lock — a hook racing `vibecommit off` could otherwise restore a turned-off repo. Written whole
+ * and atomically; read by `consent.ts`'s `isCaptureAllowed` next to `grants.json`.
+ */
+export function grantsAccountPath(home) {
+    return join(rootDir(home), "grants-account.json");
+}
+/**
+ * Credentials `g` made and then removed from this machine whose revoke did not reach the server (slice 2, S4, R3-11): the next CLI
+ * verb retries each one. ⛔ **It holds a bearer token**, because a self-revoke is made with the credential itself and the local
+ * credential file was deleted. Mode 0600 like `credentials.json`, written atomically, CLI-only, and a row leaves it the moment the
+ * server says there is nothing left to revoke.
+ */
+export function pendingRevokePath(home) {
+    return join(rootDir(home), "pending-revoke.json");
+}
+/**
  * The HUMAN lane's signed-in session — `CR-084d`. Mode 0600, enforced on read by
  * the same `readSecretFile` the ingest credential goes through.
  *
@@ -119,6 +137,14 @@ export function repoDayNoticePath(home, repoKey, day, state) {
  */
 export function machineDayNoticePath(home, day, key) {
     return join(stateDir(home), "notices", "machine-day", sanitise(day), `${sanitise(key)}.json`);
+}
+/**
+ * Once-per-`(machine, account epoch)` marker — slice 2, notice state 10 ("your account grants N repositories not captured on this
+ * machine yet"). The epoch is the server's version of the user's grants, so the message is spoken again only when the grants
+ * changed; a repeat per session or per day would nag about the same unchanged gap. `epoch` is a non-negative integer, `key` the state.
+ */
+export function machineEpochNoticePath(home, epoch, key) {
+    return join(stateDir(home), "notices", "machine-epoch", sanitise(String(epoch)), `${sanitise(key)}.json`);
 }
 /**
  * Once-per-CLONE marker — 0.7.0, notices 6-8 and the `SessionStart` install record (eng review D4 · A).
