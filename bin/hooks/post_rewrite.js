@@ -39,8 +39,8 @@
  */
 import { EXIT } from "../exit.js";
 import { DEFAULT_AGENT_ID, dialectFor } from "../agents/registry.js";
-import { isProjectAllowed } from "../consent.js";
-import { gitProbe } from "../git.js";
+import { isCaptureAllowed } from "../consent.js";
+import { gitProbe, onceRepoSlug } from "../git.js";
 import { resolveProjectKeys } from "../project.js";
 import { activeSessionFor, appendRewrites, collapseObservedIntermediates, isFullSha, readPending, readSpool, recordRebaseAmends, takeRebaseAmends, } from "../spool.js";
 import { existsSync } from "node:fs";
@@ -74,6 +74,8 @@ export function observeRewrites(ctx) {
     if (keys === null)
         return 0;
     const toplevel = keys.worktree;
+    // One slug resolution for both gates below: they are the same question asked on two branches.
+    const slugOf = onceRepoSlug(toplevel);
     // ⛔ GUARD 1 — SUPPRESS `amend` WHILE A REBASE IS IN PROGRESS.
     //
     // A `rebase -i` squash fires this hook as `amend` for each intermediate commit
@@ -94,11 +96,11 @@ export function observeRewrites(ctx) {
     // remembered in a per-repo scratch (consent first: a declined repo writes nothing, scratch
     // included) and collapsed at the final fire below.
     if (ctx.kind === "amend" && rebaseInProgress(toplevel)) {
-        if (isProjectAllowed(ctx.home, keys.consent))
+        if (isCaptureAllowed(ctx.home, keys, slugOf))
             recordRebaseAmends(ctx.home, toplevel, pairs);
         return 0;
     }
-    if (!isProjectAllowed(ctx.home, keys.consent))
+    if (!isCaptureAllowed(ctx.home, keys, slugOf))
         return 0;
     // The scratch is CONSUMED by the first `rebase` fire that sees it, whatever happens next, so a
     // leftover can never wait around for an unrelated rebase.

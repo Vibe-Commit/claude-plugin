@@ -92,7 +92,8 @@
  * @provenance vibecommit-mcp src/read/envelope.ts — the one-text-part wire shape, retyped
  * @provenance vibecommit-schema capture_turns + commit_file_attribution — MEASURED ABSENCE, cited
  */
-import { ABSENCE, COMMANDS, ERRORS, HELP, SIGNIN, WHY, renderCommitHeader, renderCommitIdentity, } from "../copy/index.js";
+import { ABSENCE, COMMANDS, SIGNIN, WHY, renderCommitHeader, renderCommitIdentity, } from "../copy/index.js";
+import { renderVerbHelp } from "../verb_help.js";
 import { EXIT } from "../exit.js";
 import { gitProbe, isShallowClone, resolveRepoSlug } from "../git.js";
 import { emitJson } from "../json.js";
@@ -100,7 +101,8 @@ import { mcpUrl } from "../oauth/discovery.js";
 import { readWithSession } from "../oauth/signin.js";
 import { resolveProjectKey } from "../project.js";
 import { WRAP_COLUMNS, paint, renderErrorBlock, truncatePath, wrap } from "../term.js";
-import { writeLines } from "./context.js";
+import { notAGitRepoBlock, writeFailure, writeLines } from "./context.js";
+import { channelCommand, installChannel } from "../install.js";
 /** §10.4 indents the body two columns and the turn rows four under it. */
 const BODY_INDENT = 2;
 const TURN_INDENT = 4;
@@ -425,16 +427,15 @@ export function parseTarget(argv) {
  * *"a new writer needs a new entry here"*; `errorCopy: [0, 1, 2, 3]` is that
  * entry, and the mutation that proves it fires is in `test/why.test.ts`.
  */
-function errorCopy(what, why, fixLabel, fix) {
-    return { what, why: [why], fixLabel, fixes: [fix] };
+function errorCopy(code, what, why, fixLabel, fix) {
+    return { code, what, why: [why], fixLabel, fixes: [fix] };
 }
 /** §13.6's shape, with the identity line above it when we have one. */
-function fail(ctx, copy, code, commit) {
+function fail(ctx, json, copy, code, commit) {
+    // Under `--json` the failure is ONE document on stdout and nothing on stderr (PR 7), so the identity line is not
+    // printed: the document carries the code, the sentences and the fix. The fix commands go through the install channel.
     const identity = commit === undefined ? [] : [...wrap(renderCommitIdentity(commit), BODY_INDENT), ""];
-    writeLines(ctx.stderr, [
-        ...identity,
-        ...renderErrorBlock({ kind: "bad", ...copy }, ctx.colour),
-    ]);
+    writeFailure(ctx, { kind: "bad", ...copy, fixes: copy.fixes.map((fix) => channelCommand(ctx.env, ctx.selfPath, fix)) }, json ? "why" : null, identity);
     return code;
 }
 /**
@@ -457,7 +458,13 @@ function absence(ctx, state, fixes, commit) {
         ...wrap(renderCommitIdentity(commit), BODY_INDENT),
         "",
         ...renderErrorBlock(fixes.length > 0
-            ? { kind: "warn", what: state.what, why: [state.why], fixLabel: state.fix, fixes }
+            ? {
+                kind: "warn",
+                what: state.what,
+                why: [state.why],
+                fixLabel: state.fix,
+                fixes: fixes.map((fix) => channelCommand(ctx.env, ctx.selfPath, fix)),
+            }
             : { kind: "warn", what: state.what, why: [state.why] }, ctx.colour),
     ];
     if (fixes.length === 0)
@@ -636,29 +643,30 @@ function attributionNote(ctx) {
  * §13.7 makes distinct precisely so a wrapper can branch on it without parsing
  * copy. The rest are failures of this attempt and exit 1.
  */
-function notAuthorized(ctx, authorized, commit) {
+function notAuthorized(ctx, json, authorized, commit) {
     switch (authorized.kind) {
         case "no-session":
-            return fail(ctx, errorCopy(WHY.signedOutWhat, WHY.signedOutWhy, WHY.signedOutFix, COMMANDS.signIn), EXIT.notConnected, commit);
+            return fail(ctx, json, errorCopy("NOT_SIGNED_IN", WHY.signedOutWhat, WHY.signedOutWhy, WHY.signedOutFix, COMMANDS.signIn), EXIT.notConnected, commit);
         case "expired":
-            return fail(ctx, errorCopy(SIGNIN.expiredWhat, SIGNIN.expiredWhy, SIGNIN.expiredFix, COMMANDS.signIn), EXIT.notConnected, commit);
+            return fail(ctx, json, errorCopy("SIGNIN_ENDED", SIGNIN.expiredWhat, SIGNIN.expiredWhy, SIGNIN.expiredFix, COMMANDS.signIn), EXIT.notConnected, commit);
         case "busy":
-            return fail(ctx, errorCopy(SIGNIN.busyWhat, SIGNIN.busyWhy, SIGNIN.busyFix, COMMANDS.why), EXIT.failure, commit);
+            return fail(ctx, json, errorCopy("SIGNIN_BUSY", SIGNIN.busyWhat, SIGNIN.busyWhy, SIGNIN.busyFix, COMMANDS.why), EXIT.failure, commit);
         case "unreachable":
-            return fail(ctx, errorCopy(WHY.unreachableWhat, WHY.unreachableWhy, WHY.readFix, COMMANDS.why), EXIT.failure, commit);
+            return fail(ctx, json, errorCopy("RECORD_SERVICE_UNREACHABLE", WHY.unreachableWhat, WHY.unreachableWhy, WHY.readFix, COMMANDS.why), EXIT.failure, commit);
         case "malformed":
-            return fail(ctx, errorCopy(WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, COMMANDS.why), EXIT.failure, commit);
+            return fail(ctx, json, errorCopy("RECORD_ANSWER_UNREADABLE", WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, COMMANDS.why), EXIT.failure, commit);
         case "ok":
             // Unreachable by construction: `readWithSession` only wraps a NON-ok
             // outcome in `not-authorized`. Rendered rather than thrown, because a
             // crash here would be a worse answer than an honest failure.
-            return fail(ctx, errorCopy(WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, COMMANDS.why), EXIT.failure, commit);
+            return fail(ctx, json, errorCopy("RECORD_ANSWER_UNREADABLE", WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, COMMANDS.why), EXIT.failure, commit);
     }
 }
 export async function why(ctx, argv, deps = {}) {
     // `TODOS[184]`. Check-first, before `parseTarget`/anything else. Reads and writes nothing.
     if (argv.includes("--help") || argv.includes("-h")) {
-        writeLines(ctx.stdout, [HELP.commands.why]);
+        const helpVerb = "why"; // an identifier, not a literal, at the writer: `copy-inline-literals` follows argument positions
+        writeLines(ctx.stdout, renderVerbHelp(helpVerb));
         return EXIT.ok;
     }
     // §13.3 — `--json` emits nothing but the JSON document on stdout, and D122 §2
@@ -668,25 +676,25 @@ export async function why(ctx, argv, deps = {}) {
     const json = argv.includes("--json");
     const target = parseTarget(argv);
     if (target === null) {
-        return fail(ctx, errorCopy(WHY.usageWhat, WHY.usageWhy, WHY.usageFix, COMMANDS.why), EXIT.usage);
+        return fail(ctx, json, errorCopy("WHY_NEEDS_FILE_AND_LINE", WHY.usageWhat, WHY.usageWhy, WHY.usageFix, COMMANDS.why), EXIT.usage);
     }
     const projectKey = resolveProjectKey(ctx.cwd);
     if (projectKey === null) {
-        writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", what: ERRORS.notAGitRepo, why: [] }, ctx.colour));
+        writeFailure(ctx, notAGitRepoBlock(ctx), json ? "why" : null);
         return EXIT.failure;
     }
     // ⚠ BEFORE the blame, not after: on a shallow clone the answer would be
     // plausible and wrong, and this is a REFUSAL, not an absence.
     if (isShallowClone(projectKey)) {
-        return fail(ctx, errorCopy(WHY.shallowWhat, WHY.shallowWhy, WHY.shallowFix, WHY.shallowFixCommand), EXIT.failure);
+        return fail(ctx, json, errorCopy("SHALLOW_CLONE", WHY.shallowWhat, WHY.shallowWhy, WHY.shallowFix, WHY.shallowFixCommand), EXIT.failure);
     }
     const blamed = blameLine(projectKey, target.file, target.line);
     if (blamed === null) {
-        return fail(ctx, errorCopy(WHY.blameWhat, WHY.blameWhy, WHY.blameFix, COMMANDS.why), EXIT.failure);
+        return fail(ctx, json, errorCopy("BLAME_FAILED", WHY.blameWhat, WHY.blameWhy, WHY.blameFix, COMMANDS.why), EXIT.failure);
     }
     const endpoint = mcpUrl(ctx.env);
     if (endpoint === null) {
-        return fail(ctx, errorCopy(SIGNIN.noServerWhat, SIGNIN.noServerRefusedWhy, WHY.readFix, COMMANDS.why), EXIT.failure, blamed.commit);
+        return fail(ctx, json, errorCopy("SIGNIN_SERVICE_NOT_FOUND", SIGNIN.noServerWhat, SIGNIN.noServerRefusedWhy, WHY.readFix, COMMANDS.why), EXIT.failure, blamed.commit);
     }
     const read = deps.read ?? readWithSession;
     const outcome = await read(endpoint, "blame_commit", {
@@ -705,27 +713,27 @@ export async function why(ctx, argv, deps = {}) {
 function render(ctx, outcome, commit, file, json) {
     switch (outcome.kind) {
         case "not-authorized":
-            return notAuthorized(ctx, outcome.authorized, commit);
+            return notAuthorized(ctx, json, outcome.authorized, commit);
         case "unauthorized":
             // A 401 that survived one refresh and one retry. The bearer is dead.
-            return fail(ctx, errorCopy(WHY.signedOutWhat, WHY.signedOutWhy, WHY.signedOutFix, COMMANDS.signIn), EXIT.notConnected, commit);
+            return fail(ctx, json, errorCopy("NOT_SIGNED_IN", WHY.signedOutWhat, WHY.signedOutWhy, WHY.signedOutFix, COMMANDS.signIn), EXIT.notConnected, commit);
         case "unreachable":
-            return fail(ctx, errorCopy(WHY.unreachableWhat, WHY.unreachableWhy, WHY.readFix, COMMANDS.why), EXIT.failure, commit);
+            return fail(ctx, json, errorCopy("RECORD_SERVICE_UNREACHABLE", WHY.unreachableWhat, WHY.unreachableWhy, WHY.readFix, COMMANDS.why), EXIT.failure, commit);
         case "rpc-error":
             // ⚠ Never a bare HTTP status or a raw JSON-RPC code on screen (§13.6).
-            return fail(ctx, errorCopy(WHY.serverErrorWhat, WHY.serverErrorWhy, WHY.readFix, COMMANDS.why), EXIT.failure, commit);
+            return fail(ctx, json, errorCopy("RECORD_SERVICE_ERROR", WHY.serverErrorWhat, WHY.serverErrorWhy, WHY.readFix, COMMANDS.why), EXIT.failure, commit);
         case "malformed":
-            return fail(ctx, errorCopy(WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, COMMANDS.why), EXIT.failure, commit);
+            return fail(ctx, json, errorCopy("RECORD_ANSWER_UNREADABLE", WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, COMMANDS.why), EXIT.failure, commit);
         case "ok": {
             // ⚠ `isError` rides the SAME envelope as a success and is a documented
             // field of a contract with an external owner. A caller that only branched
             // on the transport would read a tool failure as a record.
             if (outcome.isError) {
-                return fail(ctx, errorCopy(WHY.serverErrorWhat, WHY.serverErrorWhy, WHY.readFix, COMMANDS.why), EXIT.failure, commit);
+                return fail(ctx, json, errorCopy("RECORD_SERVICE_ERROR", WHY.serverErrorWhat, WHY.serverErrorWhy, WHY.readFix, COMMANDS.why), EXIT.failure, commit);
             }
             const payload = parseBlameCommitPayload(outcome.document);
             if (payload === null) {
-                return fail(ctx, errorCopy(WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, COMMANDS.why), EXIT.failure, commit);
+                return fail(ctx, json, errorCopy("RECORD_ANSWER_UNREADABLE", WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, COMMANDS.why), EXIT.failure, commit);
             }
             // ⛔ SKEW IS NOT MALFORMEDNESS. The server answered correctly and this
             // build is too old to render it, so the user is sent to an upgrade rather
@@ -733,7 +741,12 @@ function render(ctx, outcome, commit, file, json) {
             // the command genuinely produced no answer, and a caller scripting `why`
             // must not read a skew screen as success.
             if (isVersionSkew(payload)) {
-                return fail(ctx, errorCopy(WHY.skewWhat, WHY.skewWhy, WHY.skewFix, COMMANDS.pluginInstall), EXIT.failure, commit);
+                return fail(ctx, json, 
+                // The remedy follows the channel: the plugin is reinstalled, an npm install is updated. Anything that is not
+                // provably the plugin is told the npm command, since only a plugin bundle has a `/plugin install` to run.
+                installChannel(ctx.env, ctx.selfPath).kind === "plugin"
+                    ? errorCopy("CLIENT_TOO_OLD", WHY.skewWhat, WHY.skewWhy, WHY.skewFix, COMMANDS.pluginInstall)
+                    : errorCopy("CLIENT_TOO_OLD", WHY.skewWhat, WHY.skewWhy, WHY.skewFixNpm, COMMANDS.npmUpdate), EXIT.failure, commit);
             }
             return renderPayload(ctx, payload, commit, file, json);
         }

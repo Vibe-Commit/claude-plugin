@@ -26,20 +26,23 @@
  *
  * @provenance vibecommit-mcp src/transport/server.ts — POST /oauth/ingest-credential now mints one, verified
  */
-import { AUTH, CONNECT, COMMANDS, AGENT_HOOKS, COMMIT_HOOK, ERRORS, HELP, PATH_CLASH, REJECTED, DEVICE, RUNTIME, URLS, } from "../copy/index.js";
+import { AUTH, CONNECT, PICKER, COMMANDS, AGENT_HOOKS, COMMIT_HOOK, HELP, PATH_CLASH, REJECTED, DEVICE, RUNTIME, URLS, } from "../copy/index.js";
 import { dialectFor } from "../agents/registry.js";
-import { grantProject, isAffirmative, isProjectAllowed } from "../consent.js";
+import { clearExclusion, grantProject, grantsUnreadable, isAffirmative, isCaptureAllowed, isLocalSlug, } from "../consent.js";
 import { loadCredential } from "../credential.js";
 import { EXIT } from "../exit.js";
-import { resolveRepoSlug } from "../git.js";
-import { confinementRoots, readSpan, DEFAULT_HOOK_BUDGET_MS } from "../hooks/entry.js";
+import { onceRepoSlug, resolveRepoSlug } from "../git.js";
+import { confinementRoots, hookBudgetMs, readSpan, recordCutter, DEFAULT_HOOK_BUDGET_MS } from "../hooks/entry.js";
 import { installAgentHooks } from "../agent_install.js";
-import { authCommandFor, classifyInstall, installPostCommitHook } from "../install.js";
+import { authCommandFor, channelCommand, classifyInstall, connectCommandFor, installPostCommitHook } from "../install.js";
+import { realpathSync } from "node:fs";
 import { CAPTURE_NOT_APPROVED, deliver, credentialFingerprint, ingestUrl, } from "../post.js";
 import { resolveProjectKeys } from "../project.js";
 import { meetsNodeFloor, NODE_FLOOR_TEXT } from "../runtime.js";
 import { credentialsPath } from "../paths.js";
 import { paint, renderErrorBlock, tildePath, truncatePath, wrap } from "../term.js";
+import { renderVerbHelp } from "../verb_help.js";
+import { approvalPendingBlock } from "./approval_pending.js";
 import { credentialProblem, rejectedCredentialBlock } from "./credential_problem.js";
 import { probeCredential } from "./probe.js";
 import { writeLines } from "./context.js";
@@ -49,13 +52,15 @@ export async function connect(ctx, options = {}, deps = {}) {
     // `connect` carries the "already exposed" urgency `auth`'s own positional refusal does, so first is
     // safe here, unlike there. Reads and writes nothing.
     if (options.help === true) {
-        writeLines(ctx.stdout, [HELP.commands.connect]);
+        const helpVerb = "connect"; // an identifier, not a literal, at the writer: `copy-inline-literals` follows argument positions
+        writeLines(ctx.stdout, renderVerbHelp(helpVerb));
         return EXIT.ok;
     }
     // `CR-234d`: sign-in by code waits on a person and ends in a question — a terminal or nothing.
     if (options.device === true && !ctx.stdinIsTty) {
         writeLines(ctx.stderr, renderErrorBlock({
             kind: "bad",
+            code: "SIGNIN_CODE_NEEDS_TTY",
             what: DEVICE.needsTerminalWhat,
             why: [DEVICE.needsTerminalWhy],
             fixLabel: DEVICE.needsTerminalFix,
@@ -68,59 +73,128 @@ export async function connect(ctx, options = {}, deps = {}) {
     if (!meetsNodeFloor(ctx.nodeVersion)) {
         writeLines(ctx.stderr, renderErrorBlock({
             kind: "bad",
+            code: "NODE_TOO_OLD",
             what: RUNTIME.floorWhat,
             why: [
                 `${RUNTIME.floorWhyPrefix} ${NODE_FLOOR_TEXT} ${RUNTIME.floorWhyMiddle} ${ctx.nodeVersion}.`,
             ],
             fixLabel: RUNTIME.floorFix,
-            fixes: [COMMANDS.connect],
+            fixes: [connectCommandFor(ctx.env, ctx.selfPath)],
         }, ctx.colour));
         return EXIT.failure;
     }
-    // (2) BOTH KEYS (`D184 §1`). Outside a work tree there is nothing to consent
-    // ABOUT, and inventing a key from cwd would grant consent to something the
-    // user cannot see in `status`.
+    // (2) WHERE ARE WE? (0.7.0, D34.) `connect` no longer needs a work tree: outside one, and from `$HOME` even inside one, it
+    // shows the picker. Inside a work tree with a remote it shows the picker with this repo pre-ticked. A repo that is
+    // ALREADY covered skips it, and a repo with no remote (`local:`) keeps the 0.6.0 flow: there is no slug to grant.
     //
-    // ⛔ THE GRANT BELOW IS THE ONLY WRITER OF THE ALLOW LIST, so this verb decides
-    // what every gate can ever match. It writes `keys.consent` — the git common
-    // dir — which is what admits the worktrees of this clone as well as the clone
-    // itself. Granting the toplevel here while `entry.ts` and `post_commit.ts`
-    // check the common dir is a TOTAL, SILENT capture outage in every repository
-    // (`D184 §9`), and no cell that grants and checks through one helper can see
-    // it.
+    // ⛔ THE PER-CLONE GRANT IS STILL THE ONLY WRITER OF `projects.json`, and it writes `keys.consent` — the git common
+    // dir (`D184 §1`, `§9`): granting the toplevel while the gates check the common dir is a TOTAL, SILENT capture outage
+    // in every repository, and no cell that grants and checks through one helper can see it.
     const keys = resolveProjectKeys(ctx.cwd);
-    if (keys === null) {
-        writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", what: ERRORS.notAGitRepo, why: [] }, ctx.colour));
+    if (keys === null || atHome(ctx)) {
+        // Outside a work tree: nothing to pre-tick. At `$HOME` a dotfiles repo is FLAGGED in the list, never pre-ticked.
+        let here = null;
+        if (keys !== null) {
+            const slug = resolveRepoSlug(keys.worktree);
+            if (!isLocalSlug(slug))
+                here = { slug, toplevel: keys.worktree, kind: "folder" };
+        }
+        return await (await import("./connect_picker.js")).connectPicker(ctx, options, deps, here);
+    }
+    // 0.7.0: the same decision the hooks make. A repo that is excluded (`vibecommit off`) is NOT already connected here
+    // even when its common-dir consent survives, so it falls through to the disclosure, and only a yes below clears it.
+    const slugOf = onceRepoSlug(keys.worktree);
+    if (grantsUnreadable(ctx.home) && !isLocalSlug(slugOf())) {
+        writeLines(ctx.stderr, grantsUnreadableBlock(ctx));
         return EXIT.failure;
     }
-    if (isProjectAllowed(ctx.home, keys.consent)) {
+    if (isCaptureAllowed(ctx.home, keys, slugOf)) {
         writeLines(ctx.stdout, wrap(CONNECT.alreadyConnected, 2));
         return await afterConsent(ctx, keys, options, deps);
     }
-    // (3) The disclosure, then the gate.
-    writeLines(ctx.stdout, disclosure(ctx));
+    if (!isLocalSlug(slugOf())) {
+        return await (await import("./connect_picker.js")).connectPicker(ctx, options, deps, { slug: slugOf(), toplevel: keys.worktree, kind: "repo" }, keys);
+    }
+    // (3) The disclosure, then the gate. A repo with no remote: the 0.6.0 screen, under its own heading (D35).
+    writeLines(ctx.stdout, disclosure(ctx, false));
     // (4) Non-TTY REFUSES. A consent prompt that proceeds when nobody can answer
     // it is not a consent prompt (D65 §DR7). Exit 2 — DESIGN.md §13.7 names this
     // case explicitly, so it is a usage error and not a failure.
     if (!ctx.stdinIsTty) {
         writeLines(ctx.stderr, renderErrorBlock({
             kind: "bad",
+            code: "CONSENT_NEEDS_TTY",
             what: CONNECT.nonInteractiveWhat,
             why: [CONNECT.nonInteractiveWhy],
-            fixLabel: CONNECT.nonInteractiveFix,
-            fixes: [COMMANDS.connect],
+            // PR 6 item 6: names the folder the user is to run it in, cut from the LEFT to fit the line (§13.4).
+            fixLabel: CONNECT.nonInteractiveFix(truncatePath(tildePath(keys.worktree, ctx.home), 46)),
+            fixes: [connectCommandFor(ctx.env, ctx.selfPath)],
         }, ctx.colour));
         return EXIT.usage;
     }
-    // (5) The default is N. Anything that is not an explicit yes is a no.
-    const answer = await ctx.ask(`  ${CONNECT.consentPrompt} ${paint(ctx.colour, "muted", CONNECT.consentAnswers)} `);
+    // (5) The default is N. Anything that is not an explicit yes is a no. ⛔ A REJECTED QUESTION IS A CANCEL: Ctrl+C at a
+    // `readline/promises` question does not raise SIGINT, the promise REJECTS (TODOS[191]), and left to escape it printed
+    // the "unexpected error" block for what is ordinary CLI behaviour.
+    const answer = await askOrCancel(ctx, `  ${CONNECT.consentPrompt} ${paint(ctx.colour, "muted", CONNECT.consentAnswers)} `);
+    if (answer === null)
+        return cancelled(ctx);
     if (!isAffirmative(answer)) {
         writeLines(ctx.stdout, ["", ...wrap(CONNECT.declined, 2)]);
         // Declining is a successful consent flow, not a failure. Exit 0 (§13.7).
         return EXIT.ok;
     }
+    // A yes is the ONLY thing that lifts an exclusion: `off` recorded the slug, and the disclosure above was shown again.
+    // ⛔ `grants.json` FIRST, THE COMMON-DIR CONSENT SECOND (VR #28, on merged #73). `clearExclusion` refuses to touch a file it
+    // cannot read BEFORE it writes anything, so a race with an edit of `grants.json` since the check above stops here with
+    // nothing written — which keeps "Nothing was changed." true. The other order had already written `projects.json`.
+    // A repo with no remote has no slug to exclude and is exempt from an unreadable file (`isCaptureAllowed`), so it skips this.
+    if (!isLocalSlug(slugOf()) && clearExclusion(ctx.home, slugOf()) === "unreadable") {
+        writeLines(ctx.stderr, grantsUnreadableBlock(ctx));
+        return EXIT.failure;
+    }
     grantProject(ctx.home, keys.consent, ctx.now());
     return await afterConsent(ctx, keys, options, deps);
+}
+/** Is the working folder the home directory? Realpaths, so a symlinked home still matches; any failure is "no". */
+function atHome(ctx) {
+    if (ctx.home === "")
+        return false;
+    try {
+        return realpathSync(ctx.cwd) === realpathSync(ctx.home);
+    }
+    catch {
+        return false;
+    }
+}
+/**
+ * Ask a question; `null` when the prompt was aborted. Ctrl+C at a `readline/promises` question closes the interface and
+ * REJECTS with an `AbortError` instead of raising SIGINT (TODOS[191]), so every ask site that wants Ctrl+C to be a No
+ * goes through here. A rejection means nobody said yes.
+ */
+export async function askOrCancel(ctx, question) {
+    try {
+        return await ctx.ask(question);
+    }
+    catch {
+        return null;
+    }
+}
+/** §10.11: Ctrl+C at the picker or the grant y/N is a No. Exit 1, and nothing was changed. */
+export function cancelled(ctx) {
+    // The terminal left the cursor at the end of the prompt line, so one empty line ends it and a second leaves the blank
+    // line the drawn screen has.
+    writeLines(ctx.stdout, ["", "", ...wrap(PICKER.cancelled, 2)]);
+    return EXIT.failure;
+}
+export function grantsUnreadableBlock(ctx) {
+    return renderErrorBlock({
+        kind: "bad",
+        code: "GRANTS_UNREADABLE",
+        what: CONNECT.grantsUnreadableWhat,
+        why: [CONNECT.grantsUnreadableWhy],
+        fixLabel: CONNECT.grantsUnreadableFixLabel,
+        fixes: [connectCommandFor(ctx.env, ctx.selfPath)],
+    }, ctx.colour);
 }
 /**
  * Consent is settled. Sign in if asked, then do the credential beat.
@@ -158,13 +232,16 @@ async function afterConsent(ctx, keys, options, deps) {
  * because the approved copy itself says "private-repo paths", so a substring
  * gate would fire on approved copy on day one. That one is a HUMAN review item.
  */
-function disclosure(ctx) {
+export function disclosure(ctx, picker) {
     // §10.2 aligns the two link URLs in one column. The width is DERIVED from the
     // labels rather than hardcoded, so editing a label cannot silently break the
     // alignment — and the four trailing spaces are the gutter the guide draws.
     const gutter = Math.max(CONNECT.consentDocsLabel.length, CONNECT.consentBundleLabel.length) + 4;
     return [
-        ...wrap(CONNECT.consentHeading, 2),
+        // D23 · D35: the picker path and the no-remote path each have their own heading (a new constant, passing the same
+        // content gates). The four paragraphs under either are byte-identical, and the picker path adds ONE sentence.
+        ...wrap(picker ? CONNECT.consentHeadingPicker : CONNECT.consentHeading, 2),
+        ...(picker ? wrap(CONNECT.consentScope, 2) : []),
         "",
         ...wrap(CONNECT.consentDetail, 2),
         "",
@@ -200,6 +277,16 @@ function disclosure(ctx) {
  * exactly the population that installs commit tooling.
  */
 async function credentialBeat(ctx, keys, deps, options = {}) {
+    const got = await obtainCredential(ctx, deps, options);
+    if (got.kind === "exit")
+        return got.code;
+    return await captureBeat(ctx, keys, got.credential, got.unconfirmed);
+}
+/**
+ * Get a credential this machine can send with — the beat both endings share (the 0.6.0 one and the picker's).
+ * `scope: "repos"` is the picker path: the workspace question names the repos chosen, not the machine (D7 · 3A).
+ */
+export async function obtainCredential(ctx, deps, options = {}, scope) {
     const load = loadCredential({ env: ctx.env, home: ctx.home });
     if (load.kind === "ok") {
         // ⛔ ASK THE SERVER BEFORE SENDING — `R12` (D13 = A), G1. `connect` used to send whatever loaded
@@ -216,12 +303,12 @@ async function credentialBeat(ctx, keys, deps, options = {}) {
                 colour: ctx.colour,
                 standing: false,
             }));
-            return EXIT.notConnected;
+            return { kind: "exit", code: EXIT.notConnected };
         }
         // Only a 401 proves the credential dead. A 5xx, a 404 from a server that predates the route, a
         // timeout or a network error says nothing about it — and "a blip is not a failed install" is the
         // rule `captureBeat` already keeps for the send. So: today's ending, plus one muted line.
-        return await captureBeat(ctx, keys, load.credential, probe.kind === "unavailable");
+        return { kind: "credential", credential: load.credential, unconfirmed: probe.kind === "unavailable" };
     }
     // ⛔ ONLY FOR `absent`, AND ONLY WITH A HUMAN AT THE TERMINAL (`CR-226`).
     //   - `absent`: a credential that is present but wrong-class, unreadable or
@@ -231,7 +318,10 @@ async function credentialBeat(ctx, keys, deps, options = {}) {
     //     opened there waits five minutes for nobody. The old warning is the
     //     right answer for them, and it is what they still get.
     if (load.kind === "absent" && ctx.stdinIsTty && deps.browser !== undefined) {
-        const minted = await deps.browser(ctx, "connect", { device: options.device === true });
+        const minted = await deps.browser(ctx, "connect", {
+            device: options.device === true,
+            ...(scope === undefined ? {} : { scope }),
+        });
         if (minted.kind === "saved") {
             writeLines(ctx.stdout, [
                 "",
@@ -242,27 +332,89 @@ async function credentialBeat(ctx, keys, deps, options = {}) {
                 }, ctx.colour),
             ]);
             // Already probed by the mint (`finishMint`), so no second probe here.
-            return await captureBeat(ctx, keys, minted.credential, false);
+            return { kind: "credential", credential: minted.credential, unconfirmed: false };
         }
         // Declined at the replace confirmation: the reason is already on screen, and the user said NO.
         if (minted.kind === "declined")
-            return EXIT.failure;
+            return { kind: "exit", code: EXIT.failure };
         // Failed: the reason is already on stderr. Fall through to the paste path.
     }
     // ⛔ R15: a FAULTY file is named as the fault it is, not as "no credential". The fix for a fault is
     // `auth` (or a `chmod`), and `connect` still never mints over one (D206 §5).
     if (load.kind !== "absent") {
         writeLines(ctx.stderr, credentialProblem(load, ctx.colour, authCommandFor(ctx.env, ctx.selfPath)));
-        return EXIT.notConnected;
+        return { kind: "exit", code: EXIT.notConnected };
     }
     writeLines(ctx.stderr, renderErrorBlock({
         kind: "warn",
         what: CONNECT.credentialNeededWhat,
         why: [CONNECT.credentialNeededWhy],
         fixLabel: CONNECT.credentialNeededFix,
-        fixes: [CONNECT.credentialNeededCommand, COMMANDS.connect],
+        fixes: [CONNECT.credentialNeededCommand, COMMANDS.connect].map((fix) => channelCommand(ctx.env, ctx.selfPath, fix)),
     }, ctx.colour));
-    return EXIT.notConnected;
+    return { kind: "exit", code: EXIT.notConnected };
+}
+/**
+ * The test capture: send the current session's transcript through `deliver()` so the ending can name evidence (D57 §DX5's
+ * Sentry-wizard pattern). Shared by the 0.6.0 ending (`captureBeat`) and the in-repo picker path (0.7.0, VQ item 7), so the
+ * two cannot drift: one budget (`hookBudgetMs`, PR 4a), one redaction root set, one place that reads a 2xx body.
+ *
+ * `found` is the located transcript, or `null` when there is none (no locator, or the agent has not run here). Returns the
+ * delivery, or `null` when nothing was sent.
+ */
+export async function sendTestCapture(ctx, keys, credential, found) {
+    const projectKey = keys.worktree;
+    const url = ingestUrl(ctx.env);
+    let delivery = null;
+    if (found !== null && url !== null) {
+        // Through `deliver()`, so the offset ledger, the failure policy and
+        // `CR-024d`'s redaction all apply exactly as they do for a hook. A second
+        // upload path here would bypass all three.
+        delivery = await deliver({
+            home: ctx.home,
+            env: ctx.env,
+            url,
+            credential,
+            repoKey: projectKey,
+            repoSlug: resolveRepoSlug(projectKey),
+            sessionId: found.sessionId,
+            fileKey: "main",
+            // ⛔ The LOCATED path (`CR-204`), so this test capture names its producer
+            // on the wire exactly as a hook's would — and names it the same way,
+            // from the root that contains the file rather than from `ctx.agentId`.
+            // ⚠ The LOCATOR above is still the flag's: `connect` is looking FOR a
+            // transcript, so there is no path yet to ask a root about.
+            transcriptPath: found.path,
+            timeoutMs: DEFAULT_HOOK_BUDGET_MS,
+            // PR 4a — ONE HOOK BUDGET (Alexander's ruling, design doc Next Steps 4a). A large session is sent in deltas, and this
+            // test capture sends what fits in a single hook's budget, then prints its ending: `connect` must not sit through a
+            // multi-minute upload that the session's own hooks, `finalize` and the backfill offer will do anyway. What is left
+            // is NOT written off: the offset stays where the last acknowledged delta put it. The ending below is unchanged for a
+            // partial delivery, and so is the conversation-id link (the id comes from the first delta that carries it).
+            deadlineAtMs: Date.now() + hookBudgetMs(ctx.env, ctx.agentId ?? ""),
+            nowMs: ctx.now().getTime(),
+            // ⛔ NOT A HOOK. `connect` backfills the located transcript, which is not evidence that the session is alive: it
+            // would otherwise rewrite an old session's state file and (under the mtime clock) make it "live" — the D2 shape.
+            byHook: false,
+            // ⛔ THE ONLY CALLER THAT READS A 2xx BODY (`eng-2 D2 = A`): for the session link. Hooks and
+            // `finalize` leave this unset, so the hook's hot path never reads, awaits or parses one.
+            readConversationId: true,
+        }, found.size, 
+        // ⛔ THE ROOT SET, and it is `confinementRoots` — THE SAME FUNCTION THE
+        // HOOK PATH CALLS (`entry.ts`), not a set built here. `D184 §3`: the
+        // confinement root is `[worktree, mainToplevel]` and the consent key is
+        // NEVER a member, so this does not follow the flip above.
+        //
+        // ⚠ WHY IT CANNOT STAY THE SINGLETON IT WAS: `connect` runs in whatever
+        // cwd a human typed it in, which is reachable from inside a worktree. With
+        // one root, this preview would redact main-clone content that the hook
+        // path transmits — the two would disagree SILENTLY, and the preview is the
+        // artefact the user reads to decide whether redaction works. `isInside`
+        // fail-closes an unresolvable path to REDACT, so the disagreement shows up
+        // as a plausible, well-formed, emptier payload rather than an error.
+        (from, to) => readSpan(found.path, from, to, confinementRoots(keys), ctx.home, ctx.env), recordCutter(found.path));
+    }
+    return { delivery };
 }
 /**
  * The ending — D57 §DX5's Sentry-wizard test-event pattern.
@@ -343,55 +495,12 @@ unconfirmed) {
                 what: CONNECT.noTranscriptWhat,
                 why: [CONNECT.noTranscriptWhy],
                 fixLabel: CONNECT.noTranscriptFix,
-                fixes: [COMMANDS.status],
+                fixes: [channelCommand(ctx.env, ctx.selfPath, COMMANDS.status)],
             }, ctx.colour),
         ]);
         return tail(ctx, unconfirmed);
     }
-    const url = ingestUrl(ctx.env);
-    let delivery = null;
-    if (found !== null && url !== null) {
-        // Through `deliver()`, so the offset ledger, the failure policy and
-        // `CR-024d`'s redaction all apply exactly as they do for a hook. A second
-        // upload path here would bypass all three.
-        delivery = await deliver({
-            home: ctx.home,
-            env: ctx.env,
-            url,
-            credential,
-            repoKey: projectKey,
-            repoSlug: resolveRepoSlug(projectKey),
-            sessionId: found.sessionId,
-            fileKey: "main",
-            // ⛔ The LOCATED path (`CR-204`), so this test capture names its producer
-            // on the wire exactly as a hook's would — and names it the same way,
-            // from the root that contains the file rather than from `ctx.agentId`.
-            // ⚠ The LOCATOR above is still the flag's: `connect` is looking FOR a
-            // transcript, so there is no path yet to ask a root about.
-            transcriptPath: found.path,
-            timeoutMs: DEFAULT_HOOK_BUDGET_MS,
-            nowMs: ctx.now().getTime(),
-            // ⛔ NOT A HOOK. `connect` backfills the located transcript, which is not evidence that the session is alive: it
-            // would otherwise rewrite an old session's state file and (under the mtime clock) make it "live" — the D2 shape.
-            byHook: false,
-            // ⛔ THE ONLY CALLER THAT READS A 2xx BODY (`eng-2 D2 = A`): for the session link. Hooks and
-            // `finalize` leave this unset, so the hook's hot path never reads, awaits or parses one.
-            readConversationId: true,
-        }, found.size, 
-        // ⛔ THE ROOT SET, and it is `confinementRoots` — THE SAME FUNCTION THE
-        // HOOK PATH CALLS (`entry.ts`), not a set built here. `D184 §3`: the
-        // confinement root is `[worktree, mainToplevel]` and the consent key is
-        // NEVER a member, so this does not follow the flip above.
-        //
-        // ⚠ WHY IT CANNOT STAY THE SINGLETON IT WAS: `connect` runs in whatever
-        // cwd a human typed it in, which is reachable from inside a worktree. With
-        // one root, this preview would redact main-clone content that the hook
-        // path transmits — the two would disagree SILENTLY, and the preview is the
-        // artefact the user reads to decide whether redaction works. `isInside`
-        // fail-closes an unresolvable path to REDACT, so the disagreement shows up
-        // as a plausible, well-formed, emptier payload rather than an error.
-        (from, to) => readSpan(found.path, from, to, confinementRoots(keys), ctx.home, ctx.env));
-    }
+    const { delivery } = await sendTestCapture(ctx, keys, credential, found);
     // THE FIFTH BEAT — `CR-110`, D65 §DR6, D81.
     //
     // ⚠ ONE outcome is branched on, identified by its ERROR CODE. The general rule
@@ -417,7 +526,7 @@ unconfirmed) {
         `  ${paint(ctx.colour, "accent", conversationId === undefined ? URLS.commits : URLS.conversation(conversationId))}`,
         "",
         ...wrap(CONNECT.doneForRepo(truncatePath(projectKey, 52)), 2),
-        ...wrap(`${CONNECT.stopLabel}: ${COMMANDS.off}`, 2),
+        ...wrap(`${CONNECT.stopLabel}: ${channelCommand(ctx.env, ctx.selfPath, COMMANDS.off)}`, 2),
     ]);
     return tail(ctx, unconfirmed);
 }
@@ -426,13 +535,13 @@ unconfirmed) {
  * the PATH-clash check. The one place `pathClash` is called — a branch that called it too would print
  * the clash block twice.
  */
-function tail(ctx, unconfirmed) {
+export function tail(ctx, unconfirmed) {
     if (unconfirmed) {
         writeLines(ctx.stdout, [
             "",
             // Two short lines, never one wrapped: the backticked command must not be split (see `REJECTED`).
             `  ${paint(ctx.colour, "muted", REJECTED.unconfirmedWhat)}`,
-            `  ${paint(ctx.colour, "muted", REJECTED.unconfirmedFix)}`,
+            `  ${paint(ctx.colour, "muted", REJECTED.unconfirmedFix(channelCommand(ctx.env, ctx.selfPath, COMMANDS.status)))}`,
         ]);
     }
     return pathClash(ctx);
@@ -449,7 +558,7 @@ function tail(ctx, unconfirmed) {
  * into a file shared by every project — the one new responsibility `CR-195`
  * names — so "we configured your editor" is the shape this must not take.
  */
-function agentHookBeat(ctx) {
+export function agentHookBeat(ctx) {
     const outcomes = installAgentHooks(ctx.home, ctx.env, ctx.selfPath);
     for (const outcome of outcomes) {
         // Absent agents say nothing at all. A line per tool the user does not have
@@ -482,7 +591,7 @@ function agentHookBeat(ctx) {
                     ...(refused
                         ? {
                             fixLabel: AGENT_HOOKS.refusedFixLabel,
-                            fixes: [AGENT_HOOKS.refusedFix(path)],
+                            fixes: [AGENT_HOOKS.refusedFix(path, connectCommandFor(ctx.env, ctx.selfPath))],
                         }
                         : {}),
                 }, ctx.colour),
@@ -534,7 +643,7 @@ function commitHookBeat(ctx, projectKey) {
                         : COMMIT_HOOK.failedWhy(outcome.why),
                 ],
                 fixLabel: COMMIT_HOOK.hooksPathFixLabel,
-                fixes: [COMMIT_HOOK.hooksPathFixUnset, COMMIT_HOOK.hooksPathFixManual],
+                fixes: [COMMIT_HOOK.hooksPathFixUnset, COMMIT_HOOK.hooksPathFixManual(channelCommand(ctx.env, ctx.selfPath, COMMANDS.postCommit))],
             }, ctx.colour),
         ]);
         return;
@@ -544,7 +653,7 @@ function commitHookBeat(ctx, projectKey) {
         : outcome.kind === "chained"
             ? COMMIT_HOOK.chained(repo)
             : COMMIT_HOOK.already;
-    writeLines(ctx.stdout, ["", ...wrap(line, 2), ...wrap(COMMIT_HOOK.perClone, 2)]);
+    writeLines(ctx.stdout, ["", ...wrap(line, 2), ...wrap(COMMIT_HOOK.perClone(connectCommandFor(ctx.env, ctx.selfPath)), 2)]);
 }
 /**
  * Is this delivery the org-approval-pending outcome, and nothing else?
@@ -561,7 +670,7 @@ function commitHookBeat(ctx, projectKey) {
  * is normalised to `null`, because both mean *not determinable* to the copy and
  * neither may assert delivery.
  */
-function approvalPending(delivery) {
+export function approvalPending(delivery) {
     if (delivery === null || delivery.kind !== "attempted")
         return null;
     if (delivery.detail?.code !== CAPTURE_NOT_APPROVED)
@@ -578,19 +687,9 @@ function approvalPending(delivery) {
  * offset holds and the backlog uploads in order once an owner approves. A red
  * exit here tells a correctly-installed user they broke something.
  */
-function approvalPendingBeat(ctx, projectKey, ownersNotified) {
-    // ⚠ THE SHARED CLAUSE FIRST, THE NOTIFICATION SECOND — it ADDS, it does not
-    // replace (D81). Composed here rather than as two independent paragraphs, so
-    // the branches cannot drift apart: there is exactly one place the
-    // recorded-request sentence exists.
-    //
-    // ⚠ AND `null` NEVER REACHES THE NOTIFICATION CLAUSE. `null` = not
-    // determinable, `0` = determinable and nobody was told; both render the
-    // recorded-go-ask branch alone. The owner genuinely is not emailed until
-    // `CR-036`, which is provisioning-blocked — disclosed, not concealed.
-    const why = ownersNotified !== null && ownersNotified > 0
-        ? `${CONNECT.pendingRecorded} ${CONNECT.pendingNotified(ownersNotified)}`
-        : CONNECT.pendingRecorded;
+export function approvalPendingBeat(ctx, projectKey, ownersNotified) {
+    // The block itself is `approval_pending.ts`'s, shared with `status`: the shared clause first, the notification second
+    // (it ADDS, it does not replace, D81), and `null` never reaches the notification clause.
     // ⚠ STDOUT, not stderr, and the rule is consistent in this file: stderr
     // accompanies a NON-ZERO exit here (`credentialBeat` → 3, `noTranscript` → 1,
     // `pathClash` → 1, the sign-in failures → 1). This beat exits 0, so it is the
@@ -599,13 +698,7 @@ function approvalPendingBeat(ctx, projectKey, ownersNotified) {
     // armed" with the reason stripped off it.
     writeLines(ctx.stdout, [
         "",
-        ...renderErrorBlock({
-            kind: "warn",
-            what: CONNECT.pendingWhat,
-            why: [CONNECT.pendingWhy(resolveRepoSlug(projectKey)), why, CONNECT.pendingBuffered],
-            fixLabel: CONNECT.pendingTrackLabel,
-            fixes: [URLS.captureAccess],
-        }, ctx.colour),
+        ...approvalPendingBlock(ctx.colour, resolveRepoSlug(projectKey), ownersNotified),
         "",
         ...wrap(CONNECT.pendingArmed(truncatePath(projectKey, 52)), 2),
     ]);
@@ -630,6 +723,7 @@ function pathClash(ctx) {
         return EXIT.ok;
     writeLines(ctx.stderr, renderErrorBlock({
         kind: "bad",
+        code: verdict.kind === "foreign" ? "PATH_COMMAND_FOREIGN" : "PATH_COMMAND_ABSENT",
         what: verdict.kind === "foreign" ? PATH_CLASH.foreignWhat : PATH_CLASH.absentWhat,
         why: [
             verdict.kind === "foreign"

@@ -1,3 +1,10 @@
+/** The one question (default No). On the picker path it names the repos chosen, not the machine (0.7.0, D7 · 3A). */
+function workspaceQuestion(scope, orgName) {
+    if (scope === "repos") {
+        return orgName === null ? REPLACE.questionReposUnconfirmed : REPLACE.questionRepos(truncateMiddle(orgName, 28));
+    }
+    return orgName === null ? REPLACE.questionUnconfirmed : REPLACE.question(truncateMiddle(orgName, 30));
+}
 /**
  * Everything between "the server minted a credential" and "this machine has it" — `finishMint` — and the
  * result type both browser beats return. Shared by the loopback flow (`browser_credential.ts`) and the
@@ -33,7 +40,7 @@ export async function finishMint(ctx, input) {
     const { minted, facts, prior } = input;
     const fresh = await probeCredential(ctx, minted, input.fetch, { record: false });
     if (fresh.kind === "unauthorized") {
-        writeLines(ctx.stderr, ["", ...renderErrorBlock({ kind: "bad", what: AUTH.mintFailedWhat, why: [AUTH.mintUnconfirmedWhy] }, ctx.colour)]);
+        writeLines(ctx.stderr, ["", ...renderErrorBlock({ kind: "bad", code: "MINT_FAILED", what: AUTH.mintFailedWhat, why: [AUTH.mintUnconfirmedWhy] }, ctx.colour)]);
         return { kind: "failed" };
     }
     const priorOk = prior !== null && prior.who.kind === "ok";
@@ -59,6 +66,7 @@ export async function finishMint(ctx, input) {
             "",
             ...renderErrorBlock({
                 kind: "bad",
+                code: "WORKSPACE_UNCONFIRMED",
                 what: REPLACE.unconfirmableWhat,
                 why: [revoked.kind === "retired" ? REPLACE.unconfirmableWhyRevoked : REPLACE.unconfirmableWhyOrphan],
                 fixLabel: REPLACE.unconfirmableFix,
@@ -86,7 +94,7 @@ export async function finishMint(ctx, input) {
         // just created LIVE and unused in the person's Settings. Any rejection means nobody said yes.
         let answer;
         try {
-            answer = await ctx.ask(`  ${orgName === null ? REPLACE.questionUnconfirmed : REPLACE.question(truncateMiddle(orgName, 30))} ${paint(ctx.colour, "muted", CONNECT.consentAnswers)} `);
+            answer = await ctx.ask(`  ${workspaceQuestion(input.scope, orgName)} ${paint(ctx.colour, "muted", CONNECT.consentAnswers)} `);
         }
         catch {
             answer = null;

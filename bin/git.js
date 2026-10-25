@@ -88,6 +88,8 @@
  */
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { closeSync, openSync, readSync } from "node:fs";
+import { resolve } from "node:path";
 import { spawnTimeoutMs } from "./spawn_budget.js";
 /**
  * Per-spawn CEILINGS — the most any one call may take when no hook budget is
@@ -173,6 +175,29 @@ export function resolveRepoSlug(toplevel) {
     const remote = gitRemoteUrl(toplevel);
     const slug = remote === null ? null : parseRemoteSlug(remote);
     return slug ?? localSlug(toplevel);
+}
+/**
+ * `resolveRepoSlug` as a memoized thunk — what the consent gates hand to `isCaptureAllowed`.
+ *
+ * The slug costs `git remote get-url` and, for a host that is not GitHub, an `ssh -G`. The gate needs it only when the
+ * answer depends on it (a `grants.json` is present), and the hook that asked often needs it again straight after (the
+ * `X-Repo-Slug` header), so both share this one resolution: a second call could disagree with the first, and would cost
+ * a second spawn against the hook's budget.
+ */
+export function onceRepoSlug(toplevel) {
+    let slug;
+    return () => (slug ??= resolveRepoSlug(toplevel));
+}
+/**
+ * The remote slug of the clone whose git COMMON DIR is `commonDir` — a consent key from `projects.json` — or null.
+ *
+ * `vibecommit off` uses it to find the other clones on this machine that are the same repo. Unlike `resolveRepoSlug`
+ * it never falls back to `local:<path hash>`: a clone with no readable remote, or a directory that no longer exists,
+ * is "unknown" here, and unknown must not match anything.
+ */
+export function remoteSlugOfCommonDir(commonDir) {
+    const remote = gitRemoteUrl(commonDir);
+    return remote === null ? null : parseRemoteSlug(remote);
 }
 /**
  * `origin`'s URL, or null when there is no `origin` (or git cannot say).
@@ -665,5 +690,75 @@ function fromScpLike(raw) {
  */
 function localSlug(toplevel) {
     return `local:${createHash("sha256").update(toplevel).digest("hex").slice(0, 12)}`;
+}
+/** How much of `logs/HEAD` is read to find its first line. A reflog line is a couple of hundred bytes; this is far more. */
+const REFLOG_FIRST_LINE_MAX = 64 * 1024;
+/**
+ * The oldest HEAD reflog entry's time, in unix seconds.
+ *
+ * ## ⛔ It reads ONE LINE, because listing the reflog is a cliff
+ *
+ * The first version listed the whole reflog (`reflog show --format=%gd`) and took the last line. That is about 18 bytes an
+ * entry, and past Node's 1 MiB default buffer (roughly 58,000 entries, a heavily rebased clone) the call threw and `gitProbe`
+ * answered `null`, which reads as "no reflog": a false line, and an upload withheld for it. Raising the buffer only moves
+ * the cliff. `logs/HEAD` is append-only, oldest entry first, so the oldest entry is its FIRST line, and reading the first
+ * line costs the same on any reflog.
+ *
+ *   - **The path** comes from `git rev-parse --git-path logs/HEAD`, which is right for a linked worktree (HEAD's reflog is
+ *     per worktree) — still ONE spawn, as the listing was.
+ *   - **The line** is `<old> <new> <name> <email> <seconds> <tz>\t<message>`; the time is the `<seconds> <tz>` field before
+ *     the tab. `HEAD@{<seconds>}`, which the listing printed, is the same number.
+ *   - **A missing file** is not the same as a missing reflog: a reftable repository keeps its reflog elsewhere and has no
+ *     `logs/HEAD`. Then git is asked in a bounded way (`oldestReflogViaGit`) before the answer is `null`.
+ *   - **An empty file** (an expired reflog) is `null`. So is a repo with no commits yet, or git failing — each means the
+ *     path-reuse test cannot be made.
+ */
+export function firstReflogSeconds(top, probe = gitProbe) {
+    const where = probe(top, ["rev-parse", "--git-path", "logs/HEAD"]);
+    if (where === null || where.trim() === "")
+        return null;
+    const file = resolve(top, where.trim());
+    let fd;
+    try {
+        fd = openSync(file, "r");
+    }
+    catch (error) {
+        // Only a file that is not there falls back; a file that is there and cannot be read is a failure to know.
+        return error.code === "ENOENT" ? oldestReflogViaGit(top, probe) : null;
+    }
+    try {
+        const block = Buffer.alloc(REFLOG_FIRST_LINE_MAX);
+        const read = readSync(fd, block, 0, block.length, 0);
+        const text = block.subarray(0, read).toString("utf8");
+        const end = text.indexOf("\n");
+        const line = end >= 0 ? text.slice(0, end) : text;
+        if (line === "")
+            return null;
+        const match = /(\d+) [+-]\d{4}$/.exec(line.split("\t")[0]);
+        return match === null ? null : Number(match[1]);
+    }
+    catch {
+        return null;
+    }
+    finally {
+        closeSync(fd);
+    }
+}
+/**
+ * The oldest reflog entry by asking git, without listing the reflog: count the entries, then print only the last one
+ * (`--skip=<n-1> -n 1`). For a repository whose reflog is not a `logs/HEAD` file (reftable). Two spawns and bounded output.
+ */
+export function oldestReflogViaGit(top, probe = gitProbe) {
+    const counted = probe(top, ["rev-list", "-g", "--count", "HEAD"]);
+    if (counted === null)
+        return null;
+    const entries = Number(counted.trim());
+    if (!Number.isInteger(entries) || entries < 1)
+        return null;
+    const out = probe(top, ["reflog", "show", "--date=unix", "--format=%gd", `--skip=${entries - 1}`, "-n", "1", "HEAD"]);
+    if (out === null)
+        return null;
+    const match = /^HEAD@\{(\d+)\}$/.exec(out.trim());
+    return match === null ? null : Number(match[1]);
 }
 //# sourceMappingURL=git.js.map

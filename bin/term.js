@@ -11,6 +11,7 @@
  * the user's theme decides what every colour name resolves to. Base-16 SGR only —
  * no 24-bit, no 256-cube, and never a background fill.
  */
+import { errorCodeLine } from "./copy/error_codes.js";
 /** The six roles of §13.1. `text` is deliberately empty — see §13.2. */
 export const SGR = {
     reset: "\x1b[0m",
@@ -21,6 +22,19 @@ export const SGR = {
     warn: "\x1b[33m",
     bad: "\x1b[31m",
     strong: "\x1b[1m",
+};
+/**
+ * §13.2 — the ONLY non-SGR escapes in the product, for the one interactive list (the `connect` picker, style guide
+ * §10.12) and a beat line that is overwritten once. They draw nothing and carry no colour, so `NO_COLOR` does not
+ * switch them off; §13.2's rules do: only a list a person is driving may redraw, a one-shot overwrite is withheld
+ * under `NO_COLOR` and without a terminal, and there is NO hide-cursor, alternate screen, position query or mouse mode
+ * (each leaves the terminal changed if the process dies first). This is the whole set.
+ */
+export const CURSOR = {
+    up: (rows) => `\x1b[${rows}A`,
+    clearLine: "\x1b[2K",
+    clearBelow: "\x1b[0J",
+    column1: "\r",
 };
 /** §13.2 — status glyphs degrade to WORDS, never to nothing. */
 export const GLYPH = {
@@ -137,11 +151,18 @@ export function renderErrorBlock(block, colour) {
         for (const line of wrap(paragraph, 4))
             out.push(paint(colour, "muted", line));
     }
-    if (block.fixLabel !== undefined && block.fixes !== undefined && block.fixes.length > 0) {
+    // The code line: after the why paragraphs, before the blank line and the fix, so the fix stays last.
+    // NEVER wrapped — it is an identifier and a path an agent matches on, and a wrapped one would not match.
+    if (block.kind === "bad")
+        out.push(paint(colour, "muted", `    ${errorCodeLine(block.code)}`));
+    // A fix is a LABEL, with commands under it when there are any. PR 7: a label with no command (`NOT_A_REPO`: "Run it again
+    // inside a git repository.") is a real fix and prints last; before, a label without commands was silently dropped.
+    const fixes = block.fixes ?? [];
+    if (block.fixLabel !== undefined && (fixes.length > 0 || block.kind === "bad")) {
         out.push("");
         for (const line of wrap(block.fixLabel, 4))
             out.push(line);
-        for (const fix of block.fixes)
+        for (const fix of fixes)
             out.push(`      ${paint(colour, "accent", fix)}`);
     }
     return out;

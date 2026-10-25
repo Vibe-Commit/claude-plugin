@@ -73,11 +73,13 @@
  * @provenance vibecommit-mcp src/transport/server.ts — POST /oauth/ingest-credential is the mint route, verified
  * @provenance vibecommit-web app/api/ingest-credentials/route.ts — the dashboard producer the paste path still serves, verified
  */
-import { AUTH, COMMANDS, DEVICE, HELP, URLS } from "../copy/index.js";
-import { authCommandFor } from "../install.js";
+import { AUTH, DEVICE, PICKER, URLS } from "../copy/index.js";
+import { renderVerbHelp } from "../verb_help.js";
+import { authCommandFor, channelCommand } from "../install.js";
 import { writeLines } from "./context.js";
 import { EXIT } from "../exit.js";
 import { INGEST_TOKEN_PREFIX, IngestCredential, saveCredential } from "../credential.js";
+import { machineCapture, machineSummary } from "../machine_state.js";
 import { credentialsPath } from "../paths.js";
 import { resolveProjectKeys } from "../project.js";
 import { paint, renderErrorBlock, tildePath, wrap } from "../term.js";
@@ -98,10 +100,11 @@ export async function auth(ctx, argv, deps = {}) {
     if (positional.length > 0) {
         writeLines(ctx.stderr, renderErrorBlock({
             kind: "bad",
+            code: "CREDENTIAL_IN_ARGV",
             what: AUTH.argvWhat,
             why: [AUTH.argvWhy],
             fixLabel: AUTH.argvFix,
-            fixes: [AUTH.argvFixPrompt, AUTH.argvFixStdin],
+            fixes: [channelCommand(ctx.env, ctx.selfPath, AUTH.argvFixPrompt), AUTH.argvFixStdin(authCommandFor(ctx.env, ctx.selfPath))],
         }, ctx.colour));
         return EXIT.usage;
     }
@@ -110,7 +113,8 @@ export async function auth(ctx, argv, deps = {}) {
     // exactly that a usage error) runs first. By the time this is reached, `positional.length === 0`, so
     // `--help` still has no side effects — nothing below has read or written anything yet either way.
     if (argv.includes("--help") || argv.includes("-h")) {
-        writeLines(ctx.stdout, [HELP.commands.auth]);
+        const helpVerb = "auth"; // an identifier, not a literal, at the writer: `copy-inline-literals` follows argument positions
+        writeLines(ctx.stdout, renderVerbHelp(helpVerb));
         return EXIT.ok;
     }
     const piped = argv.includes(STDIN_FLAG) || !ctx.stdinIsTty;
@@ -119,6 +123,7 @@ export async function auth(ctx, argv, deps = {}) {
         writeLines(ctx.stderr, renderErrorBlock(piped
             ? {
                 kind: "bad",
+                code: "SIGNIN_CODE_NEEDS_TTY",
                 what: DEVICE.needsTerminalWhat,
                 why: [DEVICE.needsTerminalWhy],
                 fixLabel: DEVICE.needsTerminalFix,
@@ -126,10 +131,11 @@ export async function auth(ctx, argv, deps = {}) {
             }
             : {
                 kind: "bad",
+                code: "AUTH_FLAGS_CONFLICT",
                 what: DEVICE.conflictWhat,
                 why: [DEVICE.conflictWhy],
                 fixLabel: DEVICE.conflictFix,
-                fixes: [COMMANDS.auth, `${COMMANDS.auth} ${PASTE_FLAG}`],
+                fixes: [authCommandFor(ctx.env, ctx.selfPath), `${authCommandFor(ctx.env, ctx.selfPath)} ${PASTE_FLAG}`],
             }, ctx.colour));
         return EXIT.usage;
     }
@@ -161,10 +167,11 @@ export async function auth(ctx, argv, deps = {}) {
     if (secret === "") {
         writeLines(ctx.stderr, renderErrorBlock({
             kind: "bad",
+            code: "CREDENTIAL_EMPTY",
             what: AUTH.emptyWhat,
             why: [AUTH.emptyWhy],
-            fixLabel: AUTH.emptyFix,
-            fixes: [URLS.settings],
+            fixLabel: AUTH.mintFix(URLS.settings),
+            fixes: AUTH.mintCommands(authCommandFor(ctx.env, ctx.selfPath)),
         }, ctx.colour));
         return EXIT.failure;
     }
@@ -175,10 +182,11 @@ export async function auth(ctx, argv, deps = {}) {
     if (!secret.startsWith(INGEST_TOKEN_PREFIX)) {
         writeLines(ctx.stderr, renderErrorBlock({
             kind: "bad",
+            code: "CREDENTIAL_NOT_INGEST",
             what: AUTH.wrongClassWhat,
             why: [AUTH.wrongClassWhy],
-            fixLabel: AUTH.wrongClassFix,
-            fixes: [URLS.settings],
+            fixLabel: AUTH.mintFix(URLS.settings),
+            fixes: AUTH.mintCommands(authCommandFor(ctx.env, ctx.selfPath)),
         }, ctx.colour));
         return EXIT.failure;
     }
@@ -194,14 +202,26 @@ export async function auth(ctx, argv, deps = {}) {
  * block and the exit are exactly what they were.
  */
 async function saved(ctx, deps, piped, notes = []) {
-    const shouldConnect = !piped && deps.connect !== undefined && resolveProjectKeys(ctx.cwd) !== null;
+    // 0.7.0, D32 · 26A (supersedes only L6's "outside a repository" clause). Inside a work tree the chain is unchanged (L2).
+    // Outside one, the continuation is the picker flow, and only on a machine that has nothing captured yet; a machine that
+    // already captures prints one line and no picker. ⛔ BOTH of 0.6.0's other guards stay: `piped` (`--stdin`, or no
+    // terminal) NEVER continues, so a CI runner with no grant still saves the credential and exits 0 instead of reaching the
+    // non-terminal refusal and exiting 2; and the continuation gets no `browser` (`index.ts` hands `connect` none), so a
+    // second sign-in cannot start.
+    const inRepo = resolveProjectKeys(ctx.cwd) !== null;
+    const capture = inRepo || piped || deps.connect === undefined ? null : machineCapture(ctx.home);
+    const shouldConnect = !piped && deps.connect !== undefined && (inRepo || capture?.kind === "none");
+    const staysOn = capture?.kind === "on";
     writeLines(ctx.stdout, [
         ...renderErrorBlock({
             kind: "ok",
             what: AUTH.savedWhat,
             why: [AUTH.savedWhy(tildePath(credentialsPath(ctx.home), ctx.home)), ...notes],
-            ...(shouldConnect ? {} : { fixLabel: AUTH.nextLabel, fixes: [AUTH.nextCommand] }),
+            ...(shouldConnect || staysOn
+                ? {}
+                : { fixLabel: AUTH.nextLabel, fixes: [channelCommand(ctx.env, ctx.selfPath, AUTH.nextCommand)] }),
         }, ctx.colour),
+        ...(capture?.kind === "on" ? ["", ...wrap(PICKER.authStays(machineSummary(capture)), 2)] : []),
     ]);
     if (shouldConnect && deps.connect !== undefined)
         return await deps.connect(ctx);

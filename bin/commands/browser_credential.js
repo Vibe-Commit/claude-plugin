@@ -29,7 +29,7 @@
  */
 import { hostname as osHostname } from "node:os";
 import { headlessReason } from "../device_mode.js";
-import { resolveOnPath } from "../install.js";
+import { channelCommand, resolveOnPath } from "../install.js";
 import { AUTH, COMMANDS, SIGNIN } from "../copy/index.js";
 import { loadCredential } from "../credential.js";
 import { EXIT } from "../exit.js";
@@ -45,6 +45,10 @@ import { probeCredential } from "./probe.js";
 // `finishMint` and its types moved to `finish_mint.ts` (`CR-234d`) so the device flow can share them without
 // a cycle. Re-exported here because this is where every caller and test has always found them.
 export { finishMint } from "./finish_mint.js";
+/** The question's scope, passed down only when set (exactOptionalPropertyTypes). */
+function scopeOf(options) {
+    return options.scope === undefined ? {} : { scope: options.scope };
+}
 /** `signInBeat`'s sentinel for "no browser, go to the device flow". Never an exit code a verb returns. */
 export const NO_BROWSER = -1;
 /**
@@ -71,7 +75,7 @@ export async function signInBeat(ctx, options) {
     }
     const endpoint = mcpUrl(ctx.env);
     if (endpoint === null) {
-        writeLines(ctx.stderr, signInError(ctx, options.retry, SIGNIN.noServerWhat, SIGNIN.noServerRefusedWhy));
+        writeLines(ctx.stderr, signInError(ctx, options.retry, "SIGNIN_SERVICE_NOT_FOUND", SIGNIN.noServerWhat, SIGNIN.noServerRefusedWhy));
         return EXIT.failure;
     }
     const outcome = await signIn({
@@ -109,29 +113,30 @@ export async function signInBeat(ctx, options) {
 function signInFailure(ctx, retry, outcome) {
     switch (outcome.kind) {
         case "no-server":
-            return signInError(ctx, retry, SIGNIN.noServerWhat, outcome.detail === "unreachable"
+            return signInError(ctx, retry, "SIGNIN_SERVICE_NOT_FOUND", SIGNIN.noServerWhat, outcome.detail === "unreachable"
                 ? SIGNIN.noServerUnreachableWhy
                 : SIGNIN.noServerMalformedWhy, SIGNIN.noServerFix);
         case "denied":
-            return signInError(ctx, retry, SIGNIN.deniedWhat, SIGNIN.deniedWhy, SIGNIN.deniedFix);
+            return signInError(ctx, retry, "SIGNIN_DENIED", SIGNIN.deniedWhat, SIGNIN.deniedWhy, SIGNIN.deniedFix);
         case "timeout":
-            return signInError(ctx, retry, SIGNIN.timeoutWhat, SIGNIN.timeoutWhy, SIGNIN.timeoutFix);
+            return signInError(ctx, retry, "SIGNIN_TIMED_OUT", SIGNIN.timeoutWhat, SIGNIN.timeoutWhy, SIGNIN.timeoutFix);
         case "rejected":
-            return signInError(ctx, retry, SIGNIN.rejectedWhat, SIGNIN.rejectedWhy, SIGNIN.rejectedFix);
+            return signInError(ctx, retry, "SIGNIN_CLIENT_REFUSED", SIGNIN.rejectedWhat, SIGNIN.rejectedWhy, SIGNIN.rejectedFix);
         case "unreachable":
-            return signInError(ctx, retry, SIGNIN.unreachableWhat, SIGNIN.unreachableWhy, SIGNIN.unreachableFix);
+            return signInError(ctx, retry, "SIGNIN_UNREACHABLE", SIGNIN.unreachableWhat, SIGNIN.unreachableWhy, SIGNIN.unreachableFix);
         case "malformed":
-            return signInError(ctx, retry, SIGNIN.malformedWhat, SIGNIN.malformedWhy, SIGNIN.malformedFix);
+            return signInError(ctx, retry, "SIGNIN_ANSWER_UNUSABLE", SIGNIN.malformedWhat, SIGNIN.malformedWhy, SIGNIN.malformedFix);
     }
 }
-function signInError(ctx, retry, what, why, fixLabel = SIGNIN.noServerFix) {
+function signInError(ctx, retry, code, what, why, fixLabel = SIGNIN.noServerFix) {
     return renderErrorBlock({
         kind: "bad",
+        code,
         what,
         why: [why],
         fixLabel,
         fixes: [
-            retry === "auth" ? COMMANDS.auth : retry === "connect" ? COMMANDS.connect : COMMANDS.signIn,
+            channelCommand(ctx.env, ctx.selfPath, retry === "auth" ? COMMANDS.auth : retry === "connect" ? COMMANDS.connect : COMMANDS.signIn),
         ],
     }, ctx.colour);
 }
@@ -147,7 +152,7 @@ export async function browserCredential(ctx, retry, deps = {}, options = {}) {
     // cannot come from two different servers.
     const endpoint = mcpUrl(ctx.env);
     if (endpoint === null) {
-        writeLines(ctx.stderr, signInError(ctx, retry, SIGNIN.noServerWhat, SIGNIN.noServerRefusedWhy));
+        writeLines(ctx.stderr, signInError(ctx, retry, "SIGNIN_SERVICE_NOT_FOUND", SIGNIN.noServerWhat, SIGNIN.noServerRefusedWhy));
         return { kind: "failed" };
     }
     const fetchImpl = deps.fetch ?? fetch;
@@ -168,7 +173,7 @@ export async function browserCredential(ctx, retry, deps = {}, options = {}) {
     // opened only where a browser plausibly exists — `--device` on a desktop — never on a headless box.
     const headless = headlessReason(ctx.env, deps.platform ?? process.platform);
     if (options.device === true || headless !== null) {
-        return await deviceCredential(ctx, { endpoint, prior, openLink: headless === null }, deps);
+        return await deviceCredential(ctx, { endpoint, prior, openLink: headless === null, ...scopeOf(options) }, deps);
     }
     const signedIn = await signInBeat(ctx, {
         ...deps,
@@ -182,7 +187,7 @@ export async function browserCredential(ctx, retry, deps = {}, options = {}) {
         openBrowser: deps.openBrowser ?? ((url) => canOpenBrowser(ctx.env, deps.platform ?? process.platform) && platformOpenBrowser(url)),
     });
     if (signedIn === NO_BROWSER) {
-        return await deviceCredential(ctx, { endpoint, prior, openLink: false }, deps);
+        return await deviceCredential(ctx, { endpoint, prior, openLink: false, ...scopeOf(options) }, deps);
     }
     if (signedIn !== EXIT.ok) {
         return { kind: "failed" };
@@ -219,9 +224,10 @@ export async function browserCredential(ctx, retry, deps = {}, options = {}) {
             // The block guards a re-auth that lands in a DIFFERENT workspace. The device flow passes
             // "always" — there the approver is not the person at this terminal.
             confirm: "on-replace",
+            ...scopeOf(options),
         });
     }
-    writeLines(ctx.stderr, ["", ...renderErrorBlock({ kind: "bad", what: AUTH.mintFailedWhat, why: [mintWhy(outcome)] }, ctx.colour)]);
+    writeLines(ctx.stderr, ["", ...renderErrorBlock({ kind: "bad", code: mintCode(outcome), what: AUTH.mintFailedWhat, why: [mintWhy(outcome)] }, ctx.colour)]);
     return { kind: "failed" };
 }
 /**
@@ -231,6 +237,17 @@ export async function browserCredential(ctx, retry, deps = {}, options = {}) {
  */
 function canOpenBrowser(env, platform) {
     return platform !== "linux" || resolveOnPath(env, "xdg-open") !== null;
+}
+/**
+ * The code for a failed mint. Eight reasons share `MINT_FAILED`; two are split off because the action differs (join or
+ * ask the workspace owner; wait until the stated time) — VQ's Q3.
+ */
+function mintCode(outcome) {
+    if (outcome.kind === "refused" && outcome.error === "not_a_member")
+        return "MINT_NOT_A_MEMBER";
+    if (outcome.kind === "refused" && outcome.error === "rate_limited")
+        return "MINT_RATE_LIMITED";
+    return "MINT_FAILED";
 }
 /** One `why` per way the mint can fail. No status codes on screen (§13.6). */
 function mintWhy(outcome) {

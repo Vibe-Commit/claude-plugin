@@ -17,7 +17,9 @@
  * ⚠ **What is DATA here and what is MEASURED is not the same set**, and the
  * difference is marked on each member below rather than left to a reader.
  */
+import { join } from "node:path";
 import { cursorHooksPath, cursorTranscriptRoot, isCursorTranscript } from "../paths.js";
+import { readEntries, sessionFile, subdirectories } from "./session_listing.js";
 /**
  * ⭐ **MEASURED. `D5`'s SECOND HALF IS ANSWERED (`TODOS[130]`), AND THE ANSWER IS
  * THAT CURSOR IMPOSES NO NUMBER OF ITS OWN.**
@@ -79,6 +81,97 @@ import { cursorHooksPath, cursorTranscriptRoot, isCursorTranscript } from "../pa
  */
 const CURSOR_REGISTERED_MS = 3_000;
 const CURSOR_CLIENT_MS = 2_200;
+/**
+ * The longest folder name Cursor writes verbatim.
+ *
+ * ⛔ **MEASURED (Open Question 3, VS, 2026-10-24), with `cursor-agent`, which
+ * creates the project folder even when it is not logged in.** A name up to 61
+ * characters is kept; a longer one becomes its first 53 characters, `-`, and 7
+ * hex characters (the hash varied with the input, so it is not a constant).
+ */
+export const CURSOR_NAME_LIMIT = 61;
+/**
+ * The folder name Cursor gives a workspace path — Open Question 3.
+ *
+ * ⛔ **THIS IS NOT CLAUDE CODE'S RULE, and the difference is the measurement.**
+ * Every RUN of non-alphanumerics, a literal `--` included, collapses to ONE `-`;
+ * leading and trailing separators are dropped (so `/tmp/q/trail.` is `…-trail`
+ * and there is no leading `-`); case is kept. An emoji and `é'` each gave a single
+ * dash where Claude Code gives two.
+ *
+ * ⚠ **Which makes Cursor's names collide far more:** `a-b`, `a.b`, `a--b` and
+ * `a.b.` are all one folder. The scan's walk encodes every directory entry with
+ * THIS function and matches on the result, so the collapsing applies to every
+ * candidate rather than being assumed away.
+ */
+export function encodeProjectPath(path) {
+    return path.replace(/[^A-Za-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
+/**
+ * Is this folder name one Cursor cut and hashed? See `CURSOR_NAME_LIMIT`.
+ *
+ * ⚠ **A hashed name is always exactly 61 long, and so is a verbatim name that
+ * happens to be 61 long** — length alone cannot tell them apart. The test is the
+ * hash's shape too (`-` and 7 hex). A verbatim 61-character name that ends the
+ * same way is read as hashed, which is the safe error: it is skipped and
+ * counted, never matched to a path it might not be.
+ */
+export function isHashedProjectName(name) {
+    return name.length === CURSOR_NAME_LIMIT && /-[0-9a-f]{7}$/.test(name);
+}
+/**
+ * The folder Cursor uses for a window with no workspace open. It is not a path,
+ * so it can never resolve to one and is not worth a "folder no longer exists"
+ * count. Seen by NAME on the author's machine; nothing in it was read.
+ */
+const CURSOR_NO_WORKSPACE = "empty-window";
+/**
+ * Cursor's sessions, by folder — `D11 · A`, `scan`.
+ *
+ * `<root>/<encoded workspace>/agent-transcripts/<cid>/<cid>.jsonl`. Only the
+ * conversation's own file counts: `<cid>/subagents/…` is delegated work that
+ * belongs to the parent (`delegatedTranscripts: "announce"`). A flat
+ * `agent-transcripts/<cid>.jsonl` is accepted too, because `isCursorTranscript`
+ * admits any `.jsonl` at that depth and a count that disagreed with the gate
+ * would be a count of nothing.
+ *
+ * ⛔ Names and times only; see `claudeSessionSource` for the rule and its reason.
+ */
+function cursorSessionSource(home) {
+    const root = cursorTranscriptRoot(home);
+    const folders = [];
+    try {
+        for (const folder of subdirectories(root)) {
+            if (folder.name === CURSOR_NO_WORKSPACE)
+                continue;
+            const transcripts = join(folder.path, "agent-transcripts");
+            const sessions = [];
+            for (const entry of readEntries(transcripts) ?? []) {
+                const file = entry.isDirectory()
+                    ? join(transcripts, entry.name, `${entry.name}.jsonl`)
+                    : entry.name.endsWith(".jsonl")
+                        ? join(transcripts, entry.name)
+                        : null;
+                const session = file === null ? null : sessionFile(file);
+                if (session !== null)
+                    sessions.push(session);
+            }
+            if (sessions.length > 0)
+                folders.push({ name: folder.name, sessions });
+        }
+    }
+    catch {
+        return { kind: "unreadable", reason: "unreadable" };
+    }
+    // Cursor keeps no record of the folders it has run in, so there is no second signal.
+    return {
+        kind: "folders",
+        folders,
+        encode: encodeProjectPath,
+        isHashed: isHashedProjectName,
+        recorded: [],
+    };
+}
 export const CURSOR = {
     id: "cursor",
     transport: "ndjson",
@@ -103,7 +196,22 @@ export const CURSOR = {
     // ⛔ Against the client's `SessionEnd`, `sessionEnd` matched NOTHING — not an
     // error, a `false` — so a Cursor session took no settle on its final turn and
     // lost it permanently. That is the whole of the bug.
-    eventNames: { Stop: "stop", PreCompact: "preCompact", SessionEnd: "sessionEnd" },
+    //
+    // ⛔ **`sessionStart` is STATIC, NOT OBSERVED** (Open Question 1, 2026-10-24).
+    // `cursor-agent` was not logged in, so no session ran; the spelling and the
+    // payload (`conversation_id`, `generation_id`, `model`, `is_background_agent`,
+    // `composer_mode`) come from the CLI bundle 2026.08.11-e8db854, which runs it
+    // for a NEW chat before the first turn. It reads `env` and `additional_context`
+    // from the output — and `additional_context` goes into the agent's context and
+    // is NOT shown to the user. There is no user-visible field, so this client
+    // never uses it to carry a notice: Cursor users learn the state from `status`,
+    // and the first-`Stop` install is kept as the fallback for exactly this reason.
+    eventNames: {
+        Stop: "stop",
+        PreCompact: "preCompact",
+        SessionEnd: "sessionEnd",
+        SessionStart: "sessionStart",
+    },
     // ⛔ `~/.cursor/hooks.json`, and the `cursor` SHAPE — the two are a pair.
     // Read out of the shipped bundle's validator: a top-level numeric `version`
     // is REQUIRED, entries are a FLAT array of hook scripts each needing a
@@ -125,6 +233,11 @@ export const CURSOR = {
             registeredTimeoutMs: CURSOR_REGISTERED_MS,
             clientBudgetMs: CURSOR_CLIENT_MS,
         },
+        // gstack-shortcut(dec-e650afbf): `Stop`'s clocks, no fast path (eng review D7 · B).
+        SessionStart: {
+            registeredTimeoutMs: CURSOR_REGISTERED_MS, // gstack-shortcut(dec-e650afbf)
+            clientBudgetMs: CURSOR_CLIENT_MS, // gstack-shortcut(dec-e650afbf)
+        },
     },
     // ⛔ DECLARED EXPLICITLY, and it is load-bearing now in a way it was not
     // before (D177 §2, §9). `subagentsDir()` would compute
@@ -142,6 +255,7 @@ export const CURSOR = {
     // measurement, not as a fact about the agent. Measuring it is a change to this
     // line and nothing else.
     sessionIdFromEnv: () => null,
+    sessionSource: (home) => cursorSessionSource(home),
     // ⛔ NO `locateCurrentTranscript`, and the omission is the decision — the same
     // one Codex made. Finding the conversation for THIS project would mean munging
     // a workspace path this client is never told, or reading a `cwd` out of the

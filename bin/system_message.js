@@ -31,7 +31,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { COMMANDS, SYSTEM_MESSAGE, URLS } from "./copy/index.js";
 import { endDateText } from "./credential_meta.js";
-import { machineDayNoticePath, repoDayNoticePath, sessionNoticePath } from "./paths.js";
+import { cloneMarkerPath, machineDayNoticePath, repoDayNoticePath, sessionNoticePath } from "./paths.js";
 import { NODE_FLOOR_TEXT } from "./runtime.js";
 /**
  * The UTC calendar day, `YYYY-MM-DD`.
@@ -74,6 +74,14 @@ export function noticeText(state, nodeVersion, authCommand = DEFAULT_AUTH_COMMAN
             return SYSTEM_MESSAGE.unsupportedRuntime(NODE_FLOOR_TEXT, nodeVersion);
         case "capture_confirmed":
             return SYSTEM_MESSAGE.captureConfirmed(URLS.dashboard);
+        case "hooks_added":
+            return SYSTEM_MESSAGE.hooksAdded;
+        case "hooks_path_set":
+            return SYSTEM_MESSAGE.hooksPathSet;
+        case "own_commit_hook":
+            return SYSTEM_MESSAGE.ownCommitHook;
+        case "grants_unreadable":
+            return SYSTEM_MESSAGE.grantsUnreadable;
     }
 }
 /**
@@ -88,6 +96,16 @@ export function noticeText(state, nodeVersion, authCommand = DEFAULT_AUTH_COMMAN
  * this channel's fallback everywhere else too.
  */
 export function noticeClaimPath(ctx, state) {
+    // State 9 is about the MACHINE's file, so it is once per (machine, day): a repo or session key would repeat it
+    // in every checkout, and "once ever" would go quiet for a file that is still broken tomorrow.
+    if (state === "grants_unreadable")
+        return machineDayNoticePath(ctx.home, utcDay(ctx.now()), state);
+    // States 6-8 are once per CLONE. No clone key means no claim, and no claim is silence — never a shared key.
+    if (state === "hooks_added" || state === "hooks_path_set" || state === "own_commit_hook") {
+        return ctx.cloneKey === undefined || ctx.cloneKey === ""
+            ? null
+            : cloneMarkerPath(ctx.home, ctx.cloneKey, state);
+    }
     if (state === "credential_ending") {
         // Per MACHINE and day, and per credential: replacing it re-arms (a new credential has a new end).
         return machineDayNoticePath(ctx.home, utcDay(ctx.now()), `${state}-${ctx.fingerprint ?? "unknown"}`);

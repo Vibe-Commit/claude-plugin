@@ -34,8 +34,8 @@
  */
 import { EXIT } from "../exit.js";
 import { DEFAULT_AGENT_ID, dialectFor } from "../agents/registry.js";
-import { isProjectAllowed } from "../consent.js";
-import { gitProbe, headRef } from "../git.js";
+import { isCaptureAllowed } from "../consent.js";
+import { gitProbe, headRef, onceRepoSlug } from "../git.js";
 import { detectSquash } from "../inferred_squash.js";
 import { recordInferredSkipped } from "../inferred_tally.js";
 import { resolveProjectKeys } from "../project.js";
@@ -82,7 +82,7 @@ export function observe(ctx) {
     // silence is this file's whole contract — while transcript capture worked
     // fine. That asymmetry is invisible to any cell that grants and checks through
     // one helper (`D184 §9`).
-    if (!isProjectAllowed(ctx.home, keys.consent))
+    if (!isCaptureAllowed(ctx.home, keys, onceRepoSlug(toplevel)))
         return false;
     // ⛔ THE SESSION GATE — WHICH SESSION, NOT WHOSE HANDS.
     //

@@ -57,11 +57,25 @@
  */
 export const UNKNOWN_AGENT_ID = "unknown";
 /**
- * The three hook events DESIGN.md §13.7 names.
+ * The four hook events this client registers.
  *
- * Both members of this lane fire the same three; that is exactly why
+ * Every member of this lane fires the same four; that is exactly why
  * `hook_event_name` was REJECTED as an adapter selector (`CR-183`) — the events
  * are shared, so they discriminate nothing.
+ *
+ * ⛔ **`SessionStart` is the fourth, and it is the one that never uploads** (0.7.0,
+ * eng review D3 · A). `Stop`, `PreCompact` and `SessionEnd` flow into the code
+ * that reads a transcript and sends it; `SessionStart` must only install git
+ * hooks and say so, so `hooks/entry.ts` resolves the canonical event FIRST and
+ * branches to its own handler before the consent gate and before anything reads
+ * `transcript_path`. It sits in this list, and not in a table of its own, so the
+ * compiler makes each dialect declare its budget and its spelling.
+ *
+ *   event          Claude Code    Codex          Cursor          reads a transcript
+ *   Stop           Stop           Stop           stop            yes
+ *   PreCompact     PreCompact     PreCompact     preCompact      yes
+ *   SessionEnd     SessionEnd     SessionEnd     sessionEnd      yes
+ *   SessionStart   SessionStart   SessionStart   sessionStart    NEVER
  */
-export const HOOK_EVENTS = ["Stop", "PreCompact", "SessionEnd"];
+export const HOOK_EVENTS = ["Stop", "PreCompact", "SessionEnd", "SessionStart"];
 //# sourceMappingURL=types.js.map

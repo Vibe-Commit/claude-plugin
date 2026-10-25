@@ -36,13 +36,14 @@
 import { closeSync, openSync, readdirSync, readSync, realpathSync, statSync, writeSync, } from "node:fs";
 import { basename, isAbsolute, join } from "node:path";
 import { zstdCompressSync } from "node:zlib";
-import { isProjectAllowed } from "../consent.js";
+import { grantsUnreadable, isCaptureAllowed, isLocalSlug } from "../consent.js";
 import { endingSoon, noteCredentialExpiry } from "../credential_meta.js";
 import { loadCredential } from "../credential.js";
 import { EXIT } from "../exit.js";
-import { gitProbe, headRef, resolveRepoSlug } from "../git.js";
+import { gitProbe, headRef, onceRepoSlug } from "../git.js";
 import { redactSpan, rulesForTranscript } from "../redact.js";
 import { authCommandFor } from "../install.js";
+import { installOnce, sessionStartPayload } from "./session_start.js";
 import { credentialFingerprint, deliver, ingestUrl } from "../post.js";
 import { markSkipped } from "../policy.js";
 import { fileState, loadSessionState, saveSessionState, withFileState } from "../state.js";
@@ -427,11 +428,12 @@ async function hookBody(ctx, budgetMs, hookStartedAt) {
     // session-keyed states can fire BEFORE a project has been resolved at all —
     // `unsupported_runtime` fires before anything else runs. Only
     // `capture_confirmed` needs one, and only it supplies one.
-    const notice = (state, repoKey = null, rejected, endsAt) => renderNotice({
+    const notice = (state, repoKey = null, rejected, endsAt, cloneKey) => renderNotice({
         home: ctx.home,
         sessionId: input.sessionId,
         nodeVersion: ctx.nodeVersion,
         repoKey,
+        ...(cloneKey === undefined ? {} : { cloneKey }),
         now: () => new Date(),
         // `11A`: states 2 and 5 carry a credential. The command is the channel's, and the claim is
         // keyed by the credential, so replacing it re-arms the message.
@@ -445,8 +447,23 @@ async function hookBody(ctx, budgetMs, hookStartedAt) {
     }, state);
     if (!meetsNodeFloor(ctx.nodeVersion))
         return notice("unsupported_runtime");
+    // ⛔ THE EVENT IS RESOLVED HERE, AHEAD OF THE GATE (0.7.0, eng review D3 · A) — it used to be resolved after
+    // the transcript confinement check, inside the path that reads and sends the file. `SessionStart` must never
+    // reach that path: it branches off to its own handler, which installs git hooks and says so, opens no
+    // transcript and makes no request. Keyed on `ctx.agentId` for the reason the comment further down gives.
+    const event = canonicalHookEvent(dialectFor(ctx.agentId), input.eventName);
+    if (event === "SessionStart") {
+        return sessionStartPayload({
+            agentId: ctx.agentId,
+            env: ctx.env,
+            home: ctx.home,
+            selfPath: ctx.selfPath ?? "",
+            cwd: input.cwd,
+            notice,
+        });
+    }
     // --- CONSENT GATE. Nothing above this line has opened the transcript. ---
-    // The null arm is not new behaviour — `isProjectAllowed(home, null)` is already
+    // The null arm is not new behaviour — `isCaptureAllowed(home, null, …)` is already
     // false, so a `cwd` outside a work tree already stopped here. It is stated
     // separately because `CR-017d` makes this value half the delivery key as well
     // as the consent key, and a key the compiler cannot prove is present is one
@@ -487,8 +504,22 @@ async function hookBody(ctx, budgetMs, hookStartedAt) {
     // one consent was checked against. It is stricter than `resolveProjectKey` in
     // one way — the common dir must also resolve and hold a `HEAD` — which fails
     // closed, silently, exactly as this gate already does.
+    //
+    // ⛔ THE GATE IS NOW `isCaptureAllowed` (0.7.0): the common dir OR the repo's slug in `grants.json`, an exclusion
+    // winning over both. The slug is a MEMOIZED THUNK so a machine with no `grants.json` pays no spawn for it, and so
+    // `repoSlug` below is the very resolution the gate used. `keys` is the same result the confinement roots come from.
     const keys = resolveProjectKeys(input.cwd);
-    if (keys === null || !isProjectAllowed(ctx.home, keys.consent)) {
+    const slugOf = keys === null ? null : onceRepoSlug(keys.worktree);
+    if (keys === null || slugOf === null || !isCaptureAllowed(ctx.home, keys, slugOf)) {
+        // State 9 (0.7.0, spec review R3-14: "when a hook denies because grants.json is corrupt, have it emit one
+        // marker-gated systemMessage naming the file and `vibecommit status`"). An unreadable `grants.json` is the one
+        // denial a hook can say out loud, once per machine and day — and it must also come from here, because the
+        // plugin channel and Cursor never register `SessionStart`.
+        // Only for a repo this client WOULD have captured (a remote, so not `local:`), never for a folder that is
+        // simply not a work tree.
+        if (keys !== null && slugOf !== null && grantsUnreadable(ctx.home) && !isLocalSlug(slugOf())) {
+            return notice("grants_unreadable");
+        }
         // Unconsented is not "not connected": say nothing at all. A machine with no
         // credential says state 1 below; a repo the user declined stays silent,
         // because nagging about a decision the user already made is the tool noise
@@ -502,6 +533,14 @@ async function hookBody(ctx, budgetMs, hookStartedAt) {
     // `report.ts:343` is the standing proof that the NAME is not what tells you
     // which role a site wants.
     const projectKey = keys.worktree;
+    // ⛔ CURSOR'S FIRST-`Stop` INSTALL (0.7.0, Open Question 1). Claude Code's and Codex's `SessionStart` was measured
+    // to fire before the first prompt; Cursor's `sessionStart` was only READ out of the shipped bundle (STATIC, NOT
+    // OBSERVED — `cursor-agent` is not logged in here) and has no field a user sees. So the same marker-gated,
+    // plain-write-only install also runs on a Cursor `stop`, and its one notice rides this hook's payload below.
+    // The record makes it once per clone either way, so a `sessionStart` that does fire first loses nothing.
+    const firstStop = ctx.agentId === "cursor" && event === "Stop"
+        ? installOnce({ env: ctx.env, home: ctx.home, selfPath: ctx.selfPath ?? "" }, keys)
+        : null;
     const load = loadCredential({ env: ctx.env, home: ctx.home });
     switch (load.kind) {
         case "absent":
@@ -568,7 +607,6 @@ async function hookBody(ctx, budgetMs, hookStartedAt) {
     // `--agent=` is the value WE write into that agent's own hook config — so it
     // is the one selector that is not attacker-influenced input. `dialectBudgetMs`
     // already keys the budget off it for the same reason.
-    const event = canonicalHookEvent(dialectFor(ctx.agentId), input.eventName);
     const isSessionEnd = event === SESSION_END_EVENT;
     // ⛔ ONE FIRING, ONE PROCESS — `CR-195`/U4a. Claimed BEFORE the settle, so a
     // duplicate costs nothing rather than spending the budget to discover it is
@@ -641,7 +679,7 @@ async function hookBody(ctx, budgetMs, hookStartedAt) {
     // invocation, since `projectKey` is fixed by the consent gate above. Passing
     // it down rather than re-deriving it is also what keeps the two paths from
     // ever disagreeing about which repository this is.
-    const repoSlug = resolveRepoSlug(projectKey);
+    const repoSlug = slugOf();
     // ⛔ THE ONE NEW SPAWN `CR-170` ADDS TO THIS PATH, and it is for REF MOVES,
     // not commits. `post-commit` observes commits; it cannot see a `pull`, a
     // `checkout` or a `reset --hard`, because those move a ref WITHOUT creating a
@@ -719,6 +757,9 @@ async function hookBody(ctx, budgetMs, hookStartedAt) {
         // consumer on this path, so a reserve the loop honours and this does not
         // is one the biggest spender walks straight through (`CR-182`).
         timeoutMs: sendTimeoutMs(sendBudget, consumedMs),
+        // PR 4a — WHEN THE SENDS MUST STOP: `sendBudget` is measured from `settleStart`, the same origin `consumedMs` uses.
+        // A span larger than one delta goes out as several only while this lasts; the rest waits for the next event.
+        deadlineAtMs: settleStart + sendBudget,
         nowMs: Date.now(),
         byHook: true,
         // ⛔ THE MAIN DELIVERY ONLY. Sub-agent deliveries below leave all three
@@ -746,7 +787,7 @@ async function hookBody(ctx, budgetMs, hookStartedAt) {
     // worktree to "outside the main clone" and hand the server a span of
     // markers — a capture that succeeds, with turn counts that look right and
     // no content in it (`D184 §3`).
-    (from, to) => readSpan(input.transcriptPath, from, to, redactionRoots, ctx.home, ctx.env));
+    (from, to) => readSpan(input.transcriptPath, from, to, redactionRoots, ctx.home, ctx.env), recordCutter(input.transcriptPath));
     // --- DELEGATED WORK. `CR-124`, D76. ---
     // Claude Code writes sub-agent transcripts to `<session>/subagents/`, which
     // `transcript_path` never names: ~16% of transcript volume, and the work a
@@ -827,7 +868,10 @@ async function hookBody(ctx, budgetMs, hookStartedAt) {
                         return ending;
                 }
             }
-            return notice("capture_confirmed", projectKey);
+            return ((firstStop?.state == null
+                ? null
+                : notice(firstStop.state, null, undefined, undefined, firstStop.cloneKey)) ??
+                notice("capture_confirmed", projectKey));
         }
     }
     return null;
@@ -881,7 +925,7 @@ export async function deliverSubagents(opts) {
         ...announcedSubagentFiles(ctx, input),
     ];
     if (files.length === 0)
-        return { files, held: false };
+        return { files, held: false, deliveries: [] };
     // ⚠ SKIP WHAT HAS NOTHING PENDING, BEFORE THE CAP APPLIES — and this is not an
     // optimisation, it is what stops the tail starving.
     //
@@ -897,8 +941,9 @@ export async function deliverSubagents(opts) {
     const before = loadSessionState(ctx.home, key);
     const pending = files.filter((f) => fileState(before, f.fileKey).sentOffset < f.size);
     if (pending.length === 0)
-        return { files, held: false };
+        return { files, held: false, deliveries: [] };
     let held = false;
+    const deliveries = [];
     for (const file of pending.slice(0, MAX_SUBAGENT_FILES)) {
         const consumedMs = Date.now() - startedAt;
         if (sendBudget - consumedMs < MIN_SUBAGENT_BUDGET_MS)
@@ -918,17 +963,20 @@ export async function deliverSubagents(opts) {
             transcriptPath: file.path,
             // The remainder, MEASURED. This is what keeps N files inside one budget.
             timeoutMs: sendTimeoutMs(sendBudget, consumedMs),
+            // PR 4a: the same origin `consumedMs` is measured from (`startedAt` is the main delivery's `settleStart`).
+            deadlineAtMs: startedAt + sendBudget,
             nowMs: Date.now(),
             byHook,
         }, file.size, 
         // The SAME reader as the main transcript, so `CR-024d`'s redaction and
         // `/cso` finding 1's confinement both apply. A delegated agent reading a
         // third party's file is exactly as out-of-tree as the main thread doing it.
-        (from, to) => readSpan(file.path, from, to, redactionRoots, ctx.home, ctx.env));
+        (from, to) => readSpan(file.path, from, to, redactionRoots, ctx.home, ctx.env), recordCutter(file.path));
+        deliveries.push(delivery);
         if (endedHeld(delivery))
             held = true;
     }
-    return { files, held };
+    return { files, held, deliveries };
 }
 /**
  * Did this delivery end with the failure policy KEEPING its bytes?
@@ -1387,6 +1435,55 @@ export function readSpan(path, from, to, projectRoots, home, env) {
             }
         }
     }
+}
+/** How much `recordCutter` reads at a time while it looks for a newline. */
+const CUT_BLOCK_BYTES = 1024 * 1024;
+/**
+ * PR 4a — where a transcript's records end, for `deliver()` to cut a delta on.
+ *
+ * ⛔ IT READS BYTES TO FIND A NEWLINE AND RETURNS AN OFFSET. No byte leaves this function, so it is not a second reader of
+ * transcript content in the sense `readSpan`'s chokepoint note guards: redaction has nothing to act on, and the only thing
+ * that can follow from what it sees is where a cut falls. The path is the one the caller already confined.
+ *
+ * It THROWS on a read error rather than answering `null`: `null` means "no newline here", and `deliver()` reads that as a
+ * record too large to split, which skips it. A failed read must hold the delta instead (`deliver()` catches the throw).
+ */
+export function recordCutter(path) {
+    const withFile = (use) => {
+        const fd = openSync(path, "r");
+        try {
+            return use(fd);
+        }
+        finally {
+            closeSync(fd);
+        }
+    };
+    return {
+        lastBoundary: (from, limit) => withFile((fd) => {
+            const buf = Buffer.alloc(Math.min(CUT_BLOCK_BYTES, Math.max(0, limit - from)));
+            for (let end = limit; end > from;) {
+                const start = Math.max(from, end - buf.length);
+                const read = readSync(fd, buf, 0, end - start, start);
+                const at = buf.subarray(0, read).lastIndexOf(0x0a);
+                if (at >= 0)
+                    return start + at + 1;
+                end = start;
+            }
+            return null;
+        }),
+        firstBoundary: (from) => withFile((fd) => {
+            const buf = Buffer.alloc(CUT_BLOCK_BYTES);
+            for (let pos = from;;) {
+                const read = readSync(fd, buf, 0, buf.length, pos);
+                if (read === 0)
+                    return null;
+                const at = buf.subarray(0, read).indexOf(0x0a);
+                if (at >= 0)
+                    return pos + at + 1;
+                pos += read;
+            }
+        }),
+    };
 }
 /**
  * `TODOS[176](b)` — the promotion bound for THIS hook, computed ONLY when there is something to promote. The turn-start scan

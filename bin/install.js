@@ -72,6 +72,25 @@ export function authCommandFor(env, selfPath) {
 }
 const AUTH_VERB = "auth";
 /**
+ * Rewrite a command written as `vibecommit <rest>` (every fix command in `strings.ts` is, so the copy reads the same
+ * everywhere) into THIS install's command: `<channel command> <rest>`. 0.7.0 PR 7: a plugin-only machine has no
+ * `vibecommit` on PATH, so every fix line a block prints goes through here, and so do the `fix.commands` of a `--json`
+ * failure. A string that does not start with `vibecommit ` (a `chmod`, a `printf … |` pipe) is returned unchanged.
+ */
+export function channelCommand(env, selfPath, command) {
+    if (!command.startsWith(`${BIN} `))
+        return command;
+    return `${installChannel(env, selfPath).command}${command.slice(BIN.length)}`;
+}
+/**
+ * What a person types to run `connect`, for THIS install: `<channel command> connect`. PR 6 item 6: the consent refusal tells
+ * an agent which command to relay, and on a plugin-only machine there is no `vibecommit` on PATH, so the same channel rule as
+ * `authCommandFor` applies.
+ */
+export function connectCommandFor(env, selfPath) {
+    return `${installChannel(env, selfPath).command} connect`;
+}
+/**
  * What a user types to run the device sign-in again, for THIS install (`CR-234d`): `<channel command>
  * connect --device`. The same channel rule as `authCommandFor`, so a plugin-only machine — which has no
  * `vibecommit` on PATH — is not told to run a command that does not exist.
@@ -222,26 +241,7 @@ function shellQuote(value) {
 export function installPostCommitHook(toplevel, binPath) {
     return installCaptureHooks(toplevel, binPath).commit;
 }
-/**
- * Install BOTH capture hooks for the work tree at `toplevel`.
- *
- * ⛔ **`post-rewrite` IS NOT AN EXTRA, IT IS THE OTHER HALF OF `post-commit`.**
- * `--amend` and `rebase` fire `post-commit` for a sha they then DESTROY (`M5`),
- * so a clone with only the commit hook records observations that name commits
- * unreachable from every branch and gone after `gc --prune=now`. The two go in
- * together, behind the same `core.hooksPath` refusal and the same chaining.
- *
- * ⚠ **`installPostCommitHook` RETURNS ONLY THE COMMIT VERDICT, and the rewrite
- * verdict is currently PRINTED BY NOTHING.** `commands/connect.ts` reports one
- * install and `src/copy/` has one string for it, both outside this lane's scope.
- * The gap is narrow — `core.hooksPath` and a `not a git work tree` failure are
- * shared, so they are reported by the commit verdict — and is limited to a clone
- * that has a pre-existing `post-rewrite` and no pre-existing `post-commit`: that
- * chaining happens correctly and is not announced. ⛔ Recorded here rather than
- * left to be discovered, because an unreported install outcome is precisely what
- * the block at the top of this section calls the third silent no-op.
- */
-export function installCaptureHooks(toplevel, binPath) {
+export function installCaptureHooks(toplevel, binPath, options) {
     const configured = gitProbe(toplevel, ["config", "--get", "core.hooksPath"]);
     // `--get` exits 1 when unset, which `gitProbe` reports as null. A SET value
     // is the failure case here, which is the opposite of the usual reading.
@@ -266,6 +266,27 @@ export function installCaptureHooks(toplevel, binPath) {
     if (hooksDir === null) {
         const verdict = { kind: "failed", why: "not a git work tree" };
         return { commit: verdict, rewrite: verdict };
+    }
+    if (options?.plainWriteOnly === true) {
+        const commitPath = join(hooksDir, "post-commit");
+        const rewritePath = join(hooksDir, "post-rewrite");
+        const commitNow = readIfPresent(commitPath);
+        const rewriteNow = readIfPresent(rewritePath);
+        const theirs = (text) => text !== null && !text.includes(HOOK_MARKER);
+        if (theirs(commitNow) || theirs(rewriteNow)) {
+            return {
+                commit: { kind: "foreign", path: commitPath },
+                rewrite: { kind: "foreign", path: rewritePath },
+            };
+        }
+        return {
+            commit: commitNow === null
+                ? writeHook(hooksDir, "post-commit", hookScript(binPath, "post-commit", false))
+                : { kind: "already", path: commitPath },
+            rewrite: rewriteNow === null
+                ? writeHook(hooksDir, "post-rewrite", hookScript(binPath, "post-rewrite", true))
+                : { kind: "already", path: rewritePath },
+        };
     }
     return {
         commit: writeHook(hooksDir, "post-commit", hookScript(binPath, "post-commit", false)),
@@ -345,6 +366,19 @@ function redirectsHooks(toplevel, configured) {
     const ra = realpathOrNull(a);
     const rb = realpathOrNull(b);
     return !(ra !== null && rb !== null && ra === rb);
+}
+export function inspectCaptureHooks(toplevel) {
+    const configured = gitProbe(toplevel, ["config", "--get", "core.hooksPath"]);
+    if (configured !== null && configured.trim() !== "" && redirectsHooks(toplevel, configured.trim())) {
+        return { kind: "hooks-path", configured: configured.trim() };
+    }
+    const hooksDir = resolveHooksDir(toplevel);
+    if (hooksDir === null)
+        return { kind: "unknown" };
+    const slots = ["post-commit", "post-rewrite"].map((name) => readIfPresent(join(hooksDir, name)));
+    if (slots.some((text) => text !== null && !text.includes(HOOK_MARKER)))
+        return { kind: "foreign" };
+    return slots.every((text) => text !== null) ? { kind: "on" } : { kind: "off" };
 }
 export function resolveHooksDir(toplevel) {
     const out = gitProbe(toplevel, ["rev-parse", "--git-path", "hooks"]);

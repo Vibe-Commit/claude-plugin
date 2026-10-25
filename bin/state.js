@@ -38,7 +38,7 @@
 import { chmodSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { pendingFileExpired } from "./pending_prune.js";
-import { repoSessionsDir, sessionStatePath } from "./paths.js";
+import { repoSessionsDir, sessionStatePath, stateDir } from "./paths.js";
 import { EMPTY_FILE_STATE } from "./policy.js";
 import { SESSION_LIVE_WINDOW_MS, WIRE_RUNGS, readInferred, readRewrites, readSpool } from "./spool.js";
 export const EMPTY_SESSION_STATE = {
@@ -114,6 +114,43 @@ export function lastSendForRepo(home, repoKey) {
                 continue;
             if (best === null || file.lastSentAt > best.at) {
                 best = { at: file.lastSentAt, seq: session.seq };
+            }
+        }
+    }
+    return best;
+}
+/**
+ * When did ANY repo on this machine last deliver — the machine-level `status` (0.7.0, D6). The same scan as
+ * `lastSendForRepo`, one directory up: every repo's session files live under `<state>/sessions/<digest>/`, and the digest is
+ * one-way, so this can say WHEN and cannot say WHICH repo. Null when nothing was ever delivered.
+ */
+export function lastSendOnMachine(home) {
+    const root = join(stateDir(home), "sessions");
+    let repos;
+    try {
+        repos = readdirSync(root);
+    }
+    catch {
+        return null;
+    }
+    let best = null;
+    for (const repo of repos) {
+        let entries;
+        try {
+            entries = readdirSync(join(root, repo));
+        }
+        catch {
+            continue;
+        }
+        for (const entry of entries) {
+            if (!entry.endsWith(".json"))
+                continue;
+            const session = readStateAt(join(root, repo, entry));
+            for (const file of Object.values(session.files)) {
+                if (file.lastSentAt <= 0)
+                    continue;
+                if (best === null || file.lastSentAt > best.at)
+                    best = { at: file.lastSentAt, seq: session.seq };
             }
         }
     }

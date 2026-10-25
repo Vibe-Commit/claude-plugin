@@ -102,14 +102,14 @@ export function readSecretFile(home, path) {
         const dir = rootDir(home);
         const dirMode = statSync(dir).mode & 0o777;
         if ((dirMode & 0o077) !== 0) {
-            return { kind: "insecure-file", path: dir, mode: dirMode.toString(8).padStart(3, "0") };
+            return { kind: "insecure-file", path: dir, mode: dirMode.toString(8).padStart(3, "0"), target: "directory" };
         }
         // `lstat`, not `stat`: `stat` follows a symlink and would report the
         // TARGET's mode, so a link to an attacker-owned 0600 file would pass a
         // check that exists to establish who can read this one.
         const mode = lstatSync(path).mode & 0o777;
         if ((mode & 0o077) !== 0) {
-            return { kind: "insecure-file", path, mode: mode.toString(8).padStart(3, "0") };
+            return { kind: "insecure-file", path, mode: mode.toString(8).padStart(3, "0"), target: "file" };
         }
         return { kind: "ok", raw: readFileSync(path, "utf8") };
     }

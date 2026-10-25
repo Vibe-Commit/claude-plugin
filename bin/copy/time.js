@@ -40,4 +40,22 @@ export function relativeAge(thenMs, nowMs) {
 function plural(count, unit) {
     return `${count} ${unit}${count === 1 ? "" : "s"} ago`;
 }
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+/**
+ * `25 Sep` within the current year, `25 Sep 2024` for an older one — style guide
+ * §10.1's day-month-year order, design review D26.
+ *
+ * ⛔ **UTC and a fixed English table**, for the reason `endDateText` gives: a
+ * local date moves with the machine's timezone and `toLocaleDateString` with its
+ * locale, and §13.4 wants identical commands to emit identical bytes. `now` is an
+ * argument because a golden file that read the clock would be a different file
+ * every January.
+ */
+export function shortDate(ms, nowMs) {
+    const d = new Date(ms);
+    const day = `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]}`;
+    return d.getUTCFullYear() === new Date(nowMs).getUTCFullYear()
+        ? day
+        : `${day} ${d.getUTCFullYear()}`;
+}
 //# sourceMappingURL=time.js.map
