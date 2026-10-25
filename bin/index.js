@@ -27,7 +27,7 @@ import { browserCredential } from "./commands/browser_credential.js";
 import { updateNudge } from "./update_nudge.js";
 import { connect } from "./commands/connect.js";
 import { finalize } from "./commands/finalize.js";
-import { off, status } from "./commands/status.js";
+import { offVerb, statusVerb } from "./commands/status.js";
 import { report } from "./commands/report.js";
 import { backfill, backfillForConnect } from "./commands/backfill.js";
 import { scan } from "./commands/scan.js";
@@ -181,6 +181,16 @@ async function main(argv) {
         return EXIT.usage;
     }
     const ctx = interactiveContext(argv);
+    // Slice 2 (S4, R3-11): a credential `g` made and did not keep is revoked by the NEXT verb that runs — once, at its start, silent,
+    // needing no credential, inside one 3 s bound across every row. Not for `--help`, not for `scan` (network-free by contract,
+    // README), not for a `--stdin`, piped or no-terminal `auth` (below), and never from a hook (this is the verb path; hooks branch off at the bottom of this file).
+    // F8 (L10): nor for `auth` run with `--stdin`, piped or with no terminal ("it only saves the credential" stays exactly true of it).
+    const authSavesOnly = verb === "auth" && (argv.includes("--stdin") || !ctx.stdinIsTty);
+    if (verb !== "scan" && !authSavesOnly && !argv.includes("--help") && !argv.includes("-h")) {
+        // Loaded HERE, on the verb path only (the connect.ts rule): `vibecommit hook` never imports the module that holds a token.
+        const { retryPendingRevokes } = await import("./pending_revoke.js");
+        await retryPendingRevokes(ctx.home, ctx.env, globalThis.fetch, ctx.now());
+    }
     const code = await runVerb(verb, argv, ctx);
     // `13A`: the nudge is the LAST line of a verb that SUCCEEDED — never after an error (the §13.6 fix
     // line must stay last) and never with `--json`. It lives here, not in the verbs, so no verb's own
@@ -217,7 +227,11 @@ async function runVerb(verb, argv, ctx) {
                 // second sign-in. `test/auth-connect-chain.test.ts` brace-matches this call to keep it so.
                 // The backfill offer IS passed: it is not a sign-in, it asks its own y/N (default N) on a terminal only, and the chain
                 // itself runs only on a terminal (the `!piped` gate, D32 guard 1), so a piped or CI `auth` never reaches it.
-                connect: (c) => connect(c, {}, { backfill: backfillForConnect }),
+                // Slice 2: the account's network is passed (it is not a sign-in), so the chained `connect` syncs and shows the picker's
+                // "on your account" group. `g` needs a `browser`, which this call never has, so the chain can never reach it.
+                connect: (c) => connect(c, {}, { backfill: backfillForConnect, account: { fetch: globalThis.fetch } }),
+                // R3-7: a credential this verb saves, off the chain, is synced before it returns (only on a machine that has synced before).
+                account: { fetch: globalThis.fetch },
             });
         case "connect":
             // `--sign-in` (CR-084d) is a FLAG, not a verb: `VERBS` is what `renderHelp`
@@ -237,7 +251,8 @@ async function runVerb(verb, argv, ctx) {
                 help: argv.includes("--help") || argv.includes("-h"),
             }, 
             // `D14`/`D15`: the backfill offer after "Capture is on" (PR 5's `backfillForConnect`).
-            { browser: realBrowser, backfill: backfillForConnect });
+            // Slice 2: `account` is the network for the sync, the "on your account" group, `g` and the joining-machine question.
+            { browser: realBrowser, backfill: backfillForConnect, account: { fetch: globalThis.fetch } });
         case "scan":
             // `D33 · 27A`. Read-only, no network, and a public verb so an agent can list capturable repos
             // without entering a consent flow. Reads its own `--json` like `status`.
@@ -249,11 +264,13 @@ async function runVerb(verb, argv, ctx) {
             // `argv.slice(1)` for the same reason `why` and `report` take it: `status`
             // reads its own `--json` flag rather than this package acquiring an
             // argument parser it has deliberately never had (DESIGN.md §13.3).
-            return status(ctx, argv.slice(1));
+            // Slice 2 (S4): one bounded account sync first, then the screen. The sync only refreshes the files `status` reads.
+            return await statusVerb(ctx, argv.slice(1), { fetch: globalThis.fetch });
         case "off":
             // `TODOS[184]`: `off` now takes its trailing argv, so a stray argument (including `--help`
             // landing here by accident) can no longer silently revoke consent.
-            return off(ctx, argv.slice(1));
+            // Slice 2 (S4): the turn-off is local first; with a credential it is then queued for the account and synced once.
+            return await offVerb(ctx, argv.slice(1), { fetch: globalThis.fetch });
         case "why":
             // CR-086. `argv.slice(1)` is everything after the verb — there is no
             // argument parser in this package and `why` does not add one; it reads

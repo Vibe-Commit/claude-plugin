@@ -28,7 +28,8 @@ import { AGENT_HOOKS, COMMANDS, FINALIZE, HELP, OFF, STATUS, URLS, relativeAge }
 import { renderVerbHelp } from "../verb_help.js";
 import { authCommandFor, channelCommand } from "../install.js";
 import { credentialFingerprint } from "../post.js";
-import { GrantsUnreadableError, excludeSlug, grantsUnreadable, isCaptureAllowed, isLocalSlug, normalizeSlug, readAllowList, revokeProject, } from "../consent.js";
+import { GrantsUnreadableError, excludeSlug, grantsUnreadable, isCaptureAllowed, isLocalSlug, normalizeSlug, ownerOfSlug, readAccountState, readAllowList, readGrants, revokeProject, } from "../consent.js";
+import { queueGrantOps } from "../grants_sync.js";
 import { endDateText, endingSoon, metaFor } from "../credential_meta.js";
 import { loadCredential, savedCredentialExists } from "../credential.js";
 import { EXIT } from "../exit.js";
@@ -41,14 +42,27 @@ import { commitsWaitingForRepo, heldAtEndForRepo, inferredUnacknowledgedForRepo,
 import { LABEL_GUTTER, WRAP_COLUMNS, glyph, labelled, paint, renderErrorBlock, tildePath, truncatePath, wrap, } from "../term.js";
 import { credentialProblem, credentialProblemBlock, rejectedCredentialBlock } from "./credential_problem.js";
 import { captureBasis } from "../machine_state.js";
-import { machineStatus } from "./status_machine.js";
+import { accountRowsFor, machineStatus } from "./status_machine.js";
 import { approvalPendingBlock } from "./approval_pending.js";
 import { readOrgPending } from "../org_pending.js";
 import { writeFailure, writeLines } from "./context.js";
+import { stoppedSyncReason } from "./sync_reason.js";
 import { hookStateLines } from "./status_hooks.js";
+import { syncForVerb } from "../grants_verb.js";
 /** §10.3 indents the gutter rows four columns under the state line. */
 const ROW_INDENT = 4;
-export function status(ctx, argv = []) {
+/**
+ * The real `status`: one bounded sync, then the screen (slice 2, S4). `status` stays a synchronous renderer over local files —
+ * the sync only refreshes the files it reads — so every other caller keeps its synchronous contract.
+ */
+export async function statusVerb(ctx, argv, deps) {
+    // `--help` reads and writes nothing, the network included.
+    if (argv.includes("--help") || argv.includes("-h"))
+        return status(ctx, argv);
+    const sync = await syncForVerb(ctx, argv.includes("--json"), deps);
+    return status(ctx, argv, sync);
+}
+export function status(ctx, argv = [], sync = { kind: "skipped" }) {
     // `TODOS[184]`. Check-first, before any git/credential/consent resolution — same ordering principle
     // every other verb's `--help` check uses. Reads and writes nothing.
     if (argv.includes("--help") || argv.includes("-h")) {
@@ -64,7 +78,7 @@ export function status(ctx, argv = []) {
     const keys = resolveProjectKeys(ctx.cwd);
     // 0.7.0, D6 · 2A: from a folder that is not a work tree `status` answers for the MACHINE, instead of "Not a git repository".
     if (keys === null)
-        return machineStatus(ctx, argv);
+        return machineStatus(ctx, argv, sync);
     const projectKey = keys.worktree;
     // ⛔ CONSENT STATE, on the common dir. A worktree of a consented clone must
     // report ON here, because the hook that runs there is now admitted — a
@@ -148,10 +162,16 @@ export function status(ctx, argv = []) {
         stuck.heldIdle.bytes === 0
         ? "ok"
         : "warn";
+    // Slice 2 (S4): not on here, but the last synced account state grants it. One answer for the text row and the `--json` basis.
+    const accountOnly = !on && grantedOnAccountOnly(ctx.home, resolveRepoSlug(projectKey));
     const lines = [
         `  ${paint(ctx.colour, kind, glyph(ctx.colour, kind))} ${paint(ctx.colour, "strong", on ? STATUS.onForRepo : STATUS.offForRepo)}`,
         labelled(ROW_INDENT, STATUS.repoLabel, repoValue(ctx, projectKey)),
-        ...(on ? [labelled(ROW_INDENT, STATUS.basisLabel, basisValue(ctx, projectKey))] : []),
+        ...(on
+            ? [labelled(ROW_INDENT, STATUS.basisLabel, basisValue(ctx, projectKey))]
+            : accountOnly
+                ? [labelled(ROW_INDENT, STATUS.basisLabel, STATUS.basisAccountOnly)]
+                : []),
     ];
     // Question 2: the last successful send FOR THIS REPO. `status` has no
     // session_id — it is interactive — so this is a scan of the repo's session
@@ -161,6 +181,8 @@ export function status(ctx, argv = []) {
         lines.push(labelled(ROW_INDENT, STATUS.lastSuccessLabel, STATUS.lastSuccessValue(relativeAge(lastSend.at, ctx.now().getTime()), lastSend.seq)));
     }
     lines.push(labelled(ROW_INDENT, STATUS.dashboardLabel, paint(ctx.colour, "accent", URLS.dashboard)));
+    // F6: the account rows, after the repo's own rows, only when there is something to say.
+    lines.push(...accountRowsFor(ctx, sync));
     // §13.3 — `--json` emits NOTHING BUT the JSON document on stdout, so the
     // screen assembled above is DISCARDED rather than printed beside it.
     //
@@ -184,7 +206,9 @@ export function status(ctx, argv = []) {
             toplevel: projectKey,
             // 0.7.0, D6: why this repo is on — `owner`, `repo` or `per_clone`; `null` when it is off. A contract change,
             // recorded in `json-read-verbs.test.ts`.
-            basis: on ? basisKind(ctx, projectKey) : null,
+            // Slice 2 (S4): `"account_not_here"` when the repo is not on but the account grants it (the machine document's
+            // `account_not_here` key, spelled the same). A new value of an existing key: a contract change for the 0.8.0 release list.
+            basis: on ? basisKind(ctx, projectKey) : accountOnly ? "account_not_here" : null,
             // 0.7.0: `{ at_ms }` when this repo's last upload was refused because its org has not approved capture, else `null`.
             // A contract change, recorded in `json-read-verbs.test.ts`.
             org_pending: orgPending === null ? null : { at_ms: orgPending.at },
@@ -365,6 +389,25 @@ function repoValue(ctx, toplevel) {
     }
     return value;
 }
+/**
+ * Slice 2 (S4), brief §3.3: this repo is NOT on here, but the last synced account state grants it (the repo, or its owner) and
+ * neither the account nor this machine has turned it off. The account never admits a repo by itself (R3-22), so the row names
+ * the gap and the fix row below it is `connect`. It does not change the exit code: a repo that is not on is `notConnected`.
+ */
+function grantedOnAccountOnly(home, slug) {
+    if (isLocalSlug(slug))
+        return false;
+    const name = normalizeSlug(slug);
+    const account = readAccountState(home).account;
+    if (account === null)
+        return false;
+    const read = readGrants(home);
+    if (read.kind === "ok" && read.grants.excluded.includes(name))
+        return false;
+    if (account.excluded.includes(name))
+        return false;
+    return account.repos.includes(name) || account.owners.includes(ownerOfSlug(name));
+}
 /** The `basis` row's value (D6): which of the three reasons admits this repo. */
 function basisValue(ctx, projectKey) {
     const basis = captureBasis(ctx.home, resolveRepoSlug(projectKey));
@@ -406,21 +449,21 @@ function actionLines(ctx, on) {
  * coupling. If a second global flag is ever added at `index.ts`'s site, add it here too.
  */
 const OFF_RECOGNIZED_GLOBAL_FLAGS = ["--no-color"];
-export function off(ctx, argv = []) {
+function offLocal(ctx, argv) {
     // `TODOS[184]`. `off` used to take no `argv` at all, so EVERY trailing token — including `--help`
     // landing here by accident — silently revoked consent (measured on 0.4.3 and 0.4.4 alike). `--help`/
     // `-h` print help and change nothing; any other argument is refused the same way, also changing
     // nothing — a revoke must never run on an argument this verb did not parse.
     if (argv.includes("--help") || argv.includes("-h")) {
         writeLines(ctx.stdout, [HELP.commands.off]);
-        return EXIT.ok;
+        return { kind: "exit", code: EXIT.ok };
     }
     // `--no-color` is a global flag 0.4.4's `off` (which parsed no argv at all) tolerated by construction;
     // every OTHER argument (including `--json`, which `off` has no mode for) still refuses.
     const rest = argv.filter((arg) => !OFF_RECOGNIZED_GLOBAL_FLAGS.includes(arg));
     if (rest.length > 0) {
         writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", code: "UNRECOGNIZED_ARGUMENT", what: OFF.unrecognizedArgWhat, why: [OFF.unrecognizedArgWhy] }, ctx.colour));
-        return EXIT.usage;
+        return { kind: "exit", code: EXIT.usage };
     }
     const keys = resolveProjectKeys(ctx.cwd);
     if (keys === null) {
@@ -434,7 +477,7 @@ export function off(ctx, argv = []) {
             fixLabel: OFF.outsideRepoFixLabel,
             fixes: [channelCommand(ctx.env, ctx.selfPath, COMMANDS.connect)],
         }, ctx.colour));
-        return EXIT.usage;
+        return { kind: "exit", code: EXIT.usage };
     }
     const slug = normalizeSlug(resolveRepoSlug(keys.worktree));
     // Asked BEFORE anything is revoked: "was it on" decides whether there is an exclusion to record at all, and the
@@ -453,7 +496,7 @@ export function off(ctx, argv = []) {
             ...wrap(changed ? OFF.done : OFF.alreadyOff, 2),
             ...wrap(OFF.note, 2),
         ]);
-        return EXIT.ok;
+        return { kind: "exit", code: EXIT.ok };
     }
     // ⛔ A repo with a remote is turned off BY SLUG, so the exclusion does not depend on `grants.json` alone: every
     // OTHER clone on this machine whose consent survives in `projects.json` and names the same repo loses it too.
@@ -466,9 +509,15 @@ export function off(ctx, argv = []) {
     }
     // An unreadable `grants.json` reads as "not on" above (it denies), but the user's `off` still has to be recorded, or
     // be reported as not recorded: `excludeSlug` throws on it rather than rewrite a file whose exclusions it cannot see.
-    if (wasOn || grantsUnreadable(ctx.home)) {
+    //
+    // Slice 2: a repo the ACCOUNT has turned off is not "on" here either (`account.excluded` denies), yet the user running `off`
+    // in it is asking for it to be off on THIS machine too, so that is recorded as well.
+    const accountWasOff = readAccountState(ctx.home).account?.excluded.includes(slug) === true;
+    let recorded = false;
+    if (wasOn || accountWasOff || grantsUnreadable(ctx.home)) {
         try {
             changed = excludeSlug(ctx.home, slug) || changed;
+            recorded = true;
         }
         catch (error) {
             if (!(error instanceof GrantsUnreadableError))
@@ -483,13 +532,73 @@ export function off(ctx, argv = []) {
                 fixLabel: OFF.grantsUnreadableFixLabel,
                 fixes: [channelCommand(ctx.env, ctx.selfPath, COMMANDS.off)],
             }, ctx.colour));
-            return EXIT.failure;
+            return { kind: "exit", code: EXIT.failure };
         }
     }
+    return { kind: "slug", slug, changed, recorded, accountWasOff };
+}
+/** `off`, local only: no credential means no account to tell, and its words are the 0.7.0 ones byte for byte. */
+export function off(ctx, argv = []) {
+    const local = offLocal(ctx, argv);
+    if (local.kind === "exit")
+        return local.code;
     writeLines(ctx.stdout, [
-        ...wrap(changed ? OFF.doneSlug(slug) : OFF.alreadyOff, 2),
+        ...wrap(local.changed ? OFF.doneSlug(local.slug) : OFF.alreadyOff, 2),
         ...wrap(OFF.note, 2),
     ]);
+    return EXIT.ok;
+}
+/**
+ * The real `off` (slice 2, S4, brief §2 and §5): the local turn-off first, then — on a machine that has a credential — the
+ * exclusion is queued for the account and synced once (3 s, silent on failure; a failed write stays queued and is retried by
+ * the next verb). What it says depends on how far the account got:
+ *
+ *   - synced:  "…and on your other machines once they sync." plus, if any of them have not caught up, how many keep capturing
+ *   - not:     the local line, and "Stopped here. Your other machines don't know yet; it will retry."
+ *
+ * A machine with no credential (never connected, or a pre-0.8.0 per-clone consent only) has no account, and says what 0.7.0 said.
+ */
+export async function offVerb(ctx, argv, deps) {
+    const local = offLocal(ctx, argv);
+    if (local.kind === "exit")
+        return local.code;
+    const { slug, changed, recorded, accountWasOff } = local;
+    const hasCredential = loadCredential({ env: ctx.env, home: ctx.home }).kind !== "absent";
+    if (!hasCredential) {
+        writeLines(ctx.stdout, [...wrap(changed ? OFF.doneSlug(slug) : OFF.alreadyOff, 2), ...wrap(OFF.note, 2)]);
+        return EXIT.ok;
+    }
+    // Queued BEFORE the sync, so a sync that cannot happen (offline, a first sync waiting for a terminal) loses nothing.
+    if (recorded)
+        queueGrantOps(ctx.home, [{ op: "exclude", kind: "repo", value: slug }], ctx.now());
+    const sync = await syncForVerb(ctx, false, deps);
+    const synced = sync.kind === "ran" && sync.result.kind === "synced" ? sync.result : null;
+    const lines = [];
+    if (!changed) {
+        lines.push(...wrap(OFF.alreadyOff, 2));
+    }
+    else if (accountWasOff) {
+        lines.push(...wrap(OFF.alreadyOffAccount, 2));
+    }
+    else {
+        lines.push(...wrap(synced !== null ? OFF.doneSlugAccount(slug) : OFF.doneSlug(slug), 2));
+    }
+    if (synced !== null && changed && !accountWasOff && synced.unsyncedMachines > 0) {
+        lines.push(...wrap(OFF.unsyncedOthers(synced.unsyncedMachines), 2));
+    }
+    if (synced === null && recorded) {
+        // "it will retry" is true only of a write that could not be sent or was not attempted; a 400, a 401, a body over the cap or an
+        // unreadable `grants.json` stops it ("0.8.0 truth fixes" F5), and the sentence must not promise a retry that will fail the same way.
+        const stopped = sync.kind === "ran" &&
+            (sync.result.kind === "rejected" || sync.result.kind === "unauthorized" || sync.result.kind === "too-large" || sync.result.kind === "unreadable");
+        lines.push(...wrap(stopped ? OFF.notSentStopped : OFF.notSentYet, 2));
+        // R2-1: say WHY it stopped, as `connect` does (a 400: the account didn't accept it; a 401: the credential is no longer accepted).
+        // An over-cap body or an unreadable file has no reason line of its own: "Stopped here …" alone.
+        if (stopped && sync.kind === "ran")
+            lines.push(...(stoppedSyncReason(ctx, sync.result) ?? []));
+    }
+    lines.push(...wrap(OFF.note, 2));
+    writeLines(ctx.stdout, lines);
     return EXIT.ok;
 }
 //# sourceMappingURL=status.js.map

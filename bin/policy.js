@@ -84,9 +84,28 @@ export function classifyStatus(status) {
         return SERVER_ERROR_CLASS;
     return DEFAULT_CLASS;
 }
-/** Classify one attempt, response or not. */
+/**
+ * The wire code for "the user turned this repository off, on their account" (slice 2, `CR-259`). A cross-repo contract, like
+ * `CAPTURE_NOT_APPROVED`: the server answers `403 { error: "repository_excluded" }` to a credential that has synced its
+ * grants. Its sibling `repository_not_granted` is ALSO a 403 and is `later` — nothing here names it, because the 403 row
+ * above already says so and a code we did not need to name is one fewer that can drift.
+ */
+export const REPOSITORY_EXCLUDED = "repository_excluded";
+/**
+ * Classify one attempt, response or not.
+ *
+ * ⛔ **ONE 403 IS `never`, AND IT IS IDENTIFIED BY THE ERROR CODE ALONE** (`ErrorDetail.code` is the only thing a caller may
+ * branch on, `post.ts`) — and only on a 403. `never` drops bytes, so every doubt is `later`: a 403 with no body, a body that
+ * did not parse or was cut off, a code this client does not know, and the same code on any other status all fall through
+ * to the 403 row. Excluded means the user said not to capture this repo, so its bytes are not held for a "later" that the
+ * user has already refused.
+ */
 export function classify(outcome) {
-    return outcome.kind === "unreachable" ? NETWORK_CLASS : classifyStatus(outcome.status);
+    if (outcome.kind === "unreachable")
+        return NETWORK_CLASS;
+    if (outcome.status === 403 && outcome.detail?.code === REPOSITORY_EXCLUDED)
+        return "never";
+    return classifyStatus(outcome.status);
 }
 /**
  * The §13.6 copy for a class.

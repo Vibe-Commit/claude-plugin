@@ -47,7 +47,7 @@
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { writeFileAtomic } from "./atomic_write.js";
-import { grantsPath, projectsPath, rootDir } from "./paths.js";
+import { grantsAccountPath, grantsPath, projectsPath, rootDir } from "./paths.js";
 /**
  * Read the allow list. **Every failure returns an empty list**, which means "no
  * project is consented" — a corrupt or unreadable file must not be able to grant
@@ -116,6 +116,8 @@ export const EMPTY_GRANTS = {
     repos: [],
     excluded: [],
     refused: [],
+    pending: [],
+    synced_at: null,
 };
 /**
  * ⛔ **THE ONE NORMALIZATION.** The whole host-qualified slug, lowercased, for every host — the identity the
@@ -152,8 +154,41 @@ function stringList(value, normalize) {
     }
     return out;
 }
-/** The five fields this version knows; every other top-level key of `grants.json` is carried through untouched. */
-const KNOWN_GRANTS_KEYS = new Set(["disclosed_at", "owners", "repos", "excluded", "refused"]);
+const PENDING_OPS = new Set(["grant", "revoke", "exclude", "include"]);
+/**
+ * `pending`: ABSENT is none (every 0.7.0 file), but a field that is there and malformed is `null` — the caller reads the
+ * whole file as unreadable, the same rule as the other lists, since a queue we cannot read may hold a grant we are holding.
+ */
+function parsePending(value) {
+    if (value === undefined)
+        return [];
+    if (!Array.isArray(value))
+        return null;
+    const out = [];
+    for (const item of value) {
+        if (item === null || typeof item !== "object" || Array.isArray(item))
+            return null;
+        const { op, kind, value: v, at } = item;
+        if (typeof op !== "string" || !PENDING_OPS.has(op))
+            return null;
+        if (kind !== "owner" && kind !== "repo")
+            return null;
+        if (typeof v !== "string" || typeof at !== "string")
+            return null;
+        if ((op === "exclude" || op === "include") && kind !== "repo")
+            return null;
+        const clean = kind === "owner" ? normalizeOwner(v) : normalizeSlug(v);
+        if (clean === "")
+            return null;
+        out.push({ op: op, kind, value: clean, at });
+    }
+    return out;
+}
+/**
+ * The seven fields this version knows and REBUILDS on every write (`pending` and `synced_at` are slice 2's); every other top-level key
+ * of `grants.json` is carried through untouched.
+ */
+const KNOWN_GRANTS_KEYS = new Set(["disclosed_at", "owners", "repos", "excluded", "refused", "pending", "synced_at"]);
 /**
  * `readGrants` plus the top-level keys it does not know, in file order. One read and one parse, so `updateGrants`
  * rewrites exactly the file it read. `extras` is empty unless `read` is `ok`.
@@ -178,13 +213,18 @@ function readGrantsWithExtras(home) {
         const repos = stringList(o.repos, normalizeSlug);
         const excluded = stringList(o.excluded, normalizeSlug);
         const refused = stringList(o.refused, normalizeSlug);
+        const pending = parsePending(o.pending);
+        const syncedAt = o.synced_at === undefined ? null : o.synced_at;
         const at = o.disclosed_at;
-        if (owners === null || repos === null || excluded === null || refused === null)
+        if (owners === null || repos === null || excluded === null || refused === null || pending === null) {
             return { read: { kind: "unreadable" }, extras: none };
+        }
         if (at !== null && typeof at !== "string")
             return { read: { kind: "unreadable" }, extras: none };
+        if (syncedAt !== null && typeof syncedAt !== "string")
+            return { read: { kind: "unreadable" }, extras: none };
         return {
-            read: { kind: "ok", grants: { disclosed_at: at, owners, repos, excluded, refused } },
+            read: { kind: "ok", grants: { disclosed_at: at, owners, repos, excluded, refused, pending, synced_at: syncedAt } },
             extras: Object.entries(o).filter(([key]) => !KNOWN_GRANTS_KEYS.has(key)),
         };
     }
@@ -199,6 +239,138 @@ export function readGrants(home) {
 export function grantsUnreadable(home) {
     return readGrants(home).kind === "unreadable";
 }
+export const EMPTY_ACCOUNT_STATE = { account: null, refused: [], stale: false, last_get_at: null };
+function parseAccountGrants(value) {
+    if (value === null)
+        return null;
+    if (typeof value !== "object" || Array.isArray(value))
+        return undefined;
+    const o = value;
+    const owners = stringList(o.owners, normalizeOwner);
+    const repos = stringList(o.repos, normalizeSlug);
+    const excluded = stringList(o.excluded, normalizeSlug);
+    if (owners === null || repos === null || excluded === null)
+        return undefined;
+    if (typeof o.epoch !== "number" || !Number.isSafeInteger(o.epoch) || o.epoch < 0)
+        return undefined;
+    if (typeof o.synced_at !== "string")
+        return undefined;
+    return { owners, repos, excluded, epoch: o.epoch, synced_at: o.synced_at };
+}
+/** Read it. **NEVER THROWS, and any failure — missing, unreadable, not JSON, any field off-shape — is the empty state.** */
+export function readAccountState(home) {
+    try {
+        const parsed = JSON.parse(readFileSync(grantsAccountPath(home), "utf8"));
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))
+            return EMPTY_ACCOUNT_STATE;
+        const o = parsed;
+        const account = o.account === undefined ? null : parseAccountGrants(o.account);
+        const refused = o.refused === undefined ? [] : stringList(o.refused, normalizeSlug);
+        const last = o.last_get_at === undefined ? null : o.last_get_at;
+        if (account === undefined || refused === null)
+            return EMPTY_ACCOUNT_STATE;
+        if (o.stale !== undefined && typeof o.stale !== "boolean")
+            return EMPTY_ACCOUNT_STATE;
+        if (last !== null && typeof last !== "string")
+            return EMPTY_ACCOUNT_STATE;
+        return { account, refused, stale: o.stale === true, last_get_at: last };
+    }
+    catch {
+        return EMPTY_ACCOUNT_STATE;
+    }
+}
+/** Write it whole: normalized, atomic, 0600. Throws on an I/O failure (the destination is then untouched). */
+export function writeAccountState(home, state) {
+    const clean = {
+        account: state.account === null
+            ? null
+            : {
+                owners: [...new Set(state.account.owners.map(normalizeOwner).filter((o) => o !== ""))],
+                repos: [...new Set(state.account.repos.map(normalizeSlug).filter((r) => r !== ""))],
+                excluded: [...new Set(state.account.excluded.map(normalizeSlug).filter((x) => x !== ""))],
+                epoch: state.account.epoch,
+                synced_at: state.account.synced_at,
+            },
+        refused: [...new Set(state.refused.map(normalizeSlug).filter((x) => x !== "" && !isLocalSlug(x)))],
+        stale: state.stale,
+        last_get_at: state.last_get_at,
+    };
+    const path = grantsAccountPath(home);
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    writeFileAtomic(path, `${JSON.stringify(clean, null, 2)}\n`, 0o600);
+}
+/**
+ * A hook saw `repository_excluded` for this slug: remember it, so this machine stops reading that repo's transcripts until
+ * the next sync says otherwise. **NEVER THROWS** — it runs on the hook's path, where a failed write only means the server
+ * refuses the next upload too. `local:` slugs are never recorded (there is no repo identity to refuse).
+ */
+export function recordRefused(home, slug) {
+    const name = normalizeSlug(slug);
+    if (name === "" || isLocalSlug(name))
+        return;
+    try {
+        const current = readAccountState(home);
+        if (current.refused.includes(name))
+            return;
+        writeAccountState(home, { ...current, refused: [...current.refused, name] });
+    }
+    catch {
+        // The hook goes on: nothing was written, and the next refusal tries again.
+    }
+}
+/**
+ * A hook saw `X-Grant-Epoch` on a server answer (an ingest 2xx, or a grants refusal): if it is not the epoch this machine last
+ * recorded, mark the account state `stale`, which is what SessionStart's one bounded `GET` looks for (`session_grants.ts`).
+ * A machine with no recorded account state counts as epoch 0, as the server does when a user has no grants row.
+ *
+ * Writes `grants-account.json` and never `grants.json` (see `AccountState`), only when something changed — so a Stop hook that sees
+ * the same epoch every turn does no file write at all — and only ever sets `stale`; the GET (or a sync) clears it. **NEVER THROWS**:
+ * it runs on the hook's path, and a lost mark only means the next answer marks it again.
+ */
+export function noteGrantEpoch(home, epoch) {
+    if (epoch === null || epoch === undefined || !Number.isSafeInteger(epoch) || epoch < 0)
+        return;
+    try {
+        const current = readAccountState(home);
+        if (current.stale)
+            return;
+        if (epoch === (current.account?.epoch ?? 0))
+            return;
+        writeAccountState(home, { ...current, stale: true });
+    }
+    catch {
+        // The hook goes on: nothing was written, and the next answer marks it again.
+    }
+}
+/**
+ * True when the last synced account state (the last 200) already grants this repo, or its owner. ⚠ Read only to avoid a NEEDLESS
+ * hold — say an owner grant was queued and refused with a 400 while the server already admits this repo — and never to admit: the
+ * account's grants do not admit anything on this machine.
+ */
+function accountGrants(state, name) {
+    const a = state.account;
+    return a !== null && (a.repos.includes(name) || a.owners.includes(ownerOfSlug(name)));
+}
+/** True when a queued `grant` op names this slug, or its owner. */
+function grantPendingFor(pending, name) {
+    const owner = ownerOfSlug(name);
+    return pending.some((p) => p.op === "grant" && (p.kind === "repo" ? p.value === name : p.value === owner));
+}
+/**
+ * Does the hold of `isCaptureAllowed` (step 3) apply to ANYTHING on this machine right now? True when the machine has synced
+ * (`synced_at` is set) and a queued `grant` op names an owner or a repo the last synced account state does not already grant
+ * (the same two conditions the per-slug hold uses: a synced machine, and the account not already admitting it). "0.8.0 truth
+ * fixes" R2-2: `connect`'s untold line says sessions wait only when something actually waits. Reads `grants.json` and
+ * `grants-account.json`; an unreadable `grants.json` holds nothing here (the gate denies for its own reason).
+ */
+export function holdsAny(home) {
+    const read = readGrants(home);
+    if (read.kind !== "ok" || read.grants.synced_at === null)
+        return false;
+    const state = readAccountState(home);
+    // `accountGrants` is the gate's own predicate: an owner op is asked as `owner/` (its owner is `owner`, and no account repo is spelled that way).
+    return read.grants.pending.some((p) => p.op === "grant" && !accountGrants(state, p.kind === "repo" ? p.value : `${p.value}/`));
+}
 /**
  * ⛔ **THE ONE ADMISSION DECISION.** Every gate calls this; `entry.ts`, `post_commit.ts`, `post_rewrite.ts` (twice),
  * `finalize.ts`, `status.ts` and `connect.ts` are the seven call sites. Absence is a NO and every error path denies.
@@ -206,11 +378,27 @@ export function grantsUnreadable(home) {
  * Precedence:
  *  1. A MISSING `grants.json` is empty (0.6.x machines keep capturing on their common-dir consent). A PRESENT file
  *     that cannot be read denies every clone that has a slug, whatever `projects.json` says.
- *  2. An excluded slug is denied, whatever the basis.
- *  3. Otherwise: admitted on the common-dir consent, or on a slug matched by `owners` or `repos`.
+ *  2. A denied slug is denied, whatever the basis: `grants.json`'s `excluded` (and its legacy `refused`), the account file's
+ *     `refused`, or the account's own `excluded`.
+ *  3. On a machine that HAS SYNCED (`grants.synced_at` is set), a slug with a `grant` still PENDING (queued, not yet delivered to
+ *     the account) is held back when that grant is the slug's ONLY local basis, i.e. the clone has no common-dir consent: its
+ *     spans stay unsent with their offset unchanged, and go once a sync delivers the grant. It is not held either when the last
+ *     synced account state already grants the repo or its owner (the server admits it, so a queued grant that was refused must
+ *     not hold it for ever).
+ *     ⭐ **A MACHINE THAT HAS NEVER SYNCED HOLDS NOTHING** (VQ, "0.8.0 truth fixes" F1): the server refuses only a credential that
+ *     has synced (`grants_synced_at`), so before the first sync the hold protects nothing and would only defer uploads, for ever
+ *     against a server without the routes. Such a machine decides capture by its own choices, as under 0.7.0.
+ *     ⭐ **WHY A COMMON-DIR CONSENT LIFTS THE HOLD** (VQ's ruling): a remote repo gets a common-dir consent only from pre-0.8.0
+ *     flows (0.8.0's in-repo `connect` pre-ticks the picker, which writes GRANTS). The first sync uploads those consented slugs, so
+ *     either this credential has not synced, and the server never refuses anything for it, or the first sync already granted the
+ *     slug, and holding it would only delay bytes the server accepts.
+ *  4. Otherwise: admitted on the common-dir consent, or on a slug matched by `owners` or `repos`. ⛔ The account's own
+ *     `owners`/`repos` are NOT consulted — a repo only the account grants is not captured on this machine (per-machine naming).
  *
  * `local:` slugs never match a grant and keep common-dir consent alone. They are also not subject to
  * exclusion or to an unreadable file: there is no repo identity to exclude.
+ *
+ * `grants-account.json` is read on every call and an unreadable one is the empty state, never a denial (`AccountState`).
  *
  * ⚠ **`slug` MAY BE A THUNK, and the hooks pass one.** Computing a slug can spawn `git remote get-url` and `ssh -G`,
  * which is real time on a hook's budget; a machine with no `grants.json` (every 0.6.x machine) needs none of it, and
@@ -225,20 +413,24 @@ export function isCaptureAllowed(home, keys, slug) {
         return false;
     const byClone = isProjectAllowed(home, keys.consent);
     const read = readGrants(home);
-    if (read.kind === "missing")
-        return byClone;
     const resolve = () => normalizeSlug(typeof slug === "function" ? slug() : slug);
     if (read.kind === "unreadable")
         return isLocalSlug(resolve()) ? byClone : false;
-    const { owners, repos, excluded } = read.grants;
-    if (excluded.length === 0 && (byClone || (owners.length === 0 && repos.length === 0)))
+    const grants = read.kind === "ok" ? read.grants : EMPTY_GRANTS;
+    const account = readAccountState(home);
+    const denyLists = [grants.excluded, grants.refused, account.refused, account.account?.excluded ?? []];
+    const mayDeny = denyLists.some((list) => list.length > 0);
+    const mayHold = !byClone && grants.synced_at !== null && grants.pending.some((p) => p.op === "grant");
+    if (!mayDeny && !mayHold && (byClone || (grants.owners.length === 0 && grants.repos.length === 0)))
         return byClone;
     const name = resolve();
     if (isLocalSlug(name))
         return byClone;
-    if (excluded.includes(name))
+    if (denyLists.some((list) => list.includes(name)))
         return false;
-    return byClone || repos.includes(name) || owners.includes(ownerOfSlug(name));
+    if (!byClone && grants.synced_at !== null && grantPendingFor(grants.pending, name) && !accountGrants(account, name))
+        return false;
+    return byClone || grants.repos.includes(name) || grants.owners.includes(ownerOfSlug(name));
 }
 /** `updateGrants` refuses to rewrite a file it cannot read: overwriting would silently drop exclusions it never saw. */
 export class GrantsUnreadableError extends Error {
@@ -269,6 +461,11 @@ export function updateGrants(home, change) {
         repos: [...new Set(next.repos.map(normalizeSlug).filter((r) => r !== ""))],
         excluded: [...new Set(next.excluded.map(normalizeSlug).filter((x) => x !== ""))],
         refused: [...new Set(next.refused.map(normalizeSlug).filter((x) => x !== ""))],
+        pending: next.pending.flatMap((p) => {
+            const value = p.kind === "owner" ? normalizeOwner(p.value) : normalizeSlug(p.value);
+            return value === "" ? [] : [{ ...p, value }];
+        }),
+        synced_at: next.synced_at,
     };
     const path = grantsPath(home);
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });

@@ -110,6 +110,11 @@ export async function connect(ctx, options = {}, deps = {}) {
     }
     if (isCaptureAllowed(ctx.home, keys, slugOf)) {
         writeLines(ctx.stdout, wrap(CONNECT.alreadyConnected, 2));
+        // Slice 2: a verb that runs on a machine with a credential is where queued changes get delivered. This repo is already on, so
+        // there is no picker and nothing new to say; the sync is bounded (3 s) and silent on failure, and a machine with no
+        // credential makes no request.
+        if (deps.account !== undefined)
+            await (await import("../grants_verb.js")).syncForVerb(ctx, false, deps.account);
         return await afterConsent(ctx, keys, options, deps);
     }
     if (!isLocalSlug(slugOf())) {
@@ -323,14 +328,7 @@ export async function obtainCredential(ctx, deps, options = {}, scope) {
             ...(scope === undefined ? {} : { scope }),
         });
         if (minted.kind === "saved") {
-            writeLines(ctx.stdout, [
-                "",
-                ...renderErrorBlock({
-                    kind: "ok",
-                    what: AUTH.savedWhat,
-                    why: [AUTH.savedWhy(tildePath(credentialsPath(ctx.home), ctx.home)), ...(minted.notes ?? [])],
-                }, ctx.colour),
-            ]);
+            savedBlock(ctx, minted.notes ?? []);
             // Already probed by the mint (`finishMint`), so no second probe here.
             return { kind: "credential", credential: minted.credential, unconfirmed: false };
         }
@@ -353,6 +351,13 @@ export async function obtainCredential(ctx, deps, options = {}, scope) {
         fixes: [CONNECT.credentialNeededCommand, COMMANDS.connect].map((fix) => channelCommand(ctx.env, ctx.selfPath, fix)),
     }, ctx.colour));
     return { kind: "exit", code: EXIT.notConnected };
+}
+/** "Saved to <credentials.json>" — what the credential beat says once a credential is on disk (and `g`, once its yes has put it there). */
+export function savedBlock(ctx, notes) {
+    writeLines(ctx.stdout, [
+        "",
+        ...renderErrorBlock({ kind: "ok", what: AUTH.savedWhat, why: [AUTH.savedWhy(tildePath(credentialsPath(ctx.home), ctx.home)), ...notes] }, ctx.colour),
+    ]);
 }
 /**
  * The test capture: send the current session's transcript through `deliver()` so the ending can name evidence (D57 §DX5's

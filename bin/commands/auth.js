@@ -79,6 +79,7 @@ import { authCommandFor, channelCommand } from "../install.js";
 import { writeLines } from "./context.js";
 import { EXIT } from "../exit.js";
 import { INGEST_TOKEN_PREFIX, IngestCredential, saveCredential } from "../credential.js";
+import { readGrants } from "../consent.js";
 import { machineCapture, machineSummary } from "../machine_state.js";
 import { credentialsPath } from "../paths.js";
 import { resolveProjectKeys } from "../project.js";
@@ -225,6 +226,26 @@ async function saved(ctx, deps, piped, notes = []) {
     ]);
     if (shouldConnect && deps.connect !== undefined)
         return await deps.connect(ctx);
+    // Not chaining (the chained `connect` syncs for itself): this is the only other place a credential is saved, so it is the other
+    // place a new credential row is synced. ⛔ It makes no prompt and prints nothing, so a piped or no-terminal `auth` (which never
+    // continues, D32 guard 1) is as quiet as before; a failure is silent and the exit stays what it was.
+    // ⛔ A piped, `--stdin` or no-terminal `auth` does NOT sync (L10: "with `--stdin`, or with no terminal, it only saves the credential"): a
+    // sync sends this machine's grants, which is more than saving. R3-7 is for a person at a terminal.
+    if (!piped)
+        await syncNewCredential(ctx, deps);
     return EXIT.ok;
+}
+/**
+ * R3-7, for a TERMINAL `auth` only (the caller skips a piped one). Only a machine that HAS synced (`grants.json`'s `synced_at`) syncs here: a machine that never has would be making a FIRST
+ * sync, which prints what it is saving and belongs to `connect`/`status`/`off`, not to a verb whose job is to save a credential.
+ * Bounded at 3 s and silent on failure (`syncForVerb` never throws).
+ */
+async function syncNewCredential(ctx, deps) {
+    if (deps.account === undefined)
+        return;
+    const read = readGrants(ctx.home);
+    if (read.kind !== "ok" || read.grants.synced_at === null)
+        return;
+    await (await import("../grants_verb.js")).syncForVerb(ctx, false, deps.account);
 }
 //# sourceMappingURL=auth.js.map

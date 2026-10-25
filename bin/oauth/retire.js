@@ -31,6 +31,8 @@
  */
 import { HTTP_TIMEOUT_MS } from "./signin.js";
 export const RETIRE_PATH = "/oauth/ingest-credential/retire";
+/** One best-effort revoke of a credential `g` holds, and the bound on a verb's whole retry of the queue (`pending_revoke.ts`). */
+export const REVOKE_TIMEOUT_MS = 3_000;
 export function retireUrl(mcpEndpoint) {
     return new URL(RETIRE_PATH, mcpEndpoint).toString();
 }
@@ -75,6 +77,15 @@ export async function retireCredential(mcpEndpoint, replacement, old, deps) {
  * result carries nothing of the credential.
  */
 export async function selfRevokeCredential(mcpEndpoint, credential, deps) {
+    const outcome = await selfRevokeOutcome(mcpEndpoint, credential, deps);
+    return outcome.kind === "gone" ? { kind: "failed" } : outcome;
+}
+/**
+ * `selfRevokeCredential`, plus the one thing a RETRY needs to know: `gone` is a 401, the server saying it does not accept this
+ * credential — already revoked, expired or never real — so there is nothing left to revoke and a queued retry stops. Every
+ * other result is `selfRevokeCredential`'s.
+ */
+export async function selfRevokeOutcome(mcpEndpoint, credential, deps) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), deps.timeoutMs ?? HTTP_TIMEOUT_MS);
     try {
@@ -91,6 +102,8 @@ export async function selfRevokeCredential(mcpEndpoint, credential, deps) {
         });
         if (res.status === 404)
             return { kind: "unknown" };
+        if (res.status === 401)
+            return { kind: "gone" };
         if (res.status !== 200)
             return { kind: "failed" };
         const doc = (await res.json());

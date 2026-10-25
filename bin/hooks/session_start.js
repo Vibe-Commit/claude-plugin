@@ -1,17 +1,22 @@
 /**
  * `SessionStart` — the event that never uploads (0.7.0, eng review D3 · A, D4 · A, A4).
  *
- * It does three things in a clone that is already captured, and nothing else:
+ * It does three things in a clone that is already captured, and one more that asks nothing of the clone:
  *
  *   1. installs the clone's two git hooks, once, and ONLY when that is a plain write;
  *   2. says so, once, as the hook's one `systemMessage` (style guide §10.1 states 6-8);
  *   3. says the other things a session start can know without sending anything: the machine has no
  *      credential (state 1), the credential ends soon (state 5), `grants.json` is unreadable (state 9).
+ *   4. (slice 2) when the account state is stale and an hour has passed, makes ONE bounded `GET` of the account's grants
+ *      (`session_grants.ts`) and, if the account grants repositories this machine has not named, says so once per account
+ *      epoch (state 10). It names no repo and sends nothing about the clone: the request is the machine's credential and a path.
  *
- * ⛔ **IT NEVER READS `transcript_path` AND NEVER SENDS.** `entry.ts` resolves the canonical event first and
+ * ⛔ **IT NEVER READS `transcript_path` AND NEVER UPLOADS.** `entry.ts` resolves the canonical event first and
  * branches here BEFORE the consent gate and before the transcript confinement check, so this module is not a
- * path a transcript can reach. There is no `fetch` here and nothing it imports makes a request; the cells in
- * `test/session-start.test.ts` assert 0 requests and an unopened transcript for each of the three dialects.
+ * path a transcript can reach. There is no `fetch` call here, and the one request anything it imports can make is
+ * `session_grants.ts`'s GET, which runs only on a stale account state, at most hourly (a machine that has never been told a
+ * different epoch makes none); the cells in `test/session-start.test.ts` assert 0 requests and an unopened transcript for
+ * each of the three dialects.
  *
  * ⚠ **The consent gate is still applied — HERE**, because installing git hooks into a repo is a write into
  * the user's clone and "absence means no" covers writes as much as reads. An ungranted or excluded clone gets
@@ -27,10 +32,11 @@
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { grantsUnreadable, isCaptureAllowed, isLocalSlug } from "../consent.js";
+import { grantsUnreadable, isCaptureAllowed, isLocalSlug, readAccountState } from "../consent.js";
 import { endingSoon, metaFor } from "../credential_meta.js";
 import { loadCredential } from "../credential.js";
 import { onceRepoSlug } from "../git.js";
+import { refreshAccountGrants } from "./session_grants.js";
 import { installChannel, installCaptureHooks } from "../install.js";
 import { cloneMarkerPath } from "../paths.js";
 import { credentialFingerprint } from "../post.js";
@@ -149,11 +155,16 @@ export function installOnce(ctx, keys) {
  * The `SessionStart` hook body. Returns the stdout payload or null; never throws past the caller's catch, and
  * opens no transcript.
  *
- * Precedence — one hook speaks at most once: 9, then 1, then 5, then 7, 8, 6. (States 2 and 4 need a send, and
+ * Precedence — one hook speaks at most once: 9, then 10, then 1, then 5, then 7, 8, 6. (States 2 and 4 need a send, and
  * 3 is `hookBody`'s own check ahead of the branch, so on a runtime below the Node floor 3 outranks 9: nothing
  * else on such a runtime works either.) A state that is already claimed returns null and the next one speaks.
+ *
+ * State 10 needs a usable credential, so it cannot share a session with state 1; it outranks 5 and the three install states.
+ * It is the one notice that can speak from a clone THIS machine does not capture — the clone an account grant names is exactly
+ * such a clone — so it is gated on the clone having a remote (as state 9 is), not on `isCaptureAllowed`. What it sends is the
+ * machine's credential and no word about the clone.
  */
-export function sessionStartPayload(ctx) {
+export async function sessionStartPayload(ctx) {
     const keys = resolveProjectKeys(ctx.cwd);
     if (keys === null)
         return null;
@@ -162,7 +173,8 @@ export function sessionStartPayload(ctx) {
     // NOTHING: it renders no notice and, because `renderNotice` is what claims, it claims none. Rendering here would
     // print a line nobody sees AND use up the clone's state 6 and the machine's once-a-day 9 and 5, leaving Claude
     // Code and Codex quiet. State 6 stays owed (`installOnce`) for the next hook that can speak — Cursor's first
-    // `stop`. Ahead of the state-9 branch for the same reason.
+    // `stop`. Ahead of the state-9 branch for the same reason. And it makes no GET: the answer would be a notice nobody sees,
+    // and the stale mark stays for a hook that can speak.
     if (ctx.agentId === "cursor") {
         if (isCaptureAllowed(ctx.home, keys, slugOf))
             installOnce(ctx, keys);
@@ -173,12 +185,44 @@ export function sessionStartPayload(ctx) {
     if (grantsUnreadable(ctx.home) && !isLocalSlug(slugOf())) {
         return ctx.notice("grants_unreadable");
     }
-    if (!isCaptureAllowed(ctx.home, keys, slugOf))
-        return null;
+    const allowed = isCaptureAllowed(ctx.home, keys, slugOf);
     // The side effect comes before any notice, so a higher-precedence notice never costs the install — and state 6
     // stays OWED to a later session rather than lost (`installOnce`).
-    const installed = installOnce(ctx, keys);
+    const installed = allowed ? installOnce(ctx, keys) : null;
+    // ⛔ A clone this machine does NOT capture may still be where an account grant is named, so it may make the one GET — under VT's five
+    // conditions (#89): (1) the request is the bare `GET /ingest/v1/grants` with only the credential, client-version and accept headers;
+    // (2) nothing is written into the clone (no clone id, no git config, no hook); (3) no transcript is opened or stat'ed (this module never
+    // names `transcript_path`); (4) the conditions are machine-wide — stale, at most hourly across ALL clones, `timeoutMs` ≤ 1,000, 64 KiB,
+    // a stalled or oversize answer stays stale; (5) THE SLUG RESOLVES LAZILY: the remote is looked up (a git spawn) only when the account
+    // state this machine already holds names at least one owner or repo AND is stale. A machine whose cached account is empty never spawns git
+    // for this, and a clone with no remote asks nothing.
+    if (!allowed) {
+        const cached = readAccountState(ctx.home);
+        if (!cached.stale || cached.account === null || (cached.account.owners.length === 0 && cached.account.repos.length === 0))
+            return null;
+        if (isLocalSlug(slugOf()))
+            return null;
+    }
     const load = loadCredential({ env: ctx.env, home: ctx.home });
+    if (load.kind === "ok") {
+        // State 10. The GET is due only when the account state is stale and an hour has passed (`session_grants.ts`).
+        const found = await refreshAccountGrants({
+            env: ctx.env,
+            home: ctx.home,
+            credential: load.credential,
+            ...(ctx.fetch === undefined ? {} : { fetch: ctx.fetch }),
+            ...(ctx.now === undefined ? {} : { now: ctx.now }),
+            ...(ctx.budgetLeftMs === undefined ? {} : { budgetLeftMs: ctx.budgetLeftMs }),
+        });
+        if (found !== null) {
+            const unnamed = ctx.notice("account_grants_unnamed", null, undefined, undefined, undefined, found);
+            if (unnamed !== null)
+                return unnamed;
+        }
+    }
+    // Everything below is about a clone this machine captures. A clone it does not capture is silent, as it always was.
+    if (!allowed || installed === null)
+        return null;
     if (load.kind !== "ok") {
         const notConnected = ctx.notice("not_connected");
         if (notConnected !== null)

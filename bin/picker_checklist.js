@@ -37,6 +37,8 @@ export function checklistRows(model, expanded) {
         if (hidden > 0)
             rows.push({ id: `more:${group.owner}`, kind: "more", group, hidden });
     }
+    for (const row of model.account)
+        rows.push({ id: `account:${row.kind}:${row.key}`, kind: "account", row });
     for (const row of model.turnedOff)
         rows.push({ id: `off:${row.slug}`, kind: "off", row });
     return rows;
@@ -70,7 +72,9 @@ function withTick(state, id, on) {
 export function isCovered(state, row) {
     return row.kind === "repo" && state.ticked.has(`all:${row.group.owner}`);
 }
-export function step(model, state, key) {
+export function step(model, state, key, 
+/** `g` is a key only where the picker offered it (no credential, a terminal, a browser); anywhere else it does nothing. */
+options = {}) {
     const rows = checklistRows(model, state.expanded);
     const at = Math.max(0, rows.findIndex((r) => r.id === state.cursor));
     const current = rows[at];
@@ -103,6 +107,8 @@ export function step(model, state, key) {
         }
         case "t":
             return { kind: "typed" };
+        case "g":
+            return options.offerAccount === true ? { kind: "account" } : { kind: "state", state };
         case "ctrl-c":
             return { kind: "cancel" };
         default:
@@ -123,6 +129,10 @@ export function changeOf(model, state) {
         stopRepos: [],
         stopClones: [],
     };
+    const add = (list, value) => {
+        if (!list.includes(value))
+            list.push(value);
+    };
     for (const row of model.onNow) {
         if (state.ticked.has(`on:${row.kind}:${row.key}`))
             continue;
@@ -135,12 +145,25 @@ export function changeOf(model, state) {
     }
     for (const group of model.owners) {
         if (state.ticked.has(`all:${group.owner}`)) {
-            change.addOwners.push(group.owner);
+            add(change.addOwners, group.owner);
             continue;
         }
         for (const repo of group.repos)
             if (state.ticked.has(`repo:${repo.slug}`))
-                change.addRepos.push(repo.slug);
+                add(change.addRepos, repo.slug);
+    }
+    // The account's grants (slice 2): an owner row is an owner grant, a repo row a repo grant (unless its owner is chosen too).
+    for (const row of model.account) {
+        if (!state.ticked.has(`account:${row.kind}:${row.key}`))
+            continue;
+        if (row.kind === "owner")
+            add(change.addOwners, row.key);
+    }
+    for (const row of model.account) {
+        if (row.kind !== "repo" || !state.ticked.has(`account:repo:${row.key}`))
+            continue;
+        if (!change.addOwners.includes(row.key.slice(0, Math.max(0, row.key.lastIndexOf("/")))))
+            add(change.addRepos, row.key);
     }
     for (const row of model.turnedOff)
         if (state.ticked.has(`off:${row.slug}`))
@@ -178,6 +201,9 @@ export function renderFrame(model, state, options) {
         }
         if (row.kind === "off")
             return { name: row.row.slug, meta: PICKER.turnOnHint, agents: "" };
+        if (row.kind === "account") {
+            return { name: row.row.kind === "owner" ? `${row.row.key}/` : row.row.key, meta: PICKER.onAccountHint, agents: "" };
+        }
         return { name: "", meta: "", agents: "" };
     };
     const named = rows.map((r) => ({ row: r, ...metaOf(r) })).filter((r) => r.name !== "");
@@ -203,9 +229,13 @@ export function renderFrame(model, state, options) {
     out.push(...wrap(SCAN.found(model.found), 2).map((l) => paint(colour, "strong", l)));
     out.push(paint(colour, "muted", `  ${PICKER.hint}`));
     out.push(paint(colour, "muted", `  ${PICKER.hintTyped(typedCommand)}`));
+    // Slice 2, screen 1a: the same sentence the typed prompt carries, where `g` does something.
+    if (options.offerAccount === true)
+        out.push(...wrap(PICKER.gLine, 2).map((l) => paint(colour, "muted", l)));
     out.push("");
     const seenOwner = new Set();
     let wroteOn = false;
+    let wroteAccount = false;
     let wroteOff = false;
     for (const entry of rows) {
         const m = metaOf(entry);
@@ -221,6 +251,10 @@ export function renderFrame(model, state, options) {
                 seenOwner.add(owner);
                 out.push(`  ${paint(colour, "text", `${owner}/`)}`);
             }
+        }
+        else if (entry.kind === "account" && !wroteAccount) {
+            out.push(paint(colour, "muted", `  ${PICKER.onAccount}`));
+            wroteAccount = true;
         }
         else if (entry.kind === "off" && !wroteOff) {
             out.push(paint(colour, "muted", `  ${PICKER.turnedOff}`));
@@ -255,6 +289,8 @@ function keyOf(str, key) {
             return { name: "space" };
         case "t":
             return { name: "t" };
+        case "g":
+            return { name: "g" };
         default:
             return str === " " ? { name: "space" } : { name: "other" };
     }
@@ -324,7 +360,7 @@ export function runChecklist(model, options, deps) {
             if (finished)
                 return;
             try {
-                const result = step(model, state, keyOf(str, key));
+                const result = step(model, state, keyOf(str, key), { offerAccount: options.offerAccount === true });
                 if (result.kind === "state") {
                     const before = state;
                     state = result.state;
