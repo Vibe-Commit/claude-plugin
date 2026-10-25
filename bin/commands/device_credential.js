@@ -68,9 +68,10 @@ function sigintOnce() {
     };
 }
 const realSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-function errorBlock(ctx, what, why, fixLabel, fixes) {
+function errorBlock(ctx, code, what, why, fixLabel, fixes) {
     return renderErrorBlock({
         kind: "bad",
+        code,
         what,
         why: [why],
         ...(fixLabel === undefined || fixes === undefined ? {} : { fixLabel, fixes }),
@@ -100,13 +101,13 @@ export async function deviceCredential(ctx, input, deps = {}) {
     if (discovery.kind !== "ok") {
         writeLines(ctx.stderr, [
             "",
-            ...errorBlock(ctx, SIGNIN.noServerWhat, discovery.kind === "unreachable" ? SIGNIN.noServerUnreachableWhy : SIGNIN.noServerMalformedWhy, DEVICE.retryFix, [rerun]),
+            ...errorBlock(ctx, "SIGNIN_SERVICE_NOT_FOUND", SIGNIN.noServerWhat, discovery.kind === "unreachable" ? SIGNIN.noServerUnreachableWhy : SIGNIN.noServerMalformedWhy, DEVICE.retryFix, [rerun]),
         ]);
         return { kind: "failed" };
     }
     const { device_authorization_endpoint, token_endpoint } = discovery.metadata;
     if (device_authorization_endpoint === undefined) {
-        writeLines(ctx.stderr, ["", ...errorBlock(ctx, DEVICE.unsupportedWhat, DEVICE.unsupportedWhy)]);
+        writeLines(ctx.stderr, ["", ...errorBlock(ctx, "SIGNIN_CODE_UNSUPPORTED", DEVICE.unsupportedWhat, DEVICE.unsupportedWhy)]);
         return { kind: "failed" };
     }
     const label = machineLabel((deps.hostname ?? osHostname)());
@@ -123,13 +124,13 @@ export async function deviceCredential(ctx, input, deps = {}) {
             writeLines(ctx.stderr, ["", ...rateLimitedBlock(ctx, started.retryAfterS, rerun)]);
             return { kind: "declined" };
         case "refused":
-            writeLines(ctx.stderr, ["", ...errorBlock(ctx, DEVICE.refusedWhat, DEVICE.refusedWhy, DEVICE.retryFix, [rerun])]);
+            writeLines(ctx.stderr, ["", ...errorBlock(ctx, "SIGNIN_CODE_REFUSED", DEVICE.refusedWhat, DEVICE.refusedWhy, DEVICE.retryFix, [rerun])]);
             return { kind: "failed" };
         case "unreachable":
-            writeLines(ctx.stderr, ["", ...errorBlock(ctx, DEVICE.unreachableWhat, DEVICE.unreachableWhy, DEVICE.retryFix, [rerun])]);
+            writeLines(ctx.stderr, ["", ...errorBlock(ctx, "SIGNIN_UNREACHABLE", DEVICE.unreachableWhat, DEVICE.unreachableWhy, DEVICE.retryFix, [rerun])]);
             return { kind: "failed" };
         case "malformed":
-            writeLines(ctx.stderr, ["", ...errorBlock(ctx, DEVICE.malformedWhat, DEVICE.malformedWhy, DEVICE.retryFix, [rerun])]);
+            writeLines(ctx.stderr, ["", ...errorBlock(ctx, "SIGNIN_ANSWER_UNUSABLE", DEVICE.malformedWhat, DEVICE.malformedWhy, SIGNIN.malformedFix, [rerun])]);
             return { kind: "failed" };
     }
     const grant = started.grant;
@@ -145,25 +146,25 @@ export async function deviceCredential(ctx, input, deps = {}) {
                 writeLines(ctx.stdout, ["", paint(ctx.colour, "muted", `  ${DEVICE.cancelled}`)]);
                 return { kind: "declined" };
             case "denied":
-                writeLines(ctx.stderr, ["", ...errorBlock(ctx, DEVICE.deniedWhat, DEVICE.deniedWhy, DEVICE.deniedFix, [rerun])]);
+                writeLines(ctx.stderr, ["", ...errorBlock(ctx, "SIGNIN_DENIED", DEVICE.deniedWhat, DEVICE.deniedWhy, DEVICE.deniedFix, [rerun])]);
                 return { kind: "declined" };
             case "code-signin-off":
                 writeLines(ctx.stderr, ["", ...gateOffBlock(ctx, rerun)]);
                 return { kind: "declined" };
             case "expired":
-                writeLines(ctx.stderr, ["", ...errorBlock(ctx, DEVICE.expiredWhat, DEVICE.expiredWhy, DEVICE.expiredFix, [rerun])]);
+                writeLines(ctx.stderr, ["", ...errorBlock(ctx, "SIGNIN_TIMED_OUT", DEVICE.expiredWhat, DEVICE.expiredWhy, DEVICE.expiredFix, [rerun])]);
                 return { kind: "declined" };
             case "rate-limited":
                 writeLines(ctx.stderr, ["", ...rateLimitedBlock(ctx, polled.retryAfterS, rerun)]);
                 return { kind: "declined" };
             case "invalid":
-                writeLines(ctx.stderr, ["", ...errorBlock(ctx, DEVICE.invalidWhat, DEVICE.invalidWhy, DEVICE.retryFix, [rerun])]);
+                writeLines(ctx.stderr, ["", ...errorBlock(ctx, "SIGNIN_CODE_INVALID", DEVICE.invalidWhat, DEVICE.invalidWhy, DEVICE.retryFix, [rerun])]);
                 return { kind: "failed" };
             case "unreachable":
-                writeLines(ctx.stderr, ["", ...errorBlock(ctx, DEVICE.unreachableWhat, DEVICE.unreachableWhy, DEVICE.retryFix, [rerun])]);
+                writeLines(ctx.stderr, ["", ...errorBlock(ctx, "SIGNIN_UNREACHABLE", DEVICE.unreachableWhat, DEVICE.unreachableWhy, DEVICE.retryFix, [rerun])]);
                 return { kind: "failed" };
             case "malformed":
-                writeLines(ctx.stderr, ["", ...errorBlock(ctx, DEVICE.malformedWhat, DEVICE.malformedWhy, DEVICE.retryFix, [rerun])]);
+                writeLines(ctx.stderr, ["", ...errorBlock(ctx, "SIGNIN_ANSWER_UNUSABLE", DEVICE.malformedWhat, DEVICE.malformedWhy, SIGNIN.malformedFix, [rerun])]);
                 return { kind: "failed" };
         }
     }
@@ -180,7 +181,7 @@ export async function deviceCredential(ctx, input, deps = {}) {
     if (minted.kind !== "ok") {
         writeLines(ctx.stderr, [
             "",
-            ...errorBlock(ctx, AUTH.mintFailedWhat, minted.kind === "unreachable"
+            ...errorBlock(ctx, minted.kind === "refused" && minted.error === "rate_limited" ? "MINT_RATE_LIMITED" : "MINT_FAILED", AUTH.mintFailedWhat, minted.kind === "unreachable"
                 ? AUTH.mintUnreachableWhy
                 : minted.kind === "refused" && minted.error === "rate_limited"
                     ? AUTH.mintRateLimitedWhy
@@ -200,16 +201,17 @@ export async function deviceCredential(ctx, input, deps = {}) {
         confirm: "always",
         ticket: { account: polled.account, orgName: polled.orgName },
         rerun,
+        ...(input.scope === undefined ? {} : { scope: input.scope }),
     });
 }
 function gateOffBlock(ctx, rerun) {
-    return errorBlock(ctx, DEVICE.gateOffWhat, DEVICE.gateOffWhy, DEVICE.gateOffFix, [rerun]);
+    return errorBlock(ctx, "SIGNIN_CODE_DISABLED", DEVICE.gateOffWhat, DEVICE.gateOffWhy, DEVICE.gateOffFix, [rerun]);
 }
 function rateLimitedBlock(ctx, retryAfterS, rerun) {
     const fixLabel = retryAfterS === null
         ? DEVICE.rateLimitedFixUnknown
         : DEVICE.rateLimitedFix(clockTime(new Date(ctx.now().getTime() + retryAfterS * 1000)));
-    return errorBlock(ctx, DEVICE.rateLimitedWhat, DEVICE.rateLimitedWhy, fixLabel, [rerun]);
+    return errorBlock(ctx, "SIGNIN_RATE_LIMITED", DEVICE.rateLimitedWhat, DEVICE.rateLimitedWhy, fixLabel, [rerun]);
 }
 /**
  * RFC 8628 §3.5's loop. The interval is the server's, `slow_down` raises it for good, and every poll is

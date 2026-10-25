@@ -46,7 +46,8 @@
  *
  * @provenance vibecommit-mcp src/read/coverage.ts — the payload shape, retyped
  */
-import { ABSENCE, COMMANDS, ERRORS, HELP, REPORT, SIGNIN, WHY, } from "../copy/index.js";
+import { ABSENCE, COMMANDS, REPORT, SIGNIN, WHY, } from "../copy/index.js";
+import { renderVerbHelp } from "../verb_help.js";
 import { EXIT } from "../exit.js";
 import { currentBranch, gitProbe, isReachable, isShallowClone, resolveRepoSlug } from "../git.js";
 import { emitJson } from "../json.js";
@@ -54,7 +55,8 @@ import { mcpUrl } from "../oauth/discovery.js";
 import { readWithSession } from "../oauth/signin.js";
 import { resolveProjectKey } from "../project.js";
 import { renderErrorBlock, wrap } from "../term.js";
-import { writeLines } from "./context.js";
+import { notAGitRepoBlock, writeFailure, writeLines } from "./context.js";
+import { channelCommand } from "../install.js";
 /** §10.3 indents the body two columns, the same as `why`'s screens. */
 const BODY_INDENT = 2;
 /** One read, one POST. Generous because it contains a server-side join. */
@@ -162,11 +164,16 @@ export function parseArgs(argv) {
 // ---------------------------------------------------------------------------
 // Rendering.
 // ---------------------------------------------------------------------------
-function errorCopy(what, why, fixLabel, fix) {
-    return { what, why: [why], fixLabel, fixes: [fix] };
+function errorCopy(code, what, why, fixLabel, fix) {
+    return { code, what, why: [why], fixLabel, fixes: [fix] };
 }
-function fail(ctx, copy, code) {
-    writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", ...copy }, ctx.colour));
+/**
+ * A failure, written the way the mode wants it: §13.6's block on stderr, or under `--json` ONE failure document on stdout
+ * and nothing on stderr (PR 7). The fix commands go through the install channel, so a plugin-only machine is told
+ * `node <path> report`, not a `vibecommit` it does not have.
+ */
+function fail(ctx, json, copy, code) {
+    writeFailure(ctx, { kind: "bad", ...copy, fixes: copy.fixes.map((fix) => channelCommand(ctx.env, ctx.selfPath, fix)) }, json ? "report" : null);
     return code;
 }
 /**
@@ -180,7 +187,7 @@ function fail(ctx, copy, code) {
  */
 function absence(ctx, what, why, fixLabel, fixes) {
     const block = fixes.length > 0
-        ? { kind: "warn", what, why: [why], fixLabel, fixes }
+        ? { kind: "warn", what, why: [why], fixLabel, fixes: fixes.map((fix) => channelCommand(ctx.env, ctx.selfPath, fix)) }
         : { kind: "warn", what, why: [why] };
     const lines = [...renderErrorBlock(block, ctx.colour)];
     if (fixes.length === 0)
@@ -189,22 +196,22 @@ function absence(ctx, what, why, fixLabel, fixes) {
     return EXIT.empty;
 }
 /** `notAuthorized`'s six outcomes, the same six `why` renders. */
-function notAuthorized(ctx, authorized) {
+function notAuthorized(ctx, json, authorized) {
     switch (authorized.kind) {
         case "no-session":
-            return fail(ctx, errorCopy(WHY.signedOutWhat, WHY.signedOutWhy, WHY.signedOutFix, COMMANDS.signIn), EXIT.notConnected);
+            return fail(ctx, json, errorCopy("NOT_SIGNED_IN", WHY.signedOutWhat, WHY.signedOutWhy, WHY.signedOutFix, COMMANDS.signIn), EXIT.notConnected);
         case "expired":
-            return fail(ctx, errorCopy(SIGNIN.expiredWhat, SIGNIN.expiredWhy, SIGNIN.expiredFix, COMMANDS.signIn), EXIT.notConnected);
+            return fail(ctx, json, errorCopy("SIGNIN_ENDED", SIGNIN.expiredWhat, SIGNIN.expiredWhy, SIGNIN.expiredFix, COMMANDS.signIn), EXIT.notConnected);
         case "busy":
-            return fail(ctx, errorCopy(SIGNIN.busyWhat, SIGNIN.busyWhy, SIGNIN.busyFix, COMMANDS.report), EXIT.failure);
+            return fail(ctx, json, errorCopy("SIGNIN_BUSY", SIGNIN.busyWhat, SIGNIN.busyWhy, SIGNIN.busyFix, COMMANDS.report), EXIT.failure);
         case "unreachable":
-            return fail(ctx, errorCopy(WHY.unreachableWhat, WHY.unreachableWhy, WHY.readFix, COMMANDS.report), EXIT.failure);
+            return fail(ctx, json, errorCopy("RECORD_SERVICE_UNREACHABLE", WHY.unreachableWhat, WHY.unreachableWhy, WHY.readFix, COMMANDS.report), EXIT.failure);
         case "malformed":
         case "ok":
             // `ok` is unreachable by construction — `readWithSession` only wraps a
             // NON-ok outcome. Rendered rather than thrown: a crash here would be a
             // worse answer than an honest failure.
-            return fail(ctx, errorCopy(WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, COMMANDS.report), EXIT.failure);
+            return fail(ctx, json, errorCopy("RECORD_ANSWER_UNREADABLE", WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, COMMANDS.report), EXIT.failure);
     }
 }
 /**
@@ -235,7 +242,8 @@ function coverageScreen(payload, reachable, percent) {
 export async function report(ctx, argv, deps = {}) {
     // `TODOS[184]`. Check-first, before `parseArgs`/anything else. Reads and writes nothing.
     if (argv.includes("--help") || argv.includes("-h")) {
-        writeLines(ctx.stdout, [HELP.commands.report]);
+        const helpVerb = "report"; // an identifier, not a literal, at the writer: `copy-inline-literals` follows argument positions
+        writeLines(ctx.stdout, renderVerbHelp(helpVerb));
         return EXIT.ok;
     }
     // §13.3 — `--json` emits nothing but the JSON document on stdout, and D122 §2
@@ -244,14 +252,14 @@ export async function report(ctx, argv, deps = {}) {
     const json = argv.includes("--json");
     const args = parseArgs(argv);
     if (args === "usage") {
-        return fail(ctx, errorCopy(REPORT.usageWhat, REPORT.usageWhy, REPORT.usageFix, COMMANDS.report), EXIT.usage);
+        return fail(ctx, json, errorCopy("REPORT_NEEDS_SINCE", REPORT.usageWhat, REPORT.usageWhy, REPORT.usageFix, COMMANDS.report), EXIT.usage);
     }
     if (args === "bad-date") {
-        return fail(ctx, errorCopy(REPORT.sinceWhat, REPORT.sinceWhy, REPORT.sinceFix, COMMANDS.report), EXIT.usage);
+        return fail(ctx, json, errorCopy("REPORT_SINCE_UNREADABLE", REPORT.sinceWhat, REPORT.sinceWhy, REPORT.sinceFix, COMMANDS.report), EXIT.usage);
     }
     const projectKey = resolveProjectKey(ctx.cwd);
     if (projectKey === null) {
-        writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", what: ERRORS.notAGitRepo, why: [] }, ctx.colour));
+        writeFailure(ctx, notAGitRepoBlock(ctx), json ? "report" : null);
         return EXIT.failure;
     }
     // ⚠⚠ THE SHALLOW REFUSAL FIRES FIRST, BEFORE THE REF, BEFORE THE LOCAL LOG
@@ -262,18 +270,18 @@ export async function report(ctx, argv, deps = {}) {
     // window"* is a claim the clone cannot support. State 3's sentence is written
     // unqualified precisely because this refusal guarantees it.
     if (isShallowClone(projectKey)) {
-        return fail(ctx, errorCopy(REPORT.shallowWhat, REPORT.shallowWhy, WHY.shallowFix, WHY.shallowFixCommand), EXIT.failure);
+        return fail(ctx, json, errorCopy("SHALLOW_CLONE", REPORT.shallowWhat, REPORT.shallowWhy, WHY.shallowFix, WHY.shallowFixCommand), EXIT.failure);
     }
     const ref = args.ref ?? currentBranch(projectKey);
     if (ref === null) {
-        return fail(ctx, errorCopy(REPORT.refWhat, REPORT.refWhy, REPORT.refFix, COMMANDS.reportRef), EXIT.usage);
+        return fail(ctx, json, errorCopy("REPORT_REF_UNNAMEABLE", REPORT.refWhat, REPORT.refWhy, REPORT.refFix, COMMANDS.reportRef), EXIT.usage);
     }
     // ⚠ THE WINDOW IS A LOCAL FACT, and so are both empty states. `git log`
     // answers "what commits are on this ref in this window" without a server,
     // which is what lets state 3 render before anything is read.
     const log = gitProbe(projectKey, ["log", "--format=%H", `--since=${args.since}`, ref, "--"]);
     if (log === null) {
-        return fail(ctx, errorCopy(REPORT.refWhat, REPORT.refWhy, REPORT.refFix, COMMANDS.reportRef), EXIT.usage);
+        return fail(ctx, json, errorCopy("REPORT_REF_UNNAMEABLE", REPORT.refWhat, REPORT.refWhy, REPORT.refFix, COMMANDS.reportRef), EXIT.usage);
     }
     const windowShas = log.split("\n").filter((line) => line.trim() !== "");
     const window = REPORT.window(args.since);
@@ -306,7 +314,7 @@ export async function report(ctx, argv, deps = {}) {
     }
     const endpoint = mcpUrl(ctx.env);
     if (endpoint === null) {
-        return fail(ctx, errorCopy(SIGNIN.noServerWhat, SIGNIN.noServerRefusedWhy, WHY.readFix, COMMANDS.report), EXIT.failure);
+        return fail(ctx, json, errorCopy("SIGNIN_SERVICE_NOT_FOUND", SIGNIN.noServerWhat, SIGNIN.noServerRefusedWhy, WHY.readFix, COMMANDS.report), EXIT.failure);
     }
     const read = deps.read ?? readWithSession;
     const outcome = await read(endpoint, "commit_coverage", 
@@ -328,25 +336,25 @@ export async function report(ctx, argv, deps = {}) {
 function render(ctx, outcome, projectKey, ref, window, windowCommits, opts) {
     switch (outcome.kind) {
         case "not-authorized":
-            return notAuthorized(ctx, outcome.authorized);
+            return notAuthorized(ctx, opts.json, outcome.authorized);
         case "unauthorized":
-            return fail(ctx, errorCopy(WHY.signedOutWhat, WHY.signedOutWhy, WHY.signedOutFix, COMMANDS.signIn), EXIT.notConnected);
+            return fail(ctx, opts.json, errorCopy("NOT_SIGNED_IN", WHY.signedOutWhat, WHY.signedOutWhy, WHY.signedOutFix, COMMANDS.signIn), EXIT.notConnected);
         case "unreachable":
-            return fail(ctx, errorCopy(WHY.unreachableWhat, WHY.unreachableWhy, WHY.readFix, COMMANDS.report), EXIT.failure);
+            return fail(ctx, opts.json, errorCopy("RECORD_SERVICE_UNREACHABLE", WHY.unreachableWhat, WHY.unreachableWhy, WHY.readFix, COMMANDS.report), EXIT.failure);
         case "rpc-error":
             // ⚠ Never a bare HTTP status or a raw JSON-RPC code on screen (§13.6).
-            return fail(ctx, errorCopy(WHY.serverErrorWhat, WHY.serverErrorWhy, WHY.readFix, COMMANDS.report), EXIT.failure);
+            return fail(ctx, opts.json, errorCopy("RECORD_SERVICE_ERROR", WHY.serverErrorWhat, WHY.serverErrorWhy, WHY.readFix, COMMANDS.report), EXIT.failure);
         case "malformed":
-            return fail(ctx, errorCopy(WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, COMMANDS.report), EXIT.failure);
+            return fail(ctx, opts.json, errorCopy("RECORD_ANSWER_UNREADABLE", WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, COMMANDS.report), EXIT.failure);
         case "ok": {
             // ⚠ `isError` rides the SAME envelope as a success. A caller that only
             // branched on the transport would read a tool failure as a record.
             if (outcome.isError) {
-                return fail(ctx, errorCopy(WHY.serverErrorWhat, WHY.serverErrorWhy, WHY.readFix, COMMANDS.report), EXIT.failure);
+                return fail(ctx, opts.json, errorCopy("RECORD_SERVICE_ERROR", WHY.serverErrorWhat, WHY.serverErrorWhy, WHY.readFix, COMMANDS.report), EXIT.failure);
             }
             const payload = parseCoveragePayload(outcome.document);
             if (payload === null) {
-                return fail(ctx, errorCopy(WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, COMMANDS.report), EXIT.failure);
+                return fail(ctx, opts.json, errorCopy("RECORD_ANSWER_UNREADABLE", WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, COMMANDS.report), EXIT.failure);
             }
             return renderPayload(ctx, payload, projectKey, ref, window, windowCommits, opts);
         }
@@ -390,7 +398,7 @@ function renderPayload(ctx, payload, projectKey, ref, window, windowCommits, opt
         // unreachable would DEFLATE the rate and present a smaller number as a
         // complete one, which is D98's class on the number that matters most.
         if (answer === null) {
-            return fail(ctx, errorCopy(REPORT.unknownReachabilityWhat, REPORT.unknownReachabilityWhy, REPORT.unknownReachabilityFix, WHY.shallowFixCommand), EXIT.failure);
+            return fail(ctx, opts.json, errorCopy("REPORT_REACHABILITY_UNKNOWN", REPORT.unknownReachabilityWhat, REPORT.unknownReachabilityWhy, REPORT.unknownReachabilityFix, WHY.shallowFixCommand), EXIT.failure);
         }
         if (answer)
             reachable += 1;
@@ -403,7 +411,7 @@ function renderPayload(ctx, payload, projectKey, ref, window, windowCommits, opt
         // The payload disagrees with the clone about its own totals. A rate over
         // 100% is not a number to print, and clamping it would hide the disagreement
         // behind a plausible figure.
-        return fail(ctx, errorCopy(WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, COMMANDS.report), EXIT.failure);
+        return fail(ctx, opts.json, errorCopy("RECORD_ANSWER_UNREADABLE", WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, COMMANDS.report), EXIT.failure);
     }
     const percent = Math.round((numerator / payload.edgesHeld) * 100);
     // §13.3 — the machine surface, and THE ONE PLACE THE GRADE MIX IS READABLE AS

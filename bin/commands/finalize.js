@@ -34,19 +34,22 @@
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_AGENT_ID, admitsTranscript, transcriptRoots } from "../agents/registry.js";
-import { ERRORS, FINALIZE, HELP } from "../copy/index.js";
-import { isProjectAllowed } from "../consent.js";
+import { BACKFILL, COMMANDS, ERRORS, FINALIZE } from "../copy/index.js";
+import { renderVerbHelp } from "../verb_help.js";
+import { isCaptureAllowed } from "../consent.js";
+import { authCommandFor, channelCommand, connectCommandFor } from "../install.js";
 import { loadCredential } from "../credential.js";
 import { EXIT } from "../exit.js";
-import { headRef, resolveRepoSlug } from "../git.js";
-import { confinementRoots, deliverSubagents, fileSize, readSpan, sendTimeoutMs, wait } from "../hooks/entry.js";
+import { headRef, onceRepoSlug } from "../git.js";
+import { confinementRoots, deliverSubagents, fileSize, readSpan, recordCutter, sendTimeoutMs, wait } from "../hooks/entry.js";
 import { repoSessionsDir, sessionStatePath } from "../paths.js";
 import { deliver, ingestUrl } from "../post.js";
 import { resolveProjectKeys } from "../project.js";
 import { capInferred, capSpool, capSuccessors, deleteInferredSpool, inferredFullyResolved, readInferred, readRewrites, readSpool } from "../spool.js";
 import { fileState, loadSessionState, saveSessionState } from "../state.js";
 import { renderErrorBlock, wrap } from "../term.js";
-import { writeLines } from "./context.js";
+import { notAGitRepoBlock, writeFailure, writeLines } from "./context.js";
+import { credentialProblem } from "./credential_problem.js";
 /** A transcript modified this recently is a session still being written. */
 const STILL_WRITING_MS = 5_000;
 /** `--latest` considers sessions that delivered inside this window. */
@@ -99,32 +102,61 @@ export async function finalize(ctx, argv) {
     // seal call, the drain loop, every exit code and receipt string) is byte-identical to 0.4.4 for any
     // `argv` that does not literally contain `--help`/`-h` (pinned by T10's differential).
     if (argv.includes("--help") || argv.includes("-h")) {
-        writeLines(ctx.stdout, [HELP.commands.finalize]);
+        const helpVerb = "finalize"; // an identifier, not a literal, at the writer: `copy-inline-literals` follows argument positions
+        writeLines(ctx.stdout, renderVerbHelp(helpVerb));
         return EXIT.ok;
     }
     const args = parseArgs(argv);
     if (args === null) {
-        writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", what: FINALIZE.needTarget, why: [] }, ctx.colour));
+        writeLines(ctx.stderr, renderErrorBlock({
+            kind: "bad",
+            code: "FINALIZE_NEEDS_TARGET",
+            what: FINALIZE.needTarget,
+            why: [],
+            fixLabel: FINALIZE.needTargetFix,
+            fixes: [FINALIZE.commandSessionAny, COMMANDS.finalize].map((fix) => channelCommand(ctx.env, ctx.selfPath, fix)),
+        }, ctx.colour));
         return EXIT.usage;
     }
     const keys = resolveProjectKeys(ctx.cwd);
     if (keys === null) {
-        writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", what: ERRORS.notAGitRepo, why: [] }, ctx.colour));
+        writeFailure(ctx, notAGitRepoBlock(ctx));
         return EXIT.failure;
     }
     const projectKey = keys.worktree;
-    if (!isProjectAllowed(ctx.home, keys.consent)) {
-        writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", what: ERRORS.notConnected, why: [] }, ctx.colour));
+    const slugOf = onceRepoSlug(projectKey);
+    if (!isCaptureAllowed(ctx.home, keys, slugOf)) {
+        // "This repository is not allowed to be captured": the repo's own consent, not the machine's credential.
+        writeLines(ctx.stderr, renderErrorBlock({
+            kind: "bad",
+            code: "NOT_CONNECTED",
+            what: ERRORS.notConnected,
+            why: [],
+            fixLabel: ERRORS.notConnectedFix,
+            fixes: [connectCommandFor(ctx.env, ctx.selfPath)],
+        }, ctx.colour));
         return EXIT.notConnected;
     }
     const load = loadCredential({ env: ctx.env, home: ctx.home });
     if (load.kind !== "ok") {
-        writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", what: ERRORS.notConnected, why: [] }, ctx.colour));
+        // PR 7 (Q1): a credential that is PRESENT but unusable gets the precise block `status`, `connect` and `backfill` print
+        // (the exit stays 3); no credential at all is `NO_CREDENTIAL`. A credential the SERVER rejects loads `ok` and reaches the
+        // send, so it is not here — and no local "known rejected" check is added (that would turn exit 1 into exit 3).
+        writeLines(ctx.stderr, load.kind === "absent"
+            ? renderErrorBlock({
+                kind: "bad",
+                code: "NO_CREDENTIAL",
+                what: BACKFILL.notConnectedWhat,
+                why: [],
+                fixLabel: BACKFILL.notConnectedFixLabel,
+                fixes: [connectCommandFor(ctx.env, ctx.selfPath)],
+            }, ctx.colour)
+            : credentialProblem(load, ctx.colour, authCommandFor(ctx.env, ctx.selfPath)));
         return EXIT.notConnected;
     }
     const url = ingestUrl(ctx.env);
     if (url === null) {
-        writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", what: FINALIZE.notDelivered, why: [] }, ctx.colour));
+        writeLines(ctx.stderr, ingestUrlUnavailableBlock(ctx));
         return EXIT.failure;
     }
     // ── Which session. ──
@@ -132,7 +164,7 @@ export async function finalize(ctx, argv) {
     let sessionId;
     if (args.session !== null) {
         if (!SESSION_ID.test(args.session)) {
-            writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", what: FINALIZE.badSessionId, why: [] }, ctx.colour));
+            writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", code: "FINALIZE_BAD_SESSION_ID", what: FINALIZE.badSessionId, why: [] }, ctx.colour));
             return EXIT.usage;
         }
         sessionId = args.session;
@@ -140,11 +172,25 @@ export async function finalize(ctx, argv) {
     else {
         const recent = recentSessions(ctx.home, projectKey, nowMs);
         if (recent.length === 0) {
-            writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", what: FINALIZE.noRecentSession, why: [] }, ctx.colour));
+            writeLines(ctx.stderr, renderErrorBlock({
+                kind: "bad",
+                code: "FINALIZE_NO_RECENT_SESSION",
+                what: FINALIZE.noRecentSession,
+                why: [],
+                fixLabel: FINALIZE.noRecentSessionFix,
+                fixes: [channelCommand(ctx.env, ctx.selfPath, FINALIZE.commandSessionAny)],
+            }, ctx.colour));
             return EXIT.usage;
         }
         if (recent.length > 1) {
-            writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", what: FINALIZE.severalRecent, why: recent.map((r) => FINALIZE.recentRow(r.id, Math.round((nowMs - r.at) / 60000))) }, ctx.colour));
+            writeLines(ctx.stderr, renderErrorBlock({
+                kind: "bad",
+                code: "FINALIZE_SEVERAL_RECENT",
+                what: FINALIZE.severalRecent,
+                why: recent.map((r) => FINALIZE.recentRow(r.id, Math.round((nowMs - r.at) / 60000))),
+                fixLabel: FINALIZE.severalRecentFix,
+                fixes: [channelCommand(ctx.env, ctx.selfPath, FINALIZE.commandSessionAny)],
+            }, ctx.colour));
             return EXIT.usage;
         }
         sessionId = recent[0].id;
@@ -152,17 +198,24 @@ export async function finalize(ctx, argv) {
     // ── The session must be one THIS repo captured (it has a state file here) and its transcript must be findable inside the agent's own root. ──
     const state = sessionStatePath(ctx.home, { repoKey: projectKey, sessionId });
     if (state === null || !existsSync(state)) {
-        writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", what: FINALIZE.unknownSession(sessionId), why: [] }, ctx.colour));
+        writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", code: "FINALIZE_UNKNOWN_SESSION", what: FINALIZE.unknownSession(sessionId), why: [] }, ctx.colour));
         return EXIT.usage;
     }
     const transcriptPath = findTranscript(ctx.home, ctx.env, sessionId);
     if (transcriptPath === null) {
-        writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", what: FINALIZE.transcriptMissing(sessionId), why: [] }, ctx.colour));
+        writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", code: "FINALIZE_TRANSCRIPT_MISSING", what: FINALIZE.transcriptMissing(sessionId), why: [] }, ctx.colour));
         return EXIT.failure;
     }
     try {
         if (!args.force && nowMs - statSync(transcriptPath).mtimeMs < STILL_WRITING_MS) {
-            writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", what: FINALIZE.stillWriting, why: [] }, ctx.colour));
+            writeLines(ctx.stderr, renderErrorBlock({
+                kind: "bad",
+                code: "FINALIZE_STILL_WRITING",
+                what: FINALIZE.stillWriting,
+                why: [],
+                fixLabel: FINALIZE.stillWritingFix,
+                fixes: [channelCommand(ctx.env, ctx.selfPath, FINALIZE.commandSessionForce(sessionId))],
+            }, ctx.colour));
             return EXIT.usage;
         }
     }
@@ -177,64 +230,193 @@ export async function finalize(ctx, argv) {
     // the session necessarily has a state file (required above), so a first-turn commit was promoted by the first
     // `Stop` that wrote one. Promoting from this verb would add a second call site to a function whose only call site
     // is a pinned property (`post-commit-spool.test.ts`, D208): a dead session must never reach it.
-    const spoolKey = { repoKey: projectKey, sessionId };
-    const spooled = capSpool(readSpool(ctx.home, spoolKey));
-    const rewritten = capSuccessors(readRewrites(ctx.home, spoolKey));
-    const inferred = capInferred(readInferred(ctx.home, spoolKey)); // `TODOS[177]`
-    const redactionRoots = confinementRoots(keys);
-    const repoSlug = resolveRepoSlug(projectKey);
-    const hookEnv = {
-        env: ctx.env,
+    const closed = await closeSession({
         home: ctx.home,
+        env: ctx.env,
         nodeVersion: ctx.nodeVersion,
         agentId: ctx.agentId ?? DEFAULT_AGENT_ID,
-        readStdin: async () => "",
-    };
-    const input = { sessionId, transcriptPath, cwd: ctx.cwd, eventName: "Stop" };
-    const startedAt = Date.now();
-    await deliverSubagents({
-        ctx: hookEnv,
-        input,
+        cwd: ctx.cwd,
         url,
         credential: load.credential,
         projectKey,
-        redactionRoots,
-        repoSlug,
-        startedAt,
-        sendBudget: SEND_BUDGET_MS,
-        byHook: false,
+        redactionRoots: confinementRoots(keys),
+        repoSlug: slugOf(),
+        sessionId,
+        transcriptPath,
+        eof,
+        seal: true,
+        allowNeverCaptured: false,
+        completeSubagents: false,
     });
+    // ── What the server said. ──
+    if (closed.kind === "stopped") {
+        writeLines(ctx.stderr, renderErrorBlock({
+            kind: "bad",
+            code: "CREDENTIAL_REJECTED",
+            what: FINALIZE.credentialStopped,
+            why: [],
+            fixLabel: FINALIZE.credentialStoppedFix,
+            fixes: [authCommandFor(ctx.env, ctx.selfPath)],
+        }, ctx.colour));
+        return EXIT.failure;
+    }
+    if (closed.kind === "sealed" || closed.kind === "already") {
+        writeLines(ctx.stdout, wrap(closed.kind === "sealed" ? FINALIZE.closed(sessionId) : FINALIZE.alreadyClosed(sessionId), 2));
+        if (closed.setAsidePairs > 0)
+            writeLines(ctx.stderr, wrap(FINALIZE.inferredSetAside(closed.setAsidePairs), 2));
+        return EXIT.ok;
+    }
+    if (closed.kind === "refused") {
+        writeLines(ctx.stderr, renderErrorBlock({
+            kind: "bad",
+            code: "FINALIZE_REFUSED",
+            what: FINALIZE.refused,
+            why: [],
+            fixLabel: FINALIZE.retryFix,
+            fixes: [channelCommand(ctx.env, ctx.selfPath, FINALIZE.commandSession(sessionId))],
+        }, ctx.colour));
+        return EXIT.failure;
+    }
+    if (closed.kind === "unacknowledged") {
+        // 2xx and no acknowledgement: an older server. Delivered, NOT closed — and the exit code says so.
+        writeLines(ctx.stderr, renderErrorBlock({ kind: "warn", what: FINALIZE.notAcknowledged, why: [] }, ctx.colour));
+        return EXIT.unacknowledged;
+    }
+    // Anything else did not deliver (`not-delivered`; `finalize` never asks for the outcomes only a backfill can get).
+    writeLines(ctx.stderr, renderErrorBlock({
+        kind: "bad",
+        code: "DELIVERY_FAILED",
+        what: FINALIZE.notDelivered,
+        why: [],
+        fixLabel: FINALIZE.retryFix,
+        fixes: [channelCommand(ctx.env, ctx.selfPath, FINALIZE.commandSession(sessionId))],
+    }, ctx.colour));
+    return EXIT.failure;
+}
+/**
+ * PR 7 (Q2): the ingest address in the environment is one this client refuses to send to. Shared with `backfill`, which
+ * stops on the same condition. The fix names the variable to correct or unset — retrying cannot help.
+ */
+export function ingestUrlUnavailableBlock(ctx) {
+    return renderErrorBlock({
+        kind: "bad",
+        code: "INGEST_URL_UNAVAILABLE",
+        what: FINALIZE.ingestUrlWhat,
+        why: [FINALIZE.ingestUrlWhy],
+        fixLabel: FINALIZE.ingestUrlFix,
+        fixes: [FINALIZE.ingestUrlCommand],
+    }, ctx.colour);
+}
+/** Rounds of `deliverSubagents` a complete close will make: eight files each, so 512 streams. A bound, not a goal. */
+const SUBAGENT_ROUNDS_MAX = 64;
+/** A delivery the failure policy KEPT the bytes of — the only kind that blocks the main stream (a `never` advanced past its span). */
+function blocksMain(delivery) {
+    if (delivery.kind === "stopped")
+        return true;
+    return delivery.kind === "attempted" && (delivery.disposition === "later" || delivery.disposition === "fatal");
+}
+/**
+ * Close ONE session: sub-agent streams first, then the main stream, then (when `seal`) the assertion and the bounded drain.
+ *
+ * Extracted from `finalize` (design review D5 · A) so that `vibecommit backfill` closes an old session exactly the way the
+ * verb that asserts a session is over does. A second copy of this order would be a second place for "sub-agents first" to be
+ * forgotten, and the seal it ends in cannot be reopened.
+ *
+ * It PRINTS nothing and reads no flag: `finalize` and `backfill` each turn the outcome into their own words and exit codes.
+ */
+export async function closeSession(input) {
+    const { home, env, url, credential, projectKey, redactionRoots, repoSlug, sessionId, transcriptPath, eof } = input;
+    const spoolKey = { repoKey: projectKey, sessionId };
+    if (!input.allowNeverCaptured) {
+        const state = sessionStatePath(home, spoolKey);
+        if (state === null || !existsSync(state))
+            return { kind: "never-captured" };
+    }
+    const spooled = capSpool(readSpool(home, spoolKey));
+    const rewritten = capSuccessors(readRewrites(home, spoolKey));
+    const inferred = capInferred(readInferred(home, spoolKey)); // `TODOS[177]`
+    const hookEnv = {
+        env,
+        home,
+        nodeVersion: input.nodeVersion,
+        agentId: input.agentId,
+        readStdin: async () => "",
+    };
+    const hookInput = { sessionId, transcriptPath, cwd: input.cwd, eventName: "Stop" };
+    const budget = input.sendBudgetMs ?? SEND_BUDGET_MS;
+    let startedAt = Date.now();
+    if (!input.completeSubagents) {
+        await deliverSubagents({
+            ctx: hookEnv,
+            input: hookInput,
+            url,
+            credential,
+            projectKey,
+            redactionRoots,
+            repoSlug,
+            startedAt,
+            sendBudget: budget,
+            byHook: false,
+        });
+    }
+    else {
+        for (let round = 0; round < SUBAGENT_ROUNDS_MAX; round += 1) {
+            const sent = await deliverSubagents({
+                ctx: hookEnv,
+                input: hookInput,
+                url,
+                credential,
+                projectKey,
+                redactionRoots,
+                repoSlug,
+                // A fresh budget each round: one round stops at the hook-sized budget with files left, and that is not a failure here.
+                startedAt: Date.now(),
+                sendBudget: budget,
+                byHook: false,
+            });
+            const blocked = sent.deliveries.find(blocksMain);
+            if (blocked !== undefined)
+                return { kind: "subagents-held", delivery: blocked };
+            // No delivery in a round with a fresh budget means no stream had bytes pending.
+            if (sent.deliveries.length === 0)
+                break;
+        }
+        // The main stream's clock starts HERE. Rounds of sub-agent sends can take longer than one budget, and a clock that began before
+        // them would hand the main deltas the minimum timeout and end them `later` (PR 5 review). `finalize`'s single pass keeps
+        // the clock it always had.
+        startedAt = Date.now();
+    }
     const delivery = await deliver({
-        home: ctx.home,
-        env: ctx.env,
+        home,
+        env,
         url,
-        credential: load.credential,
+        credential,
         repoKey: projectKey,
         repoSlug,
         sessionId,
         fileKey: "main",
         transcriptPath,
-        timeoutMs: sendTimeoutMs(SEND_BUDGET_MS, Date.now() - startedAt),
+        timeoutMs: sendTimeoutMs(budget, Date.now() - startedAt),
         nowMs: Date.now(),
         head: headRef(projectKey),
         commits: spooled,
         rewrites: rewritten.pairs,
         inferredRewrites: inferred.pairs,
         inferredGroups: inferred.groups,
-        final: true,
+        ...(input.seal ? { final: true } : {}),
         byHook: false,
-    }, eof, (from, to) => readSpan(transcriptPath, from, to, redactionRoots, ctx.home, ctx.env));
-    // ── What the server said. ──
-    if (delivery.kind === "stopped") {
-        writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", what: FINALIZE.credentialStopped, why: [] }, ctx.colour));
-        return EXIT.failure;
+    }, eof, (from, to) => readSpan(transcriptPath, from, to, redactionRoots, home, env), recordCutter(transcriptPath));
+    if (delivery.kind === "stopped")
+        return { kind: "stopped" };
+    if (!input.seal) {
+        return delivery.kind === "nothing-to-send" || (delivery.kind === "attempted" && delivery.disposition === "ok")
+            ? { kind: "delivered", delivery }
+            : { kind: "not-delivered", delivery };
     }
-    if (delivery.kind !== "attempted" || delivery.disposition !== "ok") {
-        writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", what: FINALIZE.notDelivered, why: [] }, ctx.colour));
-        return EXIT.failure;
-    }
+    if (delivery.kind !== "attempted" || delivery.disposition !== "ok")
+        return { kind: "not-delivered", delivery };
     if (delivery.finalAck === "sealed" || delivery.finalAck === "already") {
-        clearDeliveredHold(ctx.home, spoolKey);
+        clearDeliveredHold(home, spoolKey);
         // ⭐ `TODOS[177]` follow-up (VL, 2026-10-08) — DRAIN what the first delivery's caps left spooled. A session
         // over 16 exact pairs or 64 inferred pairs (one squash of 64 is already the server's own cap; several
         // squashes in one session is what overflows this) would otherwise leave the rest spooled FOREVER: nobody
@@ -255,10 +437,10 @@ export async function finalize(ctx, argv) {
         // to `FINALIZE_DRAIN_MAX_ITERATIONS` pointless empty-list requests, with the backoff delays above making
         // each one slower rather than faster to give up on (the ack is an explicit `0`, never `null`, so the
         // existing "absent ack, stop asking" guard below never fires either).
-        const lean = fileState(loadSessionState(ctx.home, spoolKey), "main").lean;
+        const lean = fileState(loadSessionState(home, spoolKey), "main").lean;
         for (let i = 0; !lean && i < FINALIZE_DRAIN_MAX_ITERATIONS; i += 1) {
-            const moreRewritten = capSuccessors(readRewrites(ctx.home, spoolKey));
-            const moreInferred = capInferred(readInferred(ctx.home, spoolKey));
+            const moreRewritten = capSuccessors(readRewrites(home, spoolKey));
+            const moreInferred = capInferred(readInferred(home, spoolKey));
             if (moreRewritten.pairs.length === 0 && moreInferred.pairs.length === 0)
                 break;
             const groupId = moreInferred.groups.length > 0 ? `${moreInferred.groups[0].successor}:${moreInferred.groups[0].patchId}` : null;
@@ -266,16 +448,16 @@ export async function finalize(ctx, argv) {
                 await wait(FINALIZE_DRAIN_BACKOFF_MS[backoffStreak - 1]);
             }
             const drain = await deliver({
-                home: ctx.home,
-                env: ctx.env,
+                home: home,
+                env: env,
                 url,
-                credential: load.credential,
+                credential: credential,
                 repoKey: projectKey,
                 repoSlug,
                 sessionId,
                 fileKey: "main",
                 transcriptPath,
-                timeoutMs: sendTimeoutMs(SEND_BUDGET_MS, Date.now() - startedAt),
+                timeoutMs: sendTimeoutMs(budget, Date.now() - startedAt),
                 nowMs: Date.now(),
                 head: headRef(projectKey),
                 rewrites: moreRewritten.pairs,
@@ -283,7 +465,7 @@ export async function finalize(ctx, argv) {
                 inferredGroups: moreInferred.groups,
                 final: true,
                 byHook: false,
-            }, eof, (from, to) => readSpan(transcriptPath, from, to, redactionRoots, ctx.home, ctx.env));
+            }, eof, (from, to) => readSpan(transcriptPath, from, to, redactionRoots, home, env), recordCutter(transcriptPath));
             if (drain.kind !== "attempted" || drain.disposition !== "ok")
                 break;
             setAsidePairs += drain.inferredSetAsidePairs;
@@ -316,20 +498,13 @@ export async function finalize(ctx, argv) {
         // ⛔⛔ Fine to delete AFTER `setAsidePairs` is computed above, NEVER before (VL, 2026-10-08, VG's silent-loss
         // finding B1): `setAsidePairs` is read from `deliver()`'s own return values — which were captured before this
         // point — not re-derived from the spool afterward, which is the file this line is about to delete.
-        if (inferredFullyResolved(ctx.home, spoolKey))
-            deleteInferredSpool(ctx.home, spoolKey);
-        writeLines(ctx.stdout, wrap(delivery.finalAck === "sealed" ? FINALIZE.closed(sessionId) : FINALIZE.alreadyClosed(sessionId), 2));
-        if (setAsidePairs > 0)
-            writeLines(ctx.stderr, wrap(FINALIZE.inferredSetAside(setAsidePairs), 2));
-        return EXIT.ok;
+        if (inferredFullyResolved(home, spoolKey))
+            deleteInferredSpool(home, spoolKey);
+        return { kind: delivery.finalAck, delivery, setAsidePairs };
     }
-    if (delivery.finalAck === "refused") {
-        writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", what: FINALIZE.refused, why: [] }, ctx.colour));
-        return EXIT.failure;
-    }
-    // 2xx and no acknowledgement: an older server. Delivered, NOT closed — and the exit code says so.
-    writeLines(ctx.stderr, renderErrorBlock({ kind: "warn", what: FINALIZE.notAcknowledged, why: [] }, ctx.colour));
-    return EXIT.unacknowledged;
+    if (delivery.finalAck === "refused")
+        return { kind: "refused", delivery };
+    return { kind: "unacknowledged", delivery };
 }
 /** Sessions of this repo whose state file was touched in the last 24 h, newest first. */
 function recentSessions(home, repoKey, nowMs) {

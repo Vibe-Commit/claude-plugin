@@ -7,9 +7,10 @@
  * `commands/connect.ts`'s own `findCurrentTranscript` verbatim except for the
  * confinement call, which now runs against the registry's union.
  */
-import { readdirSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
-import { claudeSettingsPath, isInside, isTranscriptFile, transcriptRoot } from "../paths.js";
+import { claudeConfigPath, claudeSettingsPath, isInside, isTranscriptFile, transcriptRoot, } from "../paths.js";
+import { readEntries, sessionFile, subdirectories } from "./session_listing.js";
 /**
  * The client-side backstop, per event.
  *
@@ -39,15 +40,65 @@ const CLAUDE_REGISTERED_STOP_MS = 8_000;
 const CLAUDE_REGISTERED_PRECOMPACT_MS = 8_000;
 const CLAUDE_REGISTERED_SESSION_END_MS = 10_000;
 /**
+ * `SessionStart` reuses `Stop`'s two clocks and has no fast path of its own.
+ *
+ * ⛔ **A logged shortcut** — gstack-shortcut(dec-e650afbf), eng review D7 · B,
+ * Alexander's choice over a 1.5 s cap. The ceiling: a hung `SessionStart` can
+ * hold a session's start up by as long as the REGISTERED timeout (8 s here).
+ * Upgrade when a measurement or a user report shows session-start delay, or
+ * before slice 2's grants fetch is built into this handler.
+ */
+const CLAUDE_REGISTERED_SESSION_START_MS = CLAUDE_REGISTERED_STOP_MS; // gstack-shortcut(dec-e650afbf)
+/**
+ * The longest folder name Claude Code writes verbatim.
+ *
+ * ⛔ **MEASURED (Open Question 3, VS, 2026-10-24).** An encoded path that would
+ * pass 200 characters is cut to 200, then `-`, then 6 hash characters (a
+ * measured name was 207 long, `…-x911fg`). The hash is not invertible from here,
+ * so such a folder cannot be matched to a path — and so a name LONGER than this
+ * is always a hashed one, since a verbatim name never exceeds it.
+ */
+export const CLAUDE_NAME_LIMIT = 200;
+/**
+ * The folder name Claude Code gives a project path — Open Question 3.
+ *
+ * ⛔ **EVERY UTF-16 CODE UNIT OUTSIDE `[A-Za-z0-9]` BECOMES ONE `-`.** Measured by
+ * running throwaway sessions in folders named with `. _`, a space, `@ + ~ ( ) ' =
+ * , # % &`, `é` and an emoji: all of them, and the emoji TWICE, because the
+ * regular expression below runs over code units (no `u` flag) and an emoji is
+ * two. Runs do NOT collapse (`501/-Users` gave `501--Users`), a literal `-` stays
+ * itself, case is kept, and a leading `/` gives a leading `-`.
+ *
+ * ⚠ **This replaces `/[/.]/g`, which was the rule the first version of
+ * `locateCurrentTranscript` derived from 17 folders none of which held anything
+ * else.** For a repo whose path held an `_` or a space, `connect`'s test capture
+ * looked in a folder that does not exist and skipped the beat (a 0.6.x defect;
+ * `test/scan-encodings.test.ts` carries its regression cell).
+ *
+ * ⚠ **It returns the FULL encoding even past the limit**, and the callers decide
+ * what that means: `locateCurrentTranscript` cannot find a hashed folder, and the
+ * scan's walk compares PREFIXES of a name that is itself at most the limit, so a
+ * longer prefix simply never matches. One function, no second spelling of the rule.
+ */
+export function encodeProjectPath(path) {
+    return path.replace(/[^A-Za-z0-9]/g, "-");
+}
+/** Is this folder name one Claude Code cut and hashed? See `CLAUDE_NAME_LIMIT`. */
+export function isHashedProjectName(name) {
+    return name.length > CLAUDE_NAME_LIMIT;
+}
+/**
  * The transcript for the session running right now.
  *
  * A hook is HANDED `transcript_path` on stdin. `connect` is typed by a human and
  * gets nothing, so it has to find one: Claude Code stores transcripts at
  * `<transcriptRoot>/<encoded-project-path>/<session-id>.jsonl`, where the
- * encoding replaces `/` and `.` with `-`. That was derived by comparing every
- * directory on this machine against the `cwd` its transcripts record — 15 of 17
- * matched exactly, and both misses were sessions whose `cwd` MOVED mid-session,
- * not a different encoding.
+ * encoding is `encodeProjectPath` above. The first version of that was derived
+ * by comparing every directory on this machine against the `cwd` its transcripts
+ * record — 15 of 17 matched exactly, and both misses were sessions whose `cwd`
+ * MOVED mid-session, not a different encoding. ⚠ Seventeen folders cannot
+ * contain a character none of them had: see `encodeProjectPath` for what that
+ * assumption cost.
  *
  * Which is also why this looks up the directory for THIS project rather than
  * taking the newest transcript anywhere: a session that started in another
@@ -70,7 +121,13 @@ const CLAUDE_REGISTERED_SESSION_END_MS = 10_000;
  */
 function locateCurrentTranscript(home, env, projectKey) {
     const root = transcriptRoot(home, env);
-    const dir = join(root, projectKey.replace(/[/.]/g, "-"));
+    const name = encodeProjectPath(projectKey);
+    // A hashed folder name cannot be derived from the path, so there is nothing to
+    // look in. `connect` then skips the test-capture beat, as it does for an agent
+    // with no locator, rather than guessing a sibling.
+    if (isHashedProjectName(name))
+        return null;
+    const dir = join(root, name);
     let entries;
     try {
         entries = readdirSync(dir);
@@ -129,6 +186,70 @@ function claudeSessionIdFromEnv(env) {
     const value = raw.trim();
     return value === "" ? null : value;
 }
+/**
+ * The folders Claude Code has recorded running in: the KEYS of `~/.claude.json`'s
+ * `projects` map, and nothing else.
+ *
+ * ⛔ **Keys only.** The file also holds account and onboarding state, none of
+ * which this client has any use for. Nothing but the key strings leaves this
+ * function, and a failure of any kind is an empty list: the signal then simply
+ * does not fire, which skips less. ⚠ **No error is ever surfaced or logged** — Node
+ * 22's `JSON.parse` message quotes the text it failed on, and this file is not
+ * one whose text belongs on a screen.
+ */
+function recordedProjectPaths(home, env) {
+    try {
+        const parsed = JSON.parse(readFileSync(claudeConfigPath(home, env), "utf8"));
+        const projects = typeof parsed === "object" && parsed !== null
+            ? parsed.projects
+            : undefined;
+        return typeof projects === "object" && projects !== null ? Object.keys(projects) : [];
+    }
+    catch {
+        return [];
+    }
+}
+/**
+ * Claude Code's sessions, by folder — `D11 · A`, `scan`.
+ *
+ * `<root>/<encoded path>/<session-id>.jsonl`. Only the files DIRECTLY in a
+ * project folder are sessions: `<session-id>/subagents/…` holds delegated work
+ * that belongs to a parent session (`CR-124`), and counting it would turn one
+ * session into several. A legacy `agent-*.jsonl` sidechain at this level is
+ * excluded for the same reason.
+ *
+ * ⛔ **Names and times only.** The folder name is returned still ENCODED; whether
+ * it resolves to a path is the scan engine's walk, against the filesystem, never
+ * against a transcript's own `cwd` record (D60 §D6).
+ */
+function claudeSessionSource(home, env) {
+    const root = transcriptRoot(home, env);
+    const folders = [];
+    try {
+        for (const folder of subdirectories(root)) {
+            const sessions = [];
+            for (const entry of readEntries(folder.path) ?? []) {
+                if (!entry.name.endsWith(".jsonl") || entry.name.startsWith("agent-"))
+                    continue;
+                const session = sessionFile(join(folder.path, entry.name));
+                if (session !== null)
+                    sessions.push(session);
+            }
+            if (sessions.length > 0)
+                folders.push({ name: folder.name, sessions });
+        }
+    }
+    catch {
+        return { kind: "unreadable", reason: "unreadable" };
+    }
+    return {
+        kind: "folders",
+        folders,
+        encode: encodeProjectPath,
+        isHashed: isHashedProjectName,
+        recorded: recordedProjectPaths(home, env),
+    };
+}
 export const CLAUDE_CODE = {
     id: "claude-code",
     transport: "ndjson",
@@ -143,7 +264,12 @@ export const CLAUDE_CODE = {
     // agent the client was built for. Declared explicitly rather than defaulted so
     // that a dialect added later must ANSWER the question; a default would let a
     // camelCase agent inherit Claude's spellings and match nothing (`CR-195`).
-    eventNames: { Stop: "Stop", PreCompact: "PreCompact", SessionEnd: "SessionEnd" },
+    eventNames: {
+        Stop: "Stop",
+        PreCompact: "PreCompact",
+        SessionEnd: "SessionEnd",
+        SessionStart: "SessionStart",
+    },
     // ⛔ `~/.claude/settings.json`, honouring `CLAUDE_CONFIG_DIR`. ⚠ This is the
     // file the PLUGIN path does not need — the plugin ships its own `hooks.json`
     // — and the npm path had no writer at all, which is the defect `/install`
@@ -162,12 +288,19 @@ export const CLAUDE_CODE = {
             registeredTimeoutMs: CLAUDE_REGISTERED_SESSION_END_MS,
             clientBudgetMs: CLAUDE_CLIENT_BUDGET_MS,
         },
+        // MEASURED (Open Question 1, 2.1.309): fires before the first prompt in `-p`
+        // and the TUI, and accepts `systemMessage`. gstack-shortcut(dec-e650afbf).
+        SessionStart: {
+            registeredTimeoutMs: CLAUDE_REGISTERED_SESSION_START_MS,
+            clientBudgetMs: CLAUDE_CLIENT_BUDGET_MS,
+        },
     },
     // `<session>/subagents/agent-*.jsonl`, globbed — the paths are never handed
     // over. `CR-124`, D76.
     delegatedTranscripts: "discover",
     redaction: "claude-code",
     sessionIdFromEnv: claudeSessionIdFromEnv,
+    sessionSource: claudeSessionSource,
     locateCurrentTranscript,
 };
 //# sourceMappingURL=claude_code.js.map

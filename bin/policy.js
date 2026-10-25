@@ -55,6 +55,11 @@ export const STATUS_CLASSES = new Map([
     // Org approval pending (D60 §D12). Capture has not stopped; it is waiting.
     [403, "later"],
     // Payload too large. Retrying the same bytes cannot work.
+    //
+    // ⚠ PR 4a: this row is now the verdict on a span that CANNOT BE SPLIT — a single record that alone exceeds a limit.
+    // `deliver()` halves a splittable span at a record boundary and sends the two halves, which are different bytes, so the
+    // reason above still holds for what reaches this table. Only a `deliver()` given no `RecordCutter` (a caller that
+    // cannot align) classifies a 413 here directly, and it is `never` there exactly as before.
     [413, "never"],
     // Rate limited. The definition of transient.
     [429, "later"],
@@ -149,6 +154,48 @@ function positiveOr(raw, fallback) {
         return fallback;
     const parsed = Number(raw);
     return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+// ---------------------------------------------------------------------------
+// Delta sizing — PR 4a. One request carries one DELTA, never the whole span to EOF.
+// ---------------------------------------------------------------------------
+/**
+ * The most RAW transcript bytes one delta carries. The server's own ceiling is 16 MiB decompressed
+ * (`MAX_DELTA_BYTES`, `ingest_session.ts:146`); half of it leaves room for redaction markers and for a record that
+ * straddles the cut.
+ */
+export const MAX_DELTA_RAW_BYTES = 8 * 1024 * 1024;
+/**
+ * The most COMPRESSED bytes one delta's frame may be. The server refuses a request body over 1 MiB (`MAX_BODY_BYTES`,
+ * `src/transport/server.ts:115`, a 413); 960 KiB leaves the rest for the framing the body does not include.
+ */
+export const MAX_DELTA_FRAME_BYTES = 960 * 1024;
+/**
+ * Cut the next delta from `from`: everything to `eof` when it fits, else up to the last record boundary inside `maxRaw`.
+ *
+ * Pure; the cutter is the only thing that touches a file.
+ */
+export function planChunk(cutter, from, eof, maxRaw = MAX_DELTA_RAW_BYTES) {
+    if (eof - from <= maxRaw)
+        return { kind: "span", to: eof };
+    const boundary = cutter.lastBoundary(from, from + maxRaw);
+    if (boundary !== null)
+        return { kind: "span", to: boundary };
+    const end = cutter.firstBoundary(from);
+    return end === null ? { kind: "wait" } : { kind: "oversize", to: end };
+}
+/**
+ * Where to cut `[from, to)` in two, at a record boundary, or `null` when the span is a single record and cannot be.
+ *
+ * Halves by bytes, snapping back to the last boundary at or before the middle. When the first record is longer than
+ * half, the cut is that record's end, so the oversize record goes out alone and a second 413 on it is final.
+ */
+export function splitPoint(cutter, from, to) {
+    const middle = from + Math.floor((to - from) / 2);
+    const boundary = cutter.lastBoundary(from, middle);
+    if (boundary !== null)
+        return boundary;
+    const end = cutter.firstBoundary(from);
+    return end !== null && end < to ? end : null;
 }
 /** Undelivered bytes currently held. */
 export function pendingBytes(state) {

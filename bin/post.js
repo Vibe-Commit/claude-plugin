@@ -22,7 +22,8 @@ import { agentForTranscript } from "./agents/registry.js";
 import { UNKNOWN_AGENT_ID } from "./agents/types.js";
 import { headerSafe, sessionIdSafe } from "./header_safety.js";
 import { recordInferredSkipped } from "./inferred_tally.js";
-import { classify, markDelivered, markHeld, markSkipped, nextSpan, resolveCaps, } from "./policy.js";
+import { clearOrgPending, markOrgPending } from "./org_pending.js";
+import { MAX_DELTA_FRAME_BYTES, MAX_DELTA_RAW_BYTES, classify, markDelivered, markHeld, markSkipped, nextSpan, planChunk, resolveCaps, splitPoint, } from "./policy.js";
 import { fileState, isStopped, loadSessionState, saveSessionState, withFileState, } from "./state.js";
 import { INFERRED_SET_ASIDE_AFTER, dropInferredGroups, dropRewrites, dropSpooled, isFullSha, recordInferredAttempt, setAsideInferredGroup, settleSpooled, } from "./spool.js";
 import { CLIENT_VERSION, CLIENT_VERSION_HEADER } from "./version.js";
@@ -499,6 +500,15 @@ function parseFinalAck(raw) {
     return v === "sealed" || v === "already" || v === "refused" ? v : null;
 }
 /**
+ * PR 4a — below this much remaining hook budget, do not START another delta. The same floor the sub-agent loop uses
+ * (`MIN_SUBAGENT_BUDGET_MS`, `hooks/entry.ts`), for the same reason: a request that small can only time out.
+ */
+const MIN_NEXT_DELTA_BUDGET_MS = 400;
+/** The floor under one attempt's timeout once the hook budget is nearly or fully spent — `MIN_SEND_TIMEOUT_MS` in `hooks/entry.ts`. */
+const MIN_ATTEMPT_TIMEOUT_MS = 50;
+/** The share of what is left one further attempt may take — `SEND_BUDGET_FRACTION`'s value in `hooks/entry.ts`. */
+const NEXT_DELTA_BUDGET_FRACTION = 0.6;
+/**
  * Build the delta, reduce it to the deny-list set when `lean`, validate every
  * resulting header value, and only then call `send()` — `TODOS[182]`.
  *
@@ -508,7 +518,12 @@ function parseFinalAck(raw) {
  * by elimination, always names a REQUIRED header — there is no second
  * optional one for the caller to drop.
  */
-async function attemptSend(ctx, agent, seq, span, body, lean) {
+async function attemptSend(ctx, agent, seq, span, body, lean, 
+// PR 4a. ⛔ ONLY THE DELTA THAT ENDS AT EOF CARRIES THE SESSION-LEVEL HEADERS. `X-Session-Final` seals the open turn, and
+// sealing before the rest of the span has arrived would seal a poorer turn (`finalize.ts`'s docblock). The commits,
+// rewrites and head describe the END of the session, and `capture_commits`' PK admits one row per (capture, sha), so they
+// ride on one delta and not on every one. A delta that is not the last sends none of them, and the spool keeps them.
+isLast = true) {
     const full = buildIngestHeaders(ctx.credential, {
         sessionId: ctx.sessionId,
         seq,
@@ -516,11 +531,11 @@ async function attemptSend(ctx, agent, seq, span, body, lean) {
         fileKey: ctx.fileKey,
         repoSlug: ctx.repoSlug,
         agent,
-        final: ctx.final === true,
-        head: ctx.head,
-        commits: ctx.commits,
-        rewrites: ctx.rewrites,
-        inferredRewrites: ctx.inferredRewrites,
+        final: ctx.final === true && isLast,
+        head: isLast ? ctx.head : undefined,
+        commits: isLast ? ctx.commits : undefined,
+        rewrites: isLast ? ctx.rewrites : undefined,
+        inferredRewrites: isLast ? ctx.inferredRewrites : undefined,
     });
     const headers = lean ? leanHeaders(full) : full;
     const badHeader = firstUnsafeHeader(headers);
@@ -593,8 +608,10 @@ function holdLean(ctx, key, session, current, span, caps) {
 /**
  * Send the undelivered span of one transcript file and apply the failure policy.
  *
- * **At most one NETWORK attempt per hook, still — exactly D56 §D8's rule.** A
- * `finalize` lean retry (below) is the one exception D56 §D8 itself does not
+ * **At most one NETWORK attempt per hook, still — exactly D56 §D8's rule — FOR ONE DELTA.** PR 4a:
+ * `deliver()` (below) calls this once per delta, and a hook calls it again only while its budget lasts; a 413 split's
+ * retry is budget-gated the same way and is a DIFFERENT, smaller body, so it is not the retry of the same bytes §D8
+ * forbids. A `finalize` lean retry (below) is the one exception D56 §D8 itself does not
  * cover: it governs HOOKS, and `finalize` is a synchronous, user-invoked verb
  * that already makes 1 + up to `FINALIZE_DRAIN_MAX_ITERATIONS` requests by
  * design (VL's explicit ruling, `TODOS[182]`). On the hook path, `later` still
@@ -608,7 +625,7 @@ function holdLean(ctx, key, session, current, span, caps) {
  * is the one that has confined `transcript_path` to the Claude Code root
  * (`/cso` finding 1). This module never opens a file.
  */
-export async function deliver(ctx, eof, readBody) {
+async function deliverChunk(ctx, eof, readBody, cutter) {
     // `CR-017d`. The consent gate already refuses a `cwd` outside a work tree, so
     // the hook cannot reach this — but the ledger's isolation must not rest on a
     // check in another module, the same discipline `consent.ts` states about its
@@ -630,10 +647,41 @@ export async function deliver(ctx, eof, readBody) {
     }
     if (span === null)
         return { kind: "nothing-to-send" };
-    const body = readBody(span.from, span.to);
+    const caps = resolveCaps(ctx.env);
+    const limits = ctx.limits ?? { rawBytes: MAX_DELTA_RAW_BYTES, frameBytes: MAX_DELTA_FRAME_BYTES };
+    // ⭐ PR 4a — ONE DELTA, NOT THE WHOLE SPAN TO EOF. Without a `cutter` this is the old single-span path, byte for byte.
+    //
+    // The delta is cut on a record boundary (the server drops a trailing partial line), at most `limits.rawBytes` raw, and
+    // measured AFTER compression: a frame over `limits.frameBytes` is halved at a boundary and measured again. A record that
+    // alone exceeds either limit cannot be split, so it is skipped and COUNTED (`markSkipped`: the gap counters `status`
+    // reports as "skipped … will not be sent later"), never retried — retrying the same bytes cannot work.
+    //
+    // A cut that is NOT at EOF is not the last delta (`isLast`), so it carries none of the session-level headers.
+    if (cutter !== undefined && span.to > span.from) {
+        const plan = planChunk(cutter, span.from, span.to, limits.rawBytes);
+        // An unterminated record longer than the limit, still at EOF: it may be growing. Leave it for the next event.
+        if (plan.kind === "wait")
+            return { kind: "nothing-to-send" };
+        if (plan.kind === "oversize")
+            return recordTooLarge(ctx, key, session, current, { from: span.from, to: plan.to }, caps);
+        span = { from: span.from, to: plan.to };
+    }
+    let body = readBody(span.from, span.to);
     if (body === null)
         return { kind: "nothing-to-send" };
-    const caps = resolveCaps(ctx.env);
+    if (cutter !== undefined) {
+        while (body.length > limits.frameBytes) {
+            const at = splitPoint(cutter, span.from, span.to);
+            if (at === null)
+                return recordTooLarge(ctx, key, session, current, span, caps);
+            span = { from: span.from, to: at };
+            body = readBody(span.from, span.to);
+            if (body === null)
+                return { kind: "nothing-to-send" };
+        }
+    }
+    // An empty span (a `final` with nothing new) is the last delta by definition.
+    let isLast = cutter === undefined || span.to >= eof || span.to === span.from;
     // `seq` is claimed BEFORE the attempt and persisted by the SWITCH below (every ordinary disposition —
     // "ok"/"later"/"never"/"fatal" — builds `next` from `{ ...session, seq, … }`), so it is monotonic per
     // session across retries once a request was actually classified. A seq reused after a failure would read
@@ -673,7 +721,7 @@ export async function deliver(ctx, eof, readBody) {
     // full and lean requests depending on what the NEXT turn happens to contain,
     // which nobody can debug.
     let lean = current.lean;
-    let attempt = await attemptSend(ctx, agent, seq, span, body, lean);
+    let attempt = await attemptSend(withinBudget(ctx), agent, seq, span, body, lean, isLast);
     if (attempt.kind === "unsafe") {
         return refuse(ctx, key, session, current, span, caps, attempt.header === "authorization" ? "fatal" : "never", lean);
     }
@@ -688,7 +736,7 @@ export async function deliver(ctx, eof, readBody) {
     if (outcome.kind === "response" && outcome.status === 431) {
         if (lean) {
             // Already lean and STILL 431: nothing client-side can shrink this
-            // further. `never`, exactly as 413 — the one case `never` is correct
+            // further. `never`, exactly as an UNSPLITTABLE 413 (a single record) — the one case `never` is correct
             // here, because it really is per-body now.
             return refuse(ctx, key, session, current, span, caps, "never", true);
         }
@@ -700,7 +748,7 @@ export async function deliver(ctx, eof, readBody) {
         // in-process retry here does not reopen D56 §D8, which governs hooks. Go
         // lean and retry ONCE, within this same invocation.
         lean = true;
-        attempt = await attemptSend(ctx, agent, seq, span, body, lean);
+        attempt = await attemptSend(withinBudget(ctx), agent, seq, span, body, lean, isLast);
         if (attempt.kind === "unsafe") {
             // Unreachable in practice — every lean header is already proven safe, or
             // it would never have reached the full build either — but stated rather
@@ -717,6 +765,35 @@ export async function deliver(ctx, eof, readBody) {
         // Falls through to the ordinary classification below, now with `lean`
         // true — the `"ok"` case's accounting reads it to skip settling data this
         // attempt never put on the wire.
+    }
+    // ⭐ PR 4a — A 413 IS NO LONGER A WRITE-OFF WHEN THE SPAN CAN BE SPLIT. Halve it at a record boundary and send the first half
+    // as a different, smaller request. A 413 is refused before the server applies anything (`server.ts`'s body limit, then the
+    // decompressed-size check), so the SAME `seq` is reused: the server never recorded it, and it is not a replay.
+    //
+    // ⛔ Only a span that is a single record falls through to `classify`, where 413 is `never`: the bytes cannot be made
+    // smaller, so skipping them is correct and the record is counted. Everything else here sends bytes the 413 did not see.
+    //
+    // Each retry is gated on the hook's remaining budget (`budgetLeftMs`), so this is not D56 §D8's forbidden synchronous
+    // retry of the SAME bytes: it is bounded by the budget the hook already has, and out of budget it HOLDS the span.
+    let splitTooLarge = false;
+    while (cutter !== undefined && outcome.kind === "response" && outcome.status === 413) {
+        const at = splitPoint(cutter, span.from, span.to);
+        if (at === null) {
+            splitTooLarge = true;
+            break;
+        }
+        if (budgetLeftMs(ctx) < MIN_NEXT_DELTA_BUDGET_MS)
+            return holdSpan(ctx, key, session, current, span, caps, lean);
+        span = { from: span.from, to: at };
+        isLast = false;
+        const half = readBody(span.from, span.to);
+        if (half === null)
+            return { kind: "nothing-to-send" };
+        attempt = await attemptSend(withinBudget(ctx), agent, seq, span, half, lean, false);
+        if (attempt.kind === "unsafe") {
+            return refuse(ctx, key, session, current, span, caps, attempt.header === "authorization" ? "fatal" : "never", lean);
+        }
+        outcome = attempt.outcome;
     }
     const disposition = classify(outcome);
     let next = ctx.byHook ? { ...session, seq, liveAt: ctx.nowMs } : { ...session, seq };
@@ -797,7 +874,9 @@ export async function deliver(ctx, eof, readBody) {
             // sendable, for a reason unrelated to `lean`) entries are UNAFFECTED by this gate: they are consumed
             // only via a NORMAL, non-lean call's `capSpool`/`capSuccessors`/`capInferred`, which this gate does not
             // touch, so a lean session's held lines still drain exactly as soon as a non-lean request reads them.
-            if (!lean) {
+            // PR 4a: AND ONLY ON THE DELTA THAT CARRIED THEM (`isLast`). A delta earlier in the span sent none of the commits,
+            // rewrites or inferred pairs, so a 2xx for it says nothing about them and the spool must keep them for the delta that did.
+            if (!lean && isLast) {
                 const retry = outcome.kind === "response" ? outcome.commitsRetry : null;
                 const nothingLanded = outcome.kind === "response" && outcome.captureId === "";
                 const holdForNextDelta = nothingLanded && (ctx.commits?.shas.length ?? 0) > 0;
@@ -880,6 +959,14 @@ export async function deliver(ctx, eof, readBody) {
             break;
     }
     saveSessionState(ctx.home, key, next);
+    // 0.7.0: remember, for `status`, that THIS repo's upload was refused because its org has not approved capture — and
+    // forget it on the next delivery. Only that one error code sets it; a 5xx or a timeout neither sets nor clears it.
+    if (disposition === "ok")
+        clearOrgPending(ctx.home, ctx.repoSlug);
+    else if (disposition === "later" && outcome.kind === "response" && outcome.detail?.code === CAPTURE_NOT_APPROVED) {
+        // The slug is the CLIENT's (`ctx.repoSlug`), never the response body's: the 403 names nobody.
+        markOrgPending(ctx.home, ctx.nowMs, outcome.detail.ownersNotified ?? null, ctx.repoSlug);
+    }
     // `outcome.detail` is null on every path except a non-2xx with a parseable
     // error body, so this is a pass-through and not a second decision.
     return {
@@ -894,6 +981,123 @@ export async function deliver(ctx, eof, readBody) {
         ...(outcome.kind === "response" && disposition === "ok" && outcome.conversationId !== undefined
             ? { conversationId: outcome.conversationId }
             : {}),
+        ...(outcome.kind === "unreachable" ? { unreachable: true } : {}),
+        // PR 4a: a 413 that no split could shrink was skipped by the `never` arm above; say so, so the caller can count it.
+        ...(splitTooLarge && disposition === "never" ? { recordsTooLarge: 1 } : {}),
     };
+}
+/**
+ * PR 4a — a single record that alone exceeds a delta limit. Nothing is sent: the same bytes would be refused, so the record
+ * is skipped, the gap is stamped (`markSkipped`, which `status` reports), and the offset moves past it. `refuse` does
+ * exactly that and persists it; this adds the count.
+ */
+function recordTooLarge(ctx, key, session, current, span, caps) {
+    const skipped = refuse(ctx, key, session, current, span, caps, "never", current.lean);
+    return skipped.kind === "attempted" ? { ...skipped, recordsTooLarge: 1 } : skipped;
+}
+/**
+ * PR 4a — out of hook budget in the middle of a 413 split: hold the span the failed request covered, as a `later` does. The
+ * `seq` is not persisted for the same reason the split reuses it: the 413 was refused before the server applied it.
+ */
+function holdSpan(ctx, key, session, current, span, caps, lean) {
+    saveSessionState(ctx.home, key, withFileState(session, ctx.fileKey, { ...markHeld(current, span, ctx.nowMs, caps), lean }));
+    return { kind: "attempted", disposition: "later", detail: null, finalAck: null, inferredStored: null, inferredSetAsidePairs: 0 };
+}
+/** Hook budget left for further sends, ms. `Infinity` when the caller set no deadline (`finalize`, `connect`). */
+function budgetLeftMs(ctx) {
+    return ctx.deadlineAtMs === undefined ? Infinity : ctx.deadlineAtMs - (ctx.clock ?? Date.now)();
+}
+/**
+ * `ctx` with this attempt's timeout trimmed to what is left of the hook budget (unchanged when there is no deadline).
+ *
+ * ⛔ CALLED RIGHT BEFORE EACH `attemptSend`, never ahead of the read. The read, the redaction and the compression of a delta
+ * (and every halving pass) take real time, and a timeout fixed before them lets the last delta end past `deadlineAtMs` by
+ * exactly that. Floored like `sendTimeoutMs` (`hooks/entry.ts`): when the budget is already gone the watchdog is the real
+ * limit, and a zero timeout would only abort a send that was about to be refused anyway.
+ */
+function withinBudget(ctx) {
+    const left = budgetLeftMs(ctx);
+    if (!Number.isFinite(left))
+        return ctx;
+    return { ...ctx, timeoutMs: Math.max(MIN_ATTEMPT_TIMEOUT_MS, Math.min(ctx.timeoutMs, Math.floor(left * NEXT_DELTA_BUDGET_FRACTION))) };
+}
+/**
+ * Send the undelivered span of one transcript file, in deltas — PR 4a.
+ *
+ * Without a `cutter` this is the single request it always was: everything from the offset to EOF, at most one attempt.
+ * With one (every production caller), the span goes out as record-aligned deltas, each acknowledged before the offset
+ * moves past it:
+ *
+ *   - **A hook sends deltas only while its budget lasts** (`ctx.deadlineAtMs`) and leaves the rest for its next event or
+ *     `vibecommit finalize`; `Delivery.more` says it stopped early. `finalize` and `connect` set no deadline and run on.
+ *   - **It stops at the first delta that is not `ok`** and returns that delta's outcome: `later` and `fatal` hold exactly
+ *     the bytes that failed, so a resume starts at the next unacknowledged delta, with no resend and no gap. A
+ *     `capture_not_approved` 403 on any delta is such a stop, so its pending beat is printed once.
+ *   - **A skipped oversize record does not stop it.** The records after it still go out.
+ *   - **`connect`'s conversation id survives a partial run** (DX D8): it is read from the first 2xx that carries it, no later
+ *     delta reads a body, and it is returned even when a later delta came back `later`.
+ *
+ * ⛔ A 2xx never changes a delta's outcome, and a hook reads no body (eng-2 D2): the only body read is `connect`'s opt-in.
+ */
+export async function deliver(ctx, eof, readBody, cutter) {
+    if (cutter === undefined)
+        return deliverChunk(ctx, eof, readBody, undefined);
+    const key = { repoKey: ctx.repoKey, sessionId: ctx.sessionId };
+    let chunkCtx = ctx;
+    let conversationId;
+    let tooLarge = 0;
+    let deltas = 0;
+    let last = null;
+    const carry = (d, more = false) => d.kind !== "attempted"
+        ? d
+        : {
+            ...d,
+            ...(d.conversationId === undefined && conversationId !== undefined ? { conversationId } : {}),
+            ...(tooLarge > 0 ? { recordsTooLarge: tooLarge } : {}),
+            ...(deltas > 1 ? { deltas } : {}),
+            ...(more ? { more: true } : {}),
+        };
+    for (;;) {
+        const before = fileState(loadSessionState(ctx.home, key), ctx.fileKey).sentOffset;
+        let delivery;
+        try {
+            delivery = await deliverChunk(chunkCtx, eof, readBody, cutter);
+        }
+        catch {
+            // The cutter reads the file and a read can fail. That must read as "could not tell where the record ends", never as
+            // "it does not end" (which would skip a record). Nothing was persisted for this delta, so the next event retries it.
+            delivery = { kind: "nothing-to-send" };
+        }
+        if (delivery.kind !== "attempted")
+            return last === null ? delivery : carry(last);
+        deltas += 1;
+        tooLarge += delivery.recordsTooLarge ?? 0;
+        conversationId ??= delivery.conversationId;
+        // `ok`, or a record skipped as too large, moved the offset on; anything else is a stop, and its outcome is the answer.
+        if (delivery.disposition !== "ok" && delivery.recordsTooLarge === undefined)
+            return carry(delivery);
+        const after = fileState(loadSessionState(ctx.home, key), ctx.fileKey).sentOffset;
+        // No progress is a bug somewhere below; end the loop rather than spin on it.
+        if (after <= before)
+            return carry(delivery);
+        // ⛔ EVERY BYTE IS ACCOUNTED FOR, BUT THE LAST DELTA WAS SKIPPED RATHER THAN SENT, AND THE SESSION-LEVEL HEADERS RODE
+        // ON IT. A skipped record (too large by the raw limit, the frame limit, or a 413 no split can shrink) puts nothing on
+        // the wire, so the `final` assertion, the commits, the head and the rewrites that belong to the delta ending at EOF
+        // never landed. Run ONE more pass: `nextSpan` is null at EOF, so the existing `span === null && final` branch of
+        // `deliverChunk` sends the empty delta that carries them (`isLast` is true for an empty span). Without this a
+        // `finalize` whose last record was oversize reported `notDelivered` after every byte had been sent or written off.
+        // Hooks never set `final`, and their commits ride the next event as they always did.
+        const tailSkipped = delivery.recordsTooLarge !== undefined && after >= eof && ctx.final === true;
+        if (after >= eof && !tailSkipped)
+            return carry(delivery);
+        if (budgetLeftMs(ctx) < MIN_NEXT_DELTA_BUDGET_MS)
+            return carry(delivery, true);
+        last = delivery;
+        chunkCtx = {
+            ...ctx,
+            // Stop reading bodies once the id is in hand: a later delta never needs one.
+            readConversationId: ctx.readConversationId === true && conversationId === undefined,
+        };
+    }
 }
 //# sourceMappingURL=post.js.map

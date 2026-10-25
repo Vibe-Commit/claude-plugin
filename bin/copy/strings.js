@@ -28,12 +28,20 @@ export const HELP = {
     commands: {
         // `CR-216/U2`. FIRST in the list by habit, not by sequence: that "nothing for `connect` to use until
         // this has run" reason has been false since `CR-226` (`connect` signs in itself on a machine with no
-        // credential). `connect` is the golden path; this verb renews or replaces the credential, and inside a
-        // git work tree it then continues into `connect`. Outside one it saves the credential and stops there
-        // — the escape hatch for a renewal that should not touch the repo you happen to be standing in.
-        auth: "Renew or replace this machine's credential. In a git repo it then connects that repo; elsewhere it only saves the credential.",
-        connect: "Connect this repo and capture the current session.",
-        status: "Show whether capture is on for this repo and when it last succeeded.",
+        // credential). `connect` is the golden path; this verb renews or replaces the credential, and on a terminal it
+        // then continues into `connect` — inside a git work tree, or (0.7.0, D32) outside one on a machine that captures
+        // nothing yet. With `--stdin` or no terminal it saves the credential and stops there.
+        auth: "Renew or replace this machine's credential. On a terminal it then goes on to connect: in a git repo, or on a machine that captures nothing yet. Otherwise it only saves the credential.",
+        // 0.7.0 (D34): from any folder. A repo with a remote is chosen in the picker; a repo with no remote keeps the old flow.
+        connect: "Choose the repositories to capture, from any folder, and connect them. On a machine with no credential it signs in first.",
+        // `D33 · 27A`. A public verb so an AI agent can list capturable repos without entering a consent
+        // flow. It opens no session file and changes no setting, which is what lets it be run before `connect`.
+        // ⚠ NOT "changes nothing" (PR 1 F1): opening Codex's index read-only makes SQLite create its own
+        // `-wal`/`-shm` journal files beside it, as any SQLite reader does, so the line claims only what is true.
+        scan: "List the repositories coding agents have been used in on this machine. Uploads nothing and changes no setting.",
+        // `D14`/`D15`. Offered by `connect` too. Asks first (default N) and says what it will not do.
+        backfill: "Upload earlier coding-agent sessions still on this machine, for the repositories you chose. Asks first; no commit links.",
+        status: "Show whether capture is on for this repo, or for this machine outside a repo, and when it last succeeded.",
         off: "Stop capturing for this repo.",
         // VERBATIM-APPROVED (D61 §PS6). Any reword needs a new claims-register row.
         why: "Show the conversation turns recorded against the commit that last changed this line.",
@@ -42,6 +50,117 @@ export const HELP = {
         finalize: "Close a finished session's last turn so commits made in it can be recorded.",
     },
     docsUrl: "https://vibecommit.ai/docs/what-we-upload",
+    /**
+     * PR 6 item 2 (devex review): what `<verb> --help` prints BEYOND the one sentence above, which stays the first
+     * paragraph. Agents read `--help` first, and until now the flags and exit codes existed only in the README.
+     *
+     * ⚠ Every flag here is one the verb's own argv reader acts on (`src/index.ts`, and each verb's parser), and every exit
+     * code is one the verb returns (`src/exit.ts`). A flag the verb ignores, or a code it never returns, would be copy no
+     * gate can check, so `test/verb-help.test.ts` ties each list to the source it describes.
+     */
+    verbs: {
+        connect: {
+            usage: "vibecommit connect [--device] [--sign-in] [--typed]",
+            options: [
+                ["--device", "Sign in with a code approved on another device, for a machine with no browser."],
+                ["--sign-in", "Sign in through the browser before connecting."],
+                ["--typed", "Use the typed prompt even on a terminal, for a screen reader."],
+            ],
+            exits: [
+                ["0", "Done."],
+                ["1", "Failed, or a replacement credential was declined."],
+                ["2", "Bad arguments, or no person at a terminal to answer the consent question."],
+                ["3", "Not connected: this machine's credential is not accepted."],
+            ],
+        },
+        auth: {
+            usage: "vibecommit auth [--stdin | --paste | --device]",
+            options: [
+                ["--stdin", "Read the credential from standard input and stop after saving it."],
+                ["--paste", "Skip the browser and paste a credential made in Settings."],
+                ["--device", "Sign in with a code approved on another device."],
+            ],
+            exits: [
+                ["0", "Credential saved."],
+                ["1", "Nothing was saved."],
+                ["2", "Bad arguments, such as a credential passed as an argument."],
+            ],
+        },
+        scan: {
+            usage: "vibecommit scan [--json]",
+            options: [["--json", "Print one JSON document instead of text."]],
+            exits: [
+                ["0", "Repositories found."],
+                ["4", "None found."],
+            ],
+        },
+        backfill: {
+            usage: "vibecommit backfill",
+            options: [],
+            exits: [
+                ["0", "Done, declined at the question, or interrupted with Ctrl+C. Sessions held for an organization's approval count as done."],
+                ["1", "The server stopped the run, could not be reached or refused this machine's credential, or it could not run. Nothing already sent is lost; run it again to resume."],
+                ["2", "No terminal, or an argument was given."],
+                ["3", "Not connected."],
+                ["4", "Nothing to upload."],
+            ],
+        },
+        status: {
+            usage: "vibecommit status [--json]",
+            options: [["--json", "Print one JSON document instead of text."]],
+            exits: [
+                ["0", "Reported."],
+                ["1", "Failed."],
+                ["2", "Bad arguments."],
+                ["3", "Not connected."],
+            ],
+        },
+        why: {
+            usage: "vibecommit why <file>:<line> [--json]",
+            options: [["--json", "Print one JSON document instead of text."]],
+            exits: [
+                ["0", "Answered."],
+                ["1", "Failed."],
+                ["2", "Bad arguments."],
+                ["3", "Not connected."],
+            ],
+        },
+        report: {
+            usage: "vibecommit report --since <date> [--ref <ref>] [--json]",
+            options: [
+                ["--since", "Start of the window, as YYYY-MM-DD. Required."],
+                ["--ref", "The branch or commit to count. Default: the current branch."],
+                ["--json", "Print one JSON document instead of text."],
+            ],
+            exits: [
+                ["0", "Reported."],
+                ["1", "Failed."],
+                ["2", "Bad arguments."],
+                ["3", "Not connected."],
+                ["4", "The window is empty: nothing to report."],
+            ],
+        },
+        finalize: {
+            usage: "vibecommit finalize --session <id> | --latest [--force]",
+            options: [
+                ["--session", "The session to close."],
+                ["--latest", "The most recent session, when only one is recent."],
+                ["--force", "Skip the check that the transcript has stopped changing. Only for a session that is over."],
+            ],
+            exits: [
+                ["0", "Closed: the server confirmed the last turn is recorded."],
+                ["1", "Not confirmed closed: not a git repository, a transcript that cannot be read, a credential that is no longer accepted, or a delivery that failed."],
+                ["2", "Nothing was sent: bad arguments, an unknown or still-running session, or several recent sessions for --latest."],
+                ["3", "Not connected: this repo is not captured, or this machine has no credential."],
+                ["5", "Delivered, but the server did not confirm it. Treat it as not closed."],
+            ],
+        },
+    },
+    /** The two section labels of a verb's help. */
+    optionsLabel: "Options:",
+    /** A verb with no flags of its own (`backfill`) says so under the label, so "Options:" never sits over nothing. */
+    noOptions: "None. It takes no arguments.",
+    exitCodesLabel: "Exit codes:",
 };
 /**
  * The ENTRY POINT's own chrome and its two usage failures — `CR-090d`.
@@ -74,8 +193,14 @@ export const USAGE = {
     usageLabel: "Usage:",
     commandsLabel: "Commands:",
     docsLabel: "Docs:",
-    /** The unknown-verb line. Help follows it, so this says only what went wrong. */
-    unknownCommand: (verb) => `Unknown command: ${verb}`,
+    /**
+     * The unknown-verb block (PR 7, Q6: `UNKNOWN_COMMAND`, routed through the shared renderer). The help text is no longer
+     * dumped after it, so the fix — the way to the list of commands — is the last thing on screen. The verb is whatever
+     * the user typed, so it is cut to a length the line can hold.
+     */
+    unknownCommandWhat: (verb) => `\`${verb.length > 40 ? `${verb.slice(0, 39)}…` : verb}\` is not a vibecommit command.`,
+    unknownCommandFix: "See the commands:",
+    unknownCommandHelp: "vibecommit --help",
 };
 /** `vibecommit status` (CR-021). */
 /**
@@ -108,6 +233,25 @@ export const STATUS = {
      * changed them to match the screen rather than changing the screen.
      */
     repoLabel: "repo",
+    /** 0.7.0, D6 · 2A: why this repo is on. One row under `repo`, only inside a repo that is on. */
+    basisLabel: "basis",
+    basisOwner: (owner) => `owner grant ${owner}/`,
+    basisRepo: "repo grant",
+    basisClone: "per clone",
+    /** The machine-level screen (any folder that is not a work tree). */
+    offMachine: "Capture is not on for any repository on this machine.",
+    ownersLabel: "owners",
+    reposLabel: "repos",
+    offLabel: "off",
+    /**
+     * Machine-level `status`: the repos whose own last upload was refused because their org has not approved capture. §10.2's held
+     * vocabulary — the beat word `held`, and the backfill screen's "the org must approve capture" (Alexander, 2026-10-24 17:20).
+     */
+    heldLabel: "held",
+    heldReason: "the org must approve capture",
+    ownerTail: "all its repos, including ones you clone later",
+    changeLabel: "Change what is captured",
+    turnOffInside: "Turn one repo off, run inside it",
     lastSuccessLabel: "last sent",
     dashboardLabel: "dashboard",
     /** `<slug> (git toplevel <path>)` — §10.3's repo row. */
@@ -128,6 +272,21 @@ export const STATUS = {
      * after the rows, with the glyph turned `warn`. The date is absolute and in UTC.
      */
     credentialEnding: (date, authCommand) => `This machine's credential ends ${date}. Run \`${authCommand}\` to renew it.`,
+    /**
+     * 0.7.0. A `grants.json` that is present and unreadable denies capture for every clone that has a remote
+     * (`consent.ts`'s `isCaptureAllowed`), and a hook cannot say so, so `status` does. The file name is the user's
+     * to fix; `connect` is where the next consent lands once it is readable.
+     */
+    grantsUnreadable: (connect) => `~/.vibecommit/grants.json can't be read, so capture is stopped on this machine for every repository that has a remote. Fix the file or move it aside, then run \`${connect}\`.`,
+    /**
+     * 0.7.0, `SessionStart` (T21). `npm i -g` alone never adds the event to an agent's config, so a 0.6.x machine is
+     * missing it until `connect` runs. Only said on the npm channel: the plugin ships its own `hooks.json`, and its
+     * contract (no `SessionStart`, no git hooks) is unchanged.
+     */
+    sessionStartMissing: (agents, connect) => `${agents} will not add commit hooks to a new clone: VibeCommit's SessionStart hook is not registered there. Run \`${connect}\` to register it.`,
+    /** 0.7.0, D4 · A. A hook the user deleted stays deleted; `connect` is the watched way back. */
+    commitHooksOff: (connect) => `Commit hooks are off in this repository: sessions are captured, commits are not linked to them. Run \`${connect}\` here to add them.`,
+    commitHooksForeign: (connect) => `This clone has its own commit hook, so VibeCommit's is not installed here. Run \`${connect}\` here to chain it.`,
     credentialShadowed: "VIBECOMMIT_TOKEN is set and takes precedence over the credential saved on this machine. Unset it to use the saved one.",
     /**
      * `CR-228`, `TODOS[142]` — bytes the client ADVANCED PAST without delivering.
@@ -154,8 +313,8 @@ export const STATUS = {
      * turn only when a following prompt arrives, so nothing will ever seal this one and the commits made in
      * it cannot be recorded. States the consequence and the command; promises nothing about the commits.
      */
-    openTail: (sessions) => `${sessions === 1 ? "1 session has" : `${sessions} sessions have`} ended with the last turn still ` +
-        "open, so commits made in that turn are not recorded. Run `vibecommit finalize --latest` to close it.",
+    openTail: (sessions, finalizeLatest) => `${sessions === 1 ? "1 session has" : `${sessions} sessions have`} ended with the last turn still ` +
+        `open, so commits made in that turn are not recorded. Run \`${finalizeLatest}\` to close it.`,
     /**
      * `TODOS[145]` — commits the client has seen and is holding because no turn has closed yet. Normal
      * mid-session; shown as a fact, not as a fault.
@@ -259,12 +418,12 @@ export const STATUS = {
      * cannot tell a crashed session from one idle at lunch, and closing a session still in progress seals
      * a turn that was not actually over.
      */
-    heldIdle: (bytes, sessions, commits, ids = []) => {
+    heldIdle: (bytes, sessions, commits, finalizeSession, ids = []) => {
         const who = sessions === 1 ? `session ${namedIds(ids)}` : `${sessions} sessions (${namedIds(ids)})`;
         const commitsClause = commits > 0 ? `, including ${commits} ${commits === 1 ? "commit" : "commits"}` : "";
         const action = sessions === 1
-            ? `If that session is finished, \`vibecommit finalize --session ${ids[0]}\` tries to send them and, if that works, closes it`
-            : "If a session above is finished, `vibecommit finalize --session <id>` tries to send its bytes and, if that works, closes it";
+            ? `If that session is finished, \`${finalizeSession} ${ids[0]}\` tries to send them and, if that works, closes it`
+            : `If a session above is finished, \`${finalizeSession} <id>\` tries to send its bytes and, if that works, closes it`;
         return (`${BYTE_COUNT.format(bytes)} ${bytes === 1 ? "byte" : "bytes"} held from ${who}${commitsClause}, with no hook in over 30 ` +
             `minutes. ${action}; anything held past 24 hours is written off instead.`);
     },
@@ -299,7 +458,18 @@ export const CONNECT = {
      * the nouns are transcribed rather than reworded: *"the output of commands it
      * ran"*, never *"Bash tool results"*.
      */
-    consentHeading: "VibeCommit uploads your Claude Code transcripts for this repo.",
+    consentHeading: "VibeCommit uploads your coding-agent transcripts for this repo.",
+    /**
+     * D23 · 17A: the picker path's heading (every `connect` that shows the picker, in a repo or not). `consentHeading`
+     * above remains only on the no-remote (`local:`) in-repo path, where there is nothing to pick (D35 · 29A: "Claude
+     * Code transcripts" understated what uploads once `connect` also wired Codex and Cursor hooks, 0.2.0).
+     */
+    consentHeadingPicker: "VibeCommit uploads your coding-agent transcripts for the repositories you choose.",
+    /**
+     * ONE sentence, not a paragraph, added on the picker path only (design doc step 2, "The disclosure"): what the grant
+     * covers beyond the repos named on screen. The four paragraphs under either heading stay byte-identical.
+     */
+    consentScope: "The choice covers future clones of these repositories too, and adds commit hooks to each clone where it can.",
     /**
      * ⚠ "private-repo paths" IS THE APPROVED WORDING, and it is the reason
      * `private` is deliberately NOT registered in `claims.ts`: a substring gate on
@@ -407,11 +577,33 @@ export const CONNECT = {
     // --- Mechanism copy (CR-016). ---
     /** The `[y/N]` suffix. The capital is the default and the default is NO. */
     consentAnswers: "[y/N]",
-    /** Non-TTY refusal — DESIGN.md §13.7 exit 2, D65 §DR7. */
-    nonInteractiveWhat: "Consent needs an interactive terminal.",
-    nonInteractiveWhy: "Standard input is not a terminal, so the consent prompt cannot be answered. Nothing was read and nothing was uploaded.",
-    nonInteractiveFix: "Run this in a terminal:",
+    /**
+     * Non-TTY refusal — DESIGN.md §13.7 exit 2, D65 §DR7. PR 6 item 6: written for an AGENT that hit it, which is who reaches
+     * this branch. It says who must answer ("a person"), that an agent cannot, and what to relay, and it carries the code
+     * `CONSENT_NEEDS_TTY` for a wrapper to key on — PR 7 registered it and renders it on the block's own code line, so it is not
+     * repeated in the sentence. No `--yes`: that would bypass consent (D65 §DR7). The `what` line has no "you" (§13.6).
+     */
+    nonInteractiveWhat: "Consent needs a person at a terminal.",
+    nonInteractiveWhy: "An agent cannot answer it, and standard input is not a terminal. Nothing was read and nothing was uploaded.",
+    /** A repo with no remote has a folder to name; the label is the fix and the command follows it. */
+    nonInteractiveFix: (folder) => `Ask the user to run this in ${folder}:`,
+    /**
+     * The picker path's refusal (VQ + VT, PR 6 item 6 fit): it names no folder (the picker is not about one repo), has no
+     * "you" in the `what` line, and is reached BEFORE the scan beat, so "Nothing was read and nothing was uploaded" stays
+     * literally true.
+     */
+    pickerNonInteractiveWhat: "Choosing repositories needs a person at a terminal.",
+    pickerNonInteractiveWhy: "An agent cannot answer it, and standard input is not a terminal, so no repository can be chosen and consent cannot be asked. Nothing was read and nothing was uploaded.",
+    pickerNonInteractiveFix: "Ask the user to run this in a terminal:",
     alreadyConnected: "Capture is already on for this repository.",
+    /**
+     * 0.7.0. `grants.json` is present and unreadable, which denies this repository whatever consent it has (see
+     * `consent.ts`'s `isCaptureAllowed`). Answering the consent prompt could not change that, so `connect` stops
+     * BEFORE asking rather than take a yes it cannot honour.
+     */
+    grantsUnreadableWhat: "Capture can't be turned on: ~/.vibecommit/grants.json can't be read.",
+    grantsUnreadableWhy: "Capture is stopped on this machine for every repository that has a remote until the file is readable. Nothing was changed.",
+    grantsUnreadableFixLabel: "Fix the file or move it aside, then run:",
     /**
      * The browser sign-in beat (PKCE loopback → minted ingest credential) is the
      * oauth lane's, not this task's. Until it lands, the supported path is the one
@@ -531,12 +723,12 @@ export const COMMIT_HOOK = {
     installed: (repo) => `Commit capture is on for this clone (${repo}). Commits are recorded as they happen, including ones made by \`make\`, \`gh\`, an alias or a script.`,
     chained: (repo) => `Commit capture is on for this clone (${repo}). You already had a \`post-commit\` hook — it was kept and still runs first; ours runs after it.`,
     already: "Commit capture was already on for this clone.",
-    perClone: "Run `vibecommit connect` in each clone you want commits recorded for — git hooks are per-clone, not per-account.",
+    perClone: (connect) => `Run \`${connect}\` in each clone you want commits recorded for — git hooks are per-clone, not per-account.`,
     hooksPathWhat: "Commit capture could NOT be installed for this clone.",
     hooksPathWhy: (configured) => `This repository sets \`core.hooksPath\` to ${configured}, so git ignores \`.git/hooks\` entirely and a hook installed there would never run. Transcript capture is unaffected; only commit observation is.`,
     hooksPathFixLabel: "Fix, either one:",
     hooksPathFixUnset: "git config --unset core.hooksPath",
-    hooksPathFixManual: "or add `vibecommit post-commit` to your existing post-commit hook",
+    hooksPathFixManual: (postCommit) => `or add \`${postCommit}\` to your existing post-commit hook`,
     failedWhat: "Commit capture could NOT be installed for this clone.",
     failedWhy: (why) => `Writing the \`post-commit\` hook failed: ${why}. Transcript capture is unaffected; only commit observation is.`,
 };
@@ -567,7 +759,7 @@ export const AGENT_HOOKS = {
     refusedWhat: (agent) => `Session capture could NOT be set up for ${agent}.`,
     refusedWhy: (path, why) => `${path} could not be read as JSON (${why}), and it was left exactly as it is. Overwriting a file we cannot parse would discard settings we cannot see.`,
     refusedFixLabel: "Fix:",
-    refusedFix: (path) => `check ${path} for a syntax error, then run \`vibecommit connect\` again`,
+    refusedFix: (path, connect) => `check ${path} for a syntax error, then run \`${connect}\` again`,
     failedWhat: (agent) => `Session capture could NOT be set up for ${agent}.`,
     failedWhy: (path, why) => `Writing ${path} failed: ${why}. Commit capture and any agent already configured are unaffected.`,
 };
@@ -697,9 +889,302 @@ export const SIGNIN = {
     busyWhy: "Only one process may renew a sign-in at a time, and the one holding it did not finish. Nothing was read and the stored sign-in is unchanged.",
     busyFix: "Run it again in a moment:",
 };
+/**
+ * `vibecommit scan` — design review D17 · 11A, D26, D27, D33 · 27A, and the screen VQ drew for it
+ * (style guide §10.13) on 2026-10-24.
+ *
+ * ⛔ **The nouns are the agent-neutral ones** (D11 · A, D35): "coding agent", never "Claude Code
+ * session", because the scan covers three agents and the picker's heading says the same. The agent
+ * NAMES appear only on a repo's second line, where they are facts about which store a count came from.
+ *
+ * ⚠ **Every sentence here is a claims-register row** (the register is `code`'s, VR's PR). None says
+ * "every" or "all": the scan counts transcripts still on disk, and what `cleanupPeriodDays` already
+ * deleted is not among them.
+ */
+export const SCAN = {
+    /** The beat line, drawn in the existing beat shape and overwritten once with `done` (D17). */
+    beat: "Looking for repositories on this machine...",
+    beatDone: "done",
+    found: (count) => `Found ${count} ${count === 1 ? "repository" : "repositories"} you've used a coding agent in on this machine.`,
+    sessions: (count) => `${count} ${count === 1 ? "session" : "sessions"}`,
+    since: (date) => `since ${date}`,
+    /** What an agent is called on a repo's second line. The ids are wire values, not labels. */
+    agent: { "claude-code": "Claude Code", "codex-cli": "Codex", cursor: "Cursor" },
+    notListed: "Not listed here:",
+    noRemote: (count, connect) => count === 1 ? `1 repo with no remote: run \`${connect}\` inside it` : `${count} repos with no remote: run \`${connect}\` inside each`,
+    /**
+     * The picker's own line (PR 1 ruling 2): ONE count and ONE line for a folder with two or more
+     * candidate paths, a hashed name (cut, so it cannot be inverted) and a deleted sibling. Claude Code's
+     * and Cursor's only — a Codex row records its real `cwd` and is never ambiguous.
+     */
+    ambiguous: (count) => count === 1
+        ? "1 session in a folder that can't be matched to one repo"
+        : `${count} sessions in folders that can't be matched to one repo`,
+    /** Scan-only (ruling 5a): a folder, or a Codex `cwd`, that exists but is not inside a git work tree. */
+    nonRepo: (count) => count === 1
+        ? "1 session in a folder that isn't a git repository"
+        : `${count} sessions in folders that aren't git repositories`,
+    missingFolder: (count) => count === 1
+        ? "1 session in a folder that no longer exists"
+        : `${count} sessions in folders that no longer exist`,
+    /**
+     * ⛔ CLAIMS ONLY WHAT GIT SHOWS (ruling 7). The test is a session's mtime against the OLDEST reflog entry,
+     * and `gc.reflogExpire` prunes a long-lived clone's oldest entries, so "older than the reflog" is the fact
+     * and "the folder was reused" is a possibility — the same repo deleted and cloned again reads the same.
+     */
+    pathReused: (count) => count === 1
+        ? "1 session older than its clone's reflog (possibly a reused folder)"
+        : `${count} sessions older than their clone's reflog (possibly a reused folder)`,
+    /** One clone: the path rides the line. More: this heading, then one indented path per clone. */
+    noReflogOne: (path) => `1 clone with no reflog: ${path} (backfill skips it)`,
+    noReflogMany: (count) => `${count} clones with no reflog (backfill skips them):`,
+    /** Rollouts on disk that no index row names (ruling 5c) — counted, never opened. */
+    unindexed: (count) => count === 1
+        ? "1 Codex session missing from its thread index"
+        : `${count} Codex sessions missing from its thread index`,
+    /**
+     * `Codex sessions couldn't be read (unrecognised index)`, one line per unreadable agent (R3-15). The
+     * bracket names a cause the user can act on; a plain read failure (ruling 6) has none to name, so it
+     * gets none. The `--json` `reason` is the same three words either way.
+     */
+    unreadable: (agent, reason) => reason === null
+        ? `${agent} sessions couldn't be read`
+        : `${agent} sessions couldn't be read (${reason})`,
+    next: "Choose what is captured:",
+    /** Exit 4. Both screens end on the same command. */
+    none: "No coding-agent sessions were found on this machine.",
+    /**
+     * Exit 4 with `Not listed here:` lines: sessions exist that could not be listed, so `none` would be
+     * untrue. `none` prints only when that block is empty, i.e. the scan saw no session at all (VQ, PR 1
+     * ruling 3).
+     */
+    noneListable: "No repository could be listed from the sessions on this machine.",
+    noneNext: "Choose owners or repos anyway:",
+};
+/**
+ * `vibecommit backfill` — style guide §10.14, design review D14 · 8A, D15 · 9A; capture 0.7.0, PR 5.
+ *
+ * Every sentence here is a claims-register row. ⛔ Three promises it must never make: that a backfilled session is
+ * LINKED to a commit (it arrives without links, and the copy says so), that "every" or "all" earlier sessions are
+ * uploaded (only the ones still on this machine and not yet sent), and that a held session will upload by itself (no
+ * hook fires for an old session, so the held line points at a re-run).
+ *
+ * The two folder reasons are different facts (VQ ruling): `folder differs` is a RECORDED folder that is not this clone,
+ * `folder not recorded` is a transcript that records none.
+ */
+export const BACKFILL = {
+    /**
+     * Inside `connect` the repos are the ones it just showed, so "these"; run on its own there is no "these", so it names whose
+     * they are (VQ, PR 5 review).
+     */
+    offerHeading: (repos, standalone) => standalone
+        ? `Earlier sessions are still on this machine for ${repos} ${repos === 1 ? "repository" : "repositories"} you chose.`
+        : `Earlier sessions are still on this machine for ${repos} of these repos.`,
+    /** The count on a repo row. "Not yet uploaded", so it is never mistaken for the picker's total on disk. */
+    notYetUploaded: (count) => `${count} not yet uploaded`,
+    /**
+     * Cursor sessions are not offered (Alexander, 2026-10-24 13:54 EST: Cursor's transcripts record no folder, so the
+     * folder check cannot run). One muted line, only when a repo you chose has some.
+     */
+    cursorNotUploaded: (count) => count === 1
+        ? "1 Cursor session isn't uploaded: Cursor doesn't record the folder a session started in."
+        : `${count} Cursor sessions aren't uploaded: Cursor doesn't record the folder a session started in.`,
+    /** Two lines, as §10.14 draws them. */
+    /**
+     * A session over the 50 MiB cap is left out of the count and named here, so the offer never promises an upload the run would
+     * skip on every re-run. (Sub-agent streams are not capped.)
+     */
+    overSizeNote: (count) => count === 1 ? "1 session over 50 MiB isn't uploaded." : `${count} sessions over 50 MiB aren't uploaded.`,
+    /**
+     * A clone with no reflog cannot be tested for a reused path (a transcript older than the clone's first reflog entry), and
+     * that test is the only guard against one, so its sessions are left out of the count and named here with the clone.
+     */
+    noReflogNote: (count, path) => count === 1
+        ? `1 session in a clone with no reflog isn't uploaded: ${path}`
+        : `${count} sessions in a clone with no reflog aren't uploaded: ${path}`,
+    uploadNote: ["They upload one at a time, the same way new sessions do, without", "commit links."],
+    question: (sessions) => sessions === 1 ? "Upload this session now? [y/N] " : `Upload these ${sessions} sessions now? [y/N] `,
+    /** A no. A completed consent flow (§13.7), not an error. */
+    declined: (backfill) => `Nothing was uploaded. Run \`${backfill}\` any time.`,
+    nothingToUpload: "Nothing to upload: no earlier session on this machine is waiting for a repository you've chosen.",
+    runHeading: (sessions) => sessions === 1 ? "Uploading 1 session..." : `Uploading ${sessions} sessions, one at a time...`,
+    /** Outcome fragments on a repo line, joined by " · ". */
+    uploaded: (count) => `${count} uploaded`,
+    skipped: (count, reason) => `${count} skipped, ${reason}`,
+    held: (count) => `${count} held, the org must approve capture`,
+    failed: (count, reason) => `${count} failed, ${reason}`,
+    stopped: "stopped",
+    /** Skip reasons. */
+    overSize: "over 50 MiB",
+    folderDiffers: "folder differs",
+    folderNotRecorded: "folder not recorded",
+    /** The transcript could not be opened at all (permissions), which is a different fact from one that records no folder. */
+    couldntBeRead: "couldn't be read",
+    /** The file vanished between the offer and its upload: a skip, not a refusal by the server. */
+    fileGone: "the file is gone",
+    /** `vibecommit off` (or a grant removed) while the run was going: the rest of that repo is not sent. */
+    turnedOff: "turned off while this ran",
+    outsideAgentFolder: "not in the agent's session folder",
+    /** Failure reasons: a `never`. The server's own code is never shown (§13.6: no bare status, no raw error). */
+    refusedByServer: "the server refused it",
+    repositoryForbidden: "another organization owns this repository",
+    noRepoIdentity: "no repository identity",
+    unrecognisedFileName: "the file name isn't a session id",
+    /** The summary. The glyph is `ok` only when nothing was held, stopped or failed. */
+    summary: (uploaded, total, skipped, held, failed) => {
+        const noun = total === 1 ? "session" : "sessions";
+        const tail = [
+            skipped > 0 ? `${skipped} skipped` : null,
+            held > 0 ? `${held} held` : null,
+            failed > 0 ? `${failed} failed` : null,
+        ].filter((part) => part !== null);
+        return `Uploaded ${uploaded} of ${total} ${noun}.${tail.length > 0 ? ` ${tail.join(", ")}.` : ""}`;
+    },
+    /** `owners` is the held repos' owners, already phrased ("acme-corp", "acme-corp or other-org"). */
+    heldBlock: (owners) => `Held sessions wait for ${owners} to approve capture:`,
+    heldThenRun: "Then run:",
+    /**
+     * The stop block: a server `later` (5xx, 429) stops the run, with the resume fix. ⛔ It states only what landed: `uploaded` is
+     * sessions the server took, not sessions looked at, and "not yet uploaded" is what a re-run will OFFER again (skipped and held
+     * sessions among them), not a promise of what it will send.
+     */
+    stopWhat: (uploaded, total) => `Upload stopped: ${uploaded} of ${total} ${total === 1 ? "session" : "sessions"} uploaded.`,
+    stopWhy: (notUploaded) => `The server asked the client to try again later. Nothing already sent is lost, and a re-run offers the ${notUploaded} ${notUploaded === 1 ? "session" : "sessions"} not yet uploaded.`,
+    /** No response at all (a refused connection, a timeout): not the server asking anything. */
+    stopWhyUnreachable: (notUploaded) => `The server could not be reached. Nothing already sent is lost, and a re-run offers the ${notUploaded} ${notUploaded === 1 ? "session" : "sessions"} not yet uploaded.`,
+    stopFixLabel: "Resume:",
+    /** Ctrl+C at the y/N or during the upload. Exit 0: capture is on. */
+    interrupted: (backfill) => `Stopped. A re-run of ${backfill} sends what is left.`,
+    /** Exit 3. */
+    notConnectedWhat: "This machine isn't connected.",
+    notConnectedWhy: "`backfill` uploads with this machine's credential, and there isn't one. Nothing was read.",
+    notConnectedFixLabel: "Connect first:",
+    /** `grants.json` is present and unreadable: every repo with a remote is denied, so there is nothing honest to offer. */
+    grantsUnreadableWhat: "Backfill can't run: ~/.vibecommit/grants.json can't be read.",
+    grantsUnreadableWhy: "Capture is stopped on this machine for every repository that has a remote until the file is readable. Nothing was read and nothing was uploaded.",
+    grantsUnreadableFixLabel: "Fix the file or move it aside, then run:",
+    /** Exit 2. A prompt that proceeds when nobody can answer it is not a prompt. */
+    nonInteractiveWhat: "`backfill` needs an interactive terminal.",
+    nonInteractiveWhy: "Standard input is not a terminal, so the question before uploading cannot be answered. Nothing was read and nothing was uploaded.",
+    nonInteractiveFix: "Run this in a terminal:",
+    /** The credential was rejected mid-run (a 401): the same block `finalize` shows, in this verb's words. */
+    credentialStoppedWhat: "Upload stopped: this machine's credential is no longer accepted.",
+    credentialStoppedWhy: "Nothing already sent is lost, and a re-run offers the sessions not yet uploaded.",
+    credentialStoppedFixLabel: "Renew it, then run backfill again:",
+    usageWhat: "That is not something `vibecommit backfill` understands.",
+    usageWhy: "Nothing was read and nothing was uploaded. `backfill` takes no arguments.",
+};
+/**
+ * `vibecommit connect` from any folder — the picker, the grant block, the hooks step and the endings (0.7.0, PR 3).
+ * Style guide §10.12, copied from the merged guide and the design doc; the design doc wins where they differ.
+ */
+export const PICKER = {
+    onNow: "on now",
+    turnedOff: "turned off",
+    /** Why an `on now` row is on (D5 · 1A), so a 0.6.x upgrader sees what is already captured. */
+    reasonOwner: "owner",
+    reasonRepo: "repo",
+    reasonPerClone: "per clone",
+    /** The owner row ALWAYS states how many repos `aN` covers (D9), so a hidden repo is never covered unseen. */
+    ownerAll: (count) => `all ${count} ${count === 1 ? "repo" : "repos"} here, including repos you clone later`,
+    ownerOnReposHere: (count) => `${count} ${count === 1 ? "repo" : "repos"} here`,
+    turnOnHint: "choose it to turn it back on",
+    /** Where the working folder is a repo, the row is marked so a pre-tick (or a `$HOME` dotfiles repo) is legible. */
+    thisRepo: "this repo",
+    thisFolder: "this folder",
+    moreTyped: (count, owner) => `${count} more in ${owner}/ · type more to list them`,
+    moreChecklist: (count, owner) => `${count} more in ${owner}/`,
+    /** The typed prompt (D8). */
+    choose: (hasOwners) => hasOwners
+        ? "Choose a1, numbers (1 2), owner/ or owner/repo."
+        : "Choose numbers (1 2), owner/ or owner/repo.",
+    removeHint: "Remove one with -N, -owner/ or -owner/repo.",
+    enterNothing: "Press Enter to change nothing.",
+    /** D34 in the typed prompt: the working folder's repo is pre-selected, so Enter leads to the (default No) y/N. */
+    enterThisRepo: (slug) => `Press Enter to choose ${slug}, this repo.`,
+    promptMark: "> ",
+    /** `tokens` is the already-joined list (`9 (no row 9), acme, corp`): the corpus renders every template with a string. */
+    notUnderstood: (tokens) => `Not understood: ${tokens}. Nothing was chosen.`,
+    noRow: (n) => `${n} (no row ${n})`,
+    alreadyOn: (token, remove) => `${token} (already on; ${remove} stops it)`,
+    notOn: (token) => `${token} (not on)`,
+    /** The empty screen (D12 · 6A): a new laptop, no agent session on disk at all. */
+    emptyNone: "No coding-agent sessions were found on this machine.",
+    emptyExpected: "That's expected on a new machine. Type the owners or repos to capture; every clone of them is captured once Claude Code, Codex or Cursor runs in it.",
+    emptyType: "Type owner/ or owner/repo, for example alexvibecommit/.",
+    /** Sessions exist but none could be listed (the `Not listed here:` block is not empty): scan's own wording. */
+    emptyListable: "Type owner/ or owner/repo, for example alexvibecommit/, to capture a repository that is not listed.",
+    /** The checklist (D28). */
+    hint: "↑↓ move · space choose · enter done · t typed prompt · ctrl+c cancel",
+    hintTyped: (connectTyped) => `For a screen reader, run: ${connectTyped}`,
+    /** The enter-with-nothing lines (D5). */
+    nothingGranted: (connect) => `Nothing granted. Run \`${connect}\` again any time.`,
+    noChanges: (summary) => `No changes. Capture stays on for ${summary}.`,
+    cancelled: "Cancelled. Nothing was changed.",
+    /** The grant block (D7 · 3A). */
+    chose: "You chose:",
+    labelOwners: "owners",
+    labelRepos: "repos",
+    labelTurnOn: "turn on",
+    labelStop: "stop",
+    ownerHere: (count) => `(${count} here, and later clones)`,
+    noCloneHere: "(no clone here yet)",
+    questionGrant: "Upload transcripts from these repositories?",
+    questionStop: "Stop capturing these repositories?",
+    stopped: "Stopped capturing the repositories above.",
+    /** "1 owner and 2 repos" — the on-now summary of Enter-with-grants, `auth`'s one line and the status heading. */
+    summary: (owners, repos) => {
+        const o = `${owners} ${owners === 1 ? "owner" : "owners"}`;
+        const r = `${repos} ${repos === 1 ? "repo" : "repos"}`;
+        if (owners > 0 && repos > 0)
+            return `${o} and ${r}`;
+        return owners > 0 ? o : r;
+    },
+    authStays: (summary) => `Capture stays on for ${summary} on this machine.`,
+    /** The hooks step (D13 · 7A). */
+    hooksBeat: (clones) => `Adding commit hooks to ${clones} ${clones === 1 ? "clone" : "clones"}...`,
+    hooksDone: "done",
+    hooksCount: (added, chained, notAdded) => {
+        const head = `${added} added${chained > 0 ? `, ${chained} of them after your own hook` : ""}`;
+        return notAdded > 0 ? `${head} · ${notAdded} not added` : head;
+    },
+    hooksNotAdded: (count) => `Commit hooks were not added to ${count} ${count === 1 ? "clone" : "clones"}:`,
+    hooksPathReason: "core.hooksPath is set",
+    /** A hook write that FAILED is a real exception with its own reason (VQ, item 9): neither dropped nor given `hooksPath`'s fix. */
+    hooksFailedReason: "the hook could not be written",
+    hooksStillCaptured: "Sessions there are still captured. To record commits too, either:",
+    hooksStillCapturedOther: "Sessions there are still captured.",
+    hooksFailedFixLabel: "Where the hook could not be written, try again:",
+    /** "Capture is on" (D18 · 12A, D19 · 13A). */
+    onFor: (summary) => `Capture is on for ${summary} on this machine.`,
+    onProof: "The next Claude Code, Codex or Cursor session in any of them is captured. In Claude Code, its first reply then shows \"VibeCommit captured this session.\"",
+    stopOne: "To stop one repo, run inside it:",
+    /**
+     * Alexander's "caveat for other owners" (2026-10-24; amended 17:20), on the "Capture is on" block. It prints for the owners the
+     * test capture did NOT check: from `~` that is every granted owner (there is no session to probe), and in a repo it is every
+     * granted owner except the one whose delta the server answered with a 2xx. For an owner that is not the signed-in person's own
+     * account the client cannot know whether an org is yet to approve capture, so it says one may be. Never printed when every
+     * such owner is the user's own account.
+     */
+    ownerApproval: (status) => `An organization can require an owner's approval before its repos are captured; once a session in one of its repos has tried to upload, ${status} shows any that are waiting.`,
+    onNewLaptop: (names) => `Capture is on for ${names} on this machine.`,
+    onNewLaptopProof: "No clone of it is here yet. Clone one and open a coding agent in it; that session is captured.",
+};
 /** `vibecommit off`. */
 export const OFF = {
     done: "Capture is off for this repository.",
+    /**
+     * 0.7.0, a claims-register row. A repo with a remote is turned off BY SLUG, which reaches every clone of it on this
+     * machine. Slice 2 extends the sentence to the other machines once they sync; until then it says only what is true.
+     */
+    doneSlug: (slug) => `Turned off ${slug} for every clone on this machine.`,
+    /** D31: bare `off` outside a repository. The picker is where an owner or another repo is unticked. */
+    outsideRepoWhat: "`off` turns off the repository you're in.",
+    outsideRepoFixLabel: "To stop capturing an owner or another repo, untick it in the picker:",
+    /** `grants.json` is unreadable, so the exclusion could not be recorded. The clone's own consent was still withdrawn. */
+    grantsUnreadableWhat: "The turn-off could not be recorded: ~/.vibecommit/grants.json can't be read.",
+    grantsUnreadableWhy: "Capture is already stopped for this repository while the file can't be read, and this clone's own consent was withdrawn.",
+    grantsUnreadableFixLabel: "Fix the file or move it aside, then run:",
     alreadyOff: "Capture was already off for this repository.",
     note: "Sessions already recorded are unaffected.",
     // `TODOS[184]`. `off` used to ignore `argv` entirely and always run — a stray
@@ -989,7 +1474,10 @@ export const WHY = {
      */
     skewWhat: "The record service sent an answer this version is too old to show.",
     skewWhy: "The service described this commit in a way this build does not recognise. The record itself is fine — this copy of the client cannot render it, so it showed nothing rather than guessing at part of it.",
+    /** The PLUGIN channel's remedy (`COMMANDS.pluginInstall`). */
     skewFix: "Reinstall the VibeCommit plugin to pick up the current client, then run this again:",
+    /** The npm channel's remedy (`COMMANDS.npmUpdate`): an npm install has no plugin to reinstall. */
+    skewFixNpm: "Update VibeCommit to pick up the current client, then run this again:",
     /** The bearer is dead after one refresh and one retry. Exit 3, not 1. */
     signedOutWhat: "This machine is not signed in to VibeCommit.",
     signedOutWhy: "Reading a record needs a signed-in user, and no usable sign-in was found on this machine.",
@@ -1276,20 +1764,44 @@ export const ABSENCE = {
  * know were bound: `closed` says the last turn is recorded, not that any commit matched it.
  */
 export const FINALIZE = {
-    needTarget: "Say which session to close: --session <id>, or --latest.",
+    // PR 7 (Q7): where the remedy is a command it sits in the §13.6 fix block, not inside the `what` line. The `what` lines
+    // below lost exactly the clause that moved; the fix commands are the ones the old sentence named.
+    needTarget: "Say which session to close.",
+    needTargetFix: "Name one, or take the latest:",
     badSessionId: "That is not a session id (letters, digits, dot, dash and underscore only).",
-    noRecentSession: "No session in this repository has delivered anything in the last 24 hours. Use --session <id>.",
-    severalRecent: "More than one session in this repository is recent. Name one with --session <id>:",
+    noRecentSession: "No session in this repository has delivered anything in the last 24 hours.",
+    noRecentSessionFix: "Name a session:",
+    severalRecent: "More than one session in this repository is recent.",
+    severalRecentFix: "Name one:",
+    /** `finalize --session <id>` for a session that is known, e.g. the one whose delivery just failed. */
+    commandSession: (id) => `vibecommit finalize --session ${id}`,
+    /** The same with the placeholder, for a fix line written before a session is known. */
+    commandSessionAny: "vibecommit finalize --session <id>",
+    /** The command without its id, for a sentence that names the id itself (`status`'s held-idle line). */
+    commandSessionBase: "vibecommit finalize --session",
+    commandSessionForce: (id) => `vibecommit finalize --session ${id} --force`,
     recentRow: (id, minutesAgo) => `${id}  (${minutesAgo} min ago)`,
     unknownSession: (id) => `This repository has no captured session ${id}.`,
     transcriptMissing: (id) => `Could not find the transcript for session ${id}.`,
-    stillWriting: "That session's transcript changed a moment ago. Wait for the session to finish, or pass --force if it is over.",
+    stillWriting: "That session's transcript changed a moment ago.",
+    stillWritingFix: "Wait for the session to finish, or if it is over, run:",
     closed: (id) => `Closed session ${id}: its last turn is recorded, so commits made in it can now be recorded.`,
     alreadyClosed: (id) => `Session ${id} had nothing left open. Nothing changed.`,
     notAcknowledged: "The server accepted the data but did not confirm that it closed the session; it may predate this command. The last turn may still be open.",
-    refused: "The server declined to close the session on this attempt. Run the command again.",
-    notDelivered: "Could not deliver the session. Nothing was closed. Run the command again.",
-    credentialStopped: "VibeCommit stopped sending for this credential. Run `vibecommit auth` to replace it.",
+    refused: "The server declined to close the session on this attempt.",
+    retryFix: "Run it again:",
+    notDelivered: "Could not deliver the session. Nothing was closed.",
+    credentialStopped: "VibeCommit stopped sending for this credential.",
+    credentialStoppedFix: "Replace it:",
+    /**
+     * PR 7 (Q2, VQ's wording): the ingest address in the environment (`VIBECOMMIT_INGEST_URL`) is one this client refuses to
+     * send to, so retrying cannot help. Shared by `finalize` and `backfill`, so the `why` says only "Nothing was sent": it must
+     * not claim a session was or was not closed. The VALUE is never echoed (a URL can carry a secret).
+     */
+    ingestUrlWhat: "The address VibeCommit sends sessions to can't be used.",
+    ingestUrlWhy: "VIBECOMMIT_INGEST_URL must be an https address, or an http address on this machine, and it isn't. Nothing was sent.",
+    ingestUrlFix: "Correct it, or remove it to use the default address:",
+    ingestUrlCommand: "unset VIBECOMMIT_INGEST_URL",
     /**
      * `TODOS[177]` follow-up (VL, 2026-10-08, VG's silent-loss finding) — ONE stderr line for the whole run when
      * `finalize` sets any inferred-squash pairs aside (the main delivery, the drain loop, or both, summed). Printed
@@ -1317,8 +1829,8 @@ export const REJECTED = {
      * command across lines; `unconfirmed` is their join, the sentence the plan wrote.
      */
     unconfirmedWhat: "Couldn't confirm this machine's credential with the server.",
-    unconfirmedFix: "Run `vibecommit status` later.",
-    unconfirmed: "Couldn't confirm this machine's credential with the server. Run `vibecommit status` later.",
+    unconfirmedFix: (status) => `Run \`${status}\` later.`,
+    unconfirmed: (status) => `Couldn't confirm this machine's credential with the server. Run \`${status}\` later.`,
 };
 /** `TODOS[184]`-style one-sentence facts the retire step prints; every one is true whatever the server did. */
 export const RETIRE = {
@@ -1350,6 +1862,12 @@ export const REPLACE = {
     questionUnconfirmed: "Upload this machine's transcripts to the workspace you signed in to?",
     replacesValue: (org) => `credential for ${org}`,
     question: (org) => `Upload this machine's transcripts to ${org}?`,
+    /**
+     * 0.7.0, D7 · 3A: on the PICKER path the question names the repos, not the machine, and is the second of at most three
+     * questions in a run. The workspace is cut to 28 columns (not `question`'s 30) so the line stays within 80 with `[y/N]`.
+     */
+    questionRepos: (org) => `Upload transcripts from the repos above to ${org}?`,
+    questionReposUnconfirmed: "Upload transcripts from the repos above to your signed-in workspace?",
     declined: "Nothing was saved. The approval is discarded.",
     /** Ctrl+C at the question (the prompt was aborted): the same outcome as N, said as what it was. */
     cancelled: "Cancelled. Nothing was saved.",
@@ -1444,13 +1962,19 @@ export const UPDATE = {
     plugin: (latest) => `capture ${latest} is available: update the VibeCommit plugin in Claude Code.`,
 };
 export const ERRORS = {
-    notConnected: "This repository is not connected. Run `vibecommit connect`.",
+    notConnected: "This repository is not connected.",
+    /** PR 7 (Q7): the remedy was a sentence inside the `what` line; it is a command now, so it moves to the fix block. */
+    notConnectedFix: "Connect it:",
     networkLater: "Could not reach VibeCommit. This session will be recorded on the next turn.",
     // `11A`. The `what` of the §13.6 rejected-credential block (`REJECTED`), not a second sentence: the
     // old line sent users to `connect`, which printed "Connected" over the same dead credential (G1).
     authFatal: "This machine's credential is no longer accepted.",
     payloadNever: "This session was too large to record and has been skipped.",
     notAGitRepo: "Not a git repository.",
+    /** PR 7 (VQ): names the folder, tilde-shortened and cut from the LEFT by the caller (`truncatePath`, §13.4). */
+    notAGitRepoWhy: (folder) => `${folder} is not inside a git work tree.`,
+    /** A fix with no command to give: the remedy is where to run it, so the block has a label and no commands. */
+    notAGitRepoFix: "Run it again inside a git repository.",
 };
 /**
  * The interactive top-level catch (CR-022).
@@ -1470,7 +1994,8 @@ export const INTERNAL = {
     unexpectedWhat: "VibeCommit stopped on an unexpected error.",
     unexpectedWhy: "The command did not finish.",
     unexpectedFix: "Run it again with the error detail shown:",
-    unexpectedDebugCommand: "VIBECOMMIT_DEBUG=1 vibecommit <command>",
+    // The command is this install's own (PR 7): `node <path> <command>` on a plugin-only machine, which has no `vibecommit`.
+    unexpectedDebugCommand: (command) => `VIBECOMMIT_DEBUG=1 ${command} <command>`,
 };
 /**
  * Credential-loading failures (CR-016).
@@ -1498,6 +2023,10 @@ export const CREDENTIAL = {
     insecureFileModeLabel: "mode",
     insecureFileWhy: "It was not read. A credential file must be readable only by its owner.",
     insecureFileFix: "Restore the mode, then reconnect:",
+    /** The FOLDER (`~/.vibecommit`) is open to other accounts, not the file: same code, its own what, why and `chmod`. */
+    insecureDirWhat: "The folder that holds the credential file is open to other accounts on this machine.",
+    insecureDirWhyLabel: "folder",
+    insecureDirWhy: "The credential was not read. This folder must be accessible only to its owner.",
     unreadableWhat: "The credential file could not be read.",
     unreadableWhy: "It exists but does not contain a credential in the expected form.",
     /** `CR-216/U4`. Was "Replace it by reconnecting:" — see `wrongClassFix` above. */
@@ -1531,15 +2060,26 @@ export const AUTH = {
     nextCommand: "vibecommit connect",
     emptyWhat: "No credential was given.",
     emptyWhy: "Nothing was read, so nothing was written.",
-    emptyFix: "Mint one, then run:",
+    /**
+     * PR 6 item 1. Was "Mint one, then run:" over the URL alone, so the label promised a command and printed a link, and the
+     * non-interactive path was named nowhere. The URL comes FIRST (inside the label, where it cannot be wrapped away from
+     * its sentence) and the commands LAST, so the fix stays last (§13.6). A function because `URLS` is declared below.
+     */
+    mintFix: (url) => `Mint one at ${url}, then run either:`,
+    /**
+     * The two ways to hand it over: piped (a script or an agent), or typed at a terminal. `--stdin` never continues into `connect`
+     * (D32 guard 1). `auth` is `authCommandFor(env, selfPath)`: a plugin-only machine has no `vibecommit` on PATH, so the line names
+     * `node <path> auth` there (README, "Keeping a machine connected"), and handing it `vibecommit auth` would be a new wrong output.
+     */
+    mintCommands: (auth) => [`printf %s "$TOKEN" | ${auth} --stdin`, auth],
     wrongClassWhat: "That is not a VibeCommit ingest credential.",
     wrongClassWhy: `An ingest credential begins ${INGEST_TOKEN_PREFIX}. Nothing was written and nothing was sent.`,
-    wrongClassFix: "Mint one, then run:",
     argvWhat: "A credential must not be passed as an argument.",
     argvWhy: "Arguments are written to your shell history and are readable by other processes on this machine while the command runs. Treat the one you just typed as exposed and revoke it.",
     argvFix: "Read it from the terminal, or from a pipe:",
     argvFixPrompt: "vibecommit auth",
-    argvFixStdin: 'printf %s "$TOKEN" | vibecommit auth --stdin',
+    /** A pipe, so `channelCommand` cannot rewrite it: it takes the channel's `auth` (`authCommandFor`) instead. */
+    argvFixStdin: (auth) => `printf %s "$TOKEN" | ${auth} --stdin`,
     // --- `CR-226`: the browser mint, and the paste it falls back to. ---
     /**
      * Printed before the request, naming the label the credential will carry in
@@ -1630,6 +2170,18 @@ export const SYSTEM_MESSAGE = {
      * users and its hash chain detects post-write tampering").
      */
     captureConfirmed: (dashboardUrl) => `VibeCommit captured this session. ${dashboardUrl}`,
+    /**
+     * States 6-9 — style guide §10.1 (0.7.0, design review D16 · 10A), all emitted by the `SessionStart` hook. One
+     * plain-text line each, ≤120 characters, no SGR. The wording is the design doc's and the merged style guide's,
+     * byte for byte; `test/session-start.test.ts` pins the length of every one.
+     *
+     * 6 — hooks added, once per clone. 7 — `core.hooksPath` is set, once per clone. 8 — the clone has its own
+     * commit hook, once per clone. 9 — `grants.json` is unreadable, once per (machine, day).
+     */
+    hooksAdded: "VibeCommit added its post-commit and post-rewrite hooks to this clone, so commits can link to sessions.",
+    hooksPathSet: "VibeCommit captures sessions here, not commits: core.hooksPath is set. Run `vibecommit status` here for the fix.",
+    ownCommitHook: "VibeCommit didn't add its commit hook here: this clone has its own. Run `vibecommit connect` here to chain it.",
+    grantsUnreadable: "VibeCommit capture stopped on this machine: ~/.vibecommit/grants.json can't be read. Run `vibecommit status`.",
 };
 /**
  * The out-of-tree redaction marker — `CR-024d`, D57 §OV8d.
@@ -1660,6 +2212,10 @@ export const REDACTION = {
 /** Commands the copy points at. One definition, so a rename cannot half-land. */
 export const COMMANDS = {
     connect: "vibecommit connect",
+    /** `D33 · 27A`. */
+    scan: "vibecommit scan",
+    /** `D14`/`D15`. */
+    backfill: "vibecommit backfill",
     /**
      * `CR-216/U2`. The only verb a credential FAULT's fix line may name — it can
      * replace the credential from any state. `CR-226` lets `connect` mint one
@@ -1680,6 +2236,10 @@ export const COMMANDS = {
     /** The ref form, for the detached-HEAD refusal. */
     reportRef: "vibecommit report --since 2026-07-08 --ref main",
     off: "vibecommit off",
+    /** The picker's screen-reader flag: a FLAG on `connect`, like `signIn`. */
+    connectTyped: "vibecommit connect --typed",
+    /** The git hook's own verb. `hooksPathFixManual` tells a user to add it to a hook they keep. */
+    postCommit: "vibecommit post-commit",
     /**
      * `CR-086`. The ARGUMENT SHAPE, shown once so the usage error and the retry
      * fix line cannot drift apart. There is no argument parser in this package —
@@ -1690,6 +2250,8 @@ export const COMMANDS = {
      */
     why: "vibecommit why src/auth/session.ts:47",
     chmodCredentials: "chmod 600 ~/.vibecommit/credentials.json",
+    /** The folder's remedy, for `CREDENTIAL_FILE_INSECURE` when the folder is the one with the wrong mode. */
+    chmodDirectory: "chmod 700 ~/.vibecommit",
     /**
      * ⛔ THE INSTALL COMMAND, TRANSCRIBED FROM `claude-plugin/README.md:12` — and
      * it is deliberately NOT an invented update verb (`U1`, 2026-08-30).
@@ -1707,6 +2269,8 @@ export const COMMANDS = {
      * together — the wording and the command are one unit.
      */
     pluginInstall: "/plugin install vibecommit@vibecommit-capture",
+    /** The npm channel's way to a newer client: the package's own documented install, at `latest`. */
+    npmUpdate: "npm install -g @vibe-commit/capture@latest",
 };
 /**
  * Every URL the CLI prints. Here rather than inline for the same reason as the
@@ -1730,6 +2294,8 @@ export const URLS = {
      * deepening this constant is that task's, not a later guess.
      */
     commits: "https://vibecommit.ai/app/commits",
+    /** `/app/conversations`: where an uploaded backfill lands (D19). `/app` (`dashboard`) is the ending after a no. */
+    conversations: "https://vibecommit.ai/app/conversations",
     /**
      * One recorded session — the ending's link when the ingest 2xx carried a `conversation_id` (`DX D8`).
      * Verified by file: `vibecommit-web` `app/app/conversations/[id]/page.tsx` exists on `main`, and an

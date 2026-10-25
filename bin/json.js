@@ -49,14 +49,14 @@
  *
  * ## What is NOT here, deliberately
  *
- * **A failure taxonomy.** A verb that could not do its job renders §13.6's
- * what/why/fix block to **stderr** and writes **nothing** to stdout, exactly as
- * it does without the flag — clause 1 holds trivially, the exit code already
- * carries the branch a wrapper needs (§13.7 gives five distinct codes), and
- * minting a parallel error vocabulary would be a contract nobody asked for.
- * **Absence is not a failure** and DOES emit a document: `why` on a commit with
- * no edge and `report` on an empty window are ANSWERS (exit 4 says so), and a
- * machine surface that went silent on them would lose the state that matters.
+ * **A failure is not an answer to the question asked** — but since 0.7.0 (PR 7) it is no longer silent either. A verb that
+ * could not do its job writes ONE failure document (`renderJsonError`: `outcome: "error"`, the stable `code`, the
+ * what/why and the fix) to stdout and NOTHING to stderr, with the same exit code as the text block. Before PR 7 it
+ * rendered the block to stderr and left stdout empty, and the exit code alone could not tell a wrapper which failure;
+ * the stable codes (`src/copy/error_codes.ts`) can, so the parallel vocabulary the older text declined to mint is now
+ * the same one. **Absence is not a failure** and DOES emit an ordinary document: `why` on a commit with
+ * no edge and `report` on an empty window are ANSWERS (exit 4 says so), and a machine surface that went silent on them
+ * would lose the state that matters.
  *
  * ⚠ §13.3 does not settle that split in either direction. It is reported as an
  * open question rather than smoothed over — `DESIGN.md` is orchestrator-owned
@@ -81,6 +81,33 @@ export const JSON_SCHEMA_VERSION = 1;
  */
 export function renderJson(verb, outcome, body) {
     return `${JSON.stringify({ schema: JSON_SCHEMA_VERSION, verb, outcome, ...body })}\n`;
+}
+/**
+ * A failure as a document — 0.7.0 PR 7. Under `--json` a verb that could not do its job writes ONE document to stdout
+ * and nothing to stderr, with the verb's own exit code:
+ *
+ * ```
+ *   { "schema": 1, "verb": "status", "outcome": "error",
+ *     "error": { "code": "NOT_CONNECTED", "what": "…", "why": ["…"],
+ *                "fix": { "label": "…", "commands": ["…"] } | null } }
+ * ```
+ *
+ * This REPLACES the 0.6.x contract that a `--json` failure leaves stdout empty (the text above said "a failure is not
+ * an answer"; the exit code alone could not tell a wrapper WHICH failure, and the codes can). `fix` is `null` only when
+ * the block has no fix label at all (a label with nothing to type is `{ label, commands: [] }`), and its commands are the SAME strings the text block
+ * prints, already routed through the install channel.
+ */
+export function renderJsonError(verb, block) {
+    // `fix` is null only when the block has no fix label at all. A label with no command ("Run it again inside a git
+    // repository.") is a fix with `commands: []`; it is never a label-less list of commands.
+    const fix = block.fixLabel !== undefined ? { label: block.fixLabel, commands: [...(block.fixes ?? [])] } : null;
+    return renderJson(verb, "error", {
+        error: { code: block.code, what: block.what, why: [...block.why], fix },
+    });
+}
+/** Write the failure document to stdout and nothing else (the caller writes nothing to stderr). */
+export function emitJsonError(stdout, verb, block) {
+    stdout.write(renderJsonError(verb, block));
 }
 /**
  * Write one document to stdout, and nothing else.

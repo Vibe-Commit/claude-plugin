@@ -19,42 +19,47 @@ import { renderErrorBlock, truncatePath } from "../term.js";
 export function credentialProblem(load, colour, 
 /** The channel's `auth` (`installChannel`) — `vibecommit auth` on npm, `node <path> auth` for the plugin. */
 authCommand = COMMANDS.auth) {
+    return renderErrorBlock(credentialProblemBlock(load, authCommand), colour);
+}
+/**
+ * The block itself, un-rendered: `--json` failures carry the same code, sentences and fix commands as the text.
+ * 0.7.0 PR 7: the fix command is the one the caller gives (the channel's `auth`), never a literal.
+ */
+export function credentialProblemBlock(load, authCommand = COMMANDS.auth) {
     switch (load.kind) {
         case "wrong-class":
-            return renderErrorBlock({
+            return {
                 kind: "bad",
+                code: "STORED_CREDENTIAL_NOT_INGEST",
                 what: CREDENTIAL.wrongClassWhat,
-                why: [
-                    load.source === "env"
-                        ? CREDENTIAL.wrongClassEnvWhy
-                        : CREDENTIAL.wrongClassFileWhy,
-                ],
+                why: [load.source === "env" ? CREDENTIAL.wrongClassEnvWhy : CREDENTIAL.wrongClassFileWhy],
                 fixLabel: CREDENTIAL.wrongClassFix,
                 fixes: [authCommand],
-            }, colour);
+            };
         case "insecure-file":
-            return renderErrorBlock({
+            return {
                 kind: "bad",
-                what: CREDENTIAL.insecureFileWhat,
+                code: "CREDENTIAL_FILE_INSECURE",
+                // ONE code, two remedies: the folder's mode and the file's mode are different things to fix, and `chmod 600` on
+                // the file does not clear a folder that other accounts can enter (the user would loop on this block).
+                what: load.target === "directory" ? CREDENTIAL.insecureDirWhat : CREDENTIAL.insecureFileWhat,
                 why: [
-                    `${CREDENTIAL.insecureFileWhyLabel} ${truncatePath(load.path, 60)}`,
+                    `${load.target === "directory" ? CREDENTIAL.insecureDirWhyLabel : CREDENTIAL.insecureFileWhyLabel} ${truncatePath(load.path, 60)}`,
                     `${CREDENTIAL.insecureFileModeLabel} ${load.mode}`,
-                    CREDENTIAL.insecureFileWhy,
+                    load.target === "directory" ? CREDENTIAL.insecureDirWhy : CREDENTIAL.insecureFileWhy,
                 ],
                 fixLabel: CREDENTIAL.insecureFileFix,
-                fixes: [COMMANDS.chmodCredentials],
-            }, colour);
+                fixes: [load.target === "directory" ? COMMANDS.chmodDirectory : COMMANDS.chmodCredentials],
+            };
         case "unreadable":
-            return renderErrorBlock({
+            return {
                 kind: "bad",
+                code: "CREDENTIAL_FILE_UNREADABLE",
                 what: CREDENTIAL.unreadableWhat,
-                why: [
-                    `${CREDENTIAL.insecureFileWhyLabel} ${truncatePath(load.path, 60)}`,
-                    CREDENTIAL.unreadableWhy,
-                ],
+                why: [`${CREDENTIAL.insecureFileWhyLabel} ${truncatePath(load.path, 60)}`, CREDENTIAL.unreadableWhy],
                 fixLabel: CREDENTIAL.unreadableFix,
                 fixes: [authCommand],
-            }, colour);
+            };
     }
 }
 /**
@@ -66,8 +71,7 @@ authCommand = COMMANDS.auth) {
 export function rejectedCredentialBlock(input) {
     const expires = metaFor(input.home, input.fingerprint)?.expires_at ?? null;
     const expiredAt = expires === null ? Number.NaN : Date.parse(expires);
-    return renderErrorBlock({
-        kind: input.standing ? "warn" : "bad",
+    const body = {
         what: REJECTED.what,
         why: [
             Number.isFinite(expiredAt) && expiredAt <= input.nowMs
@@ -76,6 +80,9 @@ export function rejectedCredentialBlock(input) {
         ],
         fixLabel: REJECTED.fixLabel,
         fixes: [input.authCommand],
-    }, input.colour);
+    };
+    // A standing stop `status` reports is a warning and carries no code; the verdict `connect` just got is
+    // an error and does (`CREDENTIAL_REJECTED`, the same condition `finalize` and `backfill` stop on).
+    return renderErrorBlock(input.standing ? { kind: "warn", ...body } : { kind: "bad", code: "CREDENTIAL_REJECTED", ...body }, input.colour);
 }
 //# sourceMappingURL=credential_problem.js.map

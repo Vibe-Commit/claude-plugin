@@ -269,6 +269,28 @@ function isOurs(entry, shape, registration, binaryExists) {
         commandIsOurs(inner.command, registration.command, binaryExists));
 }
 /**
+ * Is one of OUR entries registered for this event in `raw`? Read-only, for `status` (0.7.0): a 0.6.x machine has
+ * `Stop`, `PreCompact` and `SessionEnd` but no `SessionStart`, and `npm i -g` alone never adds one.
+ *
+ * Unparseable, absent or the wrong shape all answer false — "not registered" is the honest reading of a file
+ * this client cannot use, and `connect` is the verb that explains a refusal.
+ */
+export function hasRegistration(raw, shape, registration, binaryExists = existsSync) {
+    if (raw === null)
+        return false;
+    let doc;
+    try {
+        doc = JSON.parse(raw);
+    }
+    catch {
+        return false;
+    }
+    if (!isRecord(doc) || !isRecord(doc.hooks))
+        return false;
+    const entries = doc.hooks[registration.event];
+    return Array.isArray(entries) && entries.some((e) => isOurs(e, shape, registration, binaryExists));
+}
+/**
  * ⛔ **THE WHOLE STRING, NEVER A SUBSTRING — the trap `TODOS[138]` names.**
  *
  * Two arms, and only two:
@@ -368,6 +390,15 @@ export function writeAgentHooks(path, shape, registrations) {
     const merged = mergeHookDocument(raw, shape, registrations, existsSync);
     if (merged.kind === "refused")
         return { kind: "refused", path, why: merged.why };
+    const events = registrations.map((registration) => registration.event);
+    // ⛔ **A BYTE-IDENTICAL RESULT IS NOT WRITTEN AT ALL** (0.7.0, VQ ruling). Codex hashes each hook's normalized
+    // config (event, matcher, command, timeout) and runs a user-level hook only while a persisted hash matches, so
+    // the entry this client writes is something the user has to APPROVE. A re-`connect` with the same binary path
+    // rebuilds the same entry; rewriting the file anyway churns its mtime for nothing and invites every tool that
+    // watches it to react. A MOVED binary path still lands here as different text and is refreshed, because a stale
+    // path is worse than a fresh review — the hook would point at a binary that is gone.
+    if (raw !== null && merged.text === raw)
+        return { kind: "already", path, events };
     const temp = join(dirname(path), `.${AGENT_HOOK_MARKER.replace(/\W+/g, "-")}.tmp`);
     try {
         mkdirSync(dirname(path), { recursive: true });
@@ -379,7 +410,6 @@ export function writeAgentHooks(path, shape, registrations) {
     catch (error) {
         return { kind: "failed", path, why: error instanceof Error ? error.message : "write failed" };
     }
-    const events = registrations.map((registration) => registration.event);
     // "already" is not "nothing happened" — the command was still refreshed. It is
     // the answer to *did this connect ADD anything*, which is what a user reads.
     return merged.added.length === 0

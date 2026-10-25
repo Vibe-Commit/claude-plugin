@@ -24,29 +24,36 @@
  * invented here: `CR-112` (W8) owns the five-absence grammar as one set, and
  * adding a variant now is what that task exists to prevent.
  */
-import { COMMANDS, ERRORS, HELP, OFF, STATUS, URLS, relativeAge } from "../copy/index.js";
-import { authCommandFor } from "../install.js";
+import { AGENT_HOOKS, COMMANDS, FINALIZE, HELP, OFF, STATUS, URLS, relativeAge } from "../copy/index.js";
+import { renderVerbHelp } from "../verb_help.js";
+import { authCommandFor, channelCommand } from "../install.js";
 import { credentialFingerprint } from "../post.js";
-import { isProjectAllowed, revokeProject } from "../consent.js";
+import { GrantsUnreadableError, excludeSlug, grantsUnreadable, isCaptureAllowed, isLocalSlug, normalizeSlug, readAllowList, revokeProject, } from "../consent.js";
 import { endDateText, endingSoon, metaFor } from "../credential_meta.js";
 import { loadCredential, savedCredentialExists } from "../credential.js";
 import { EXIT } from "../exit.js";
-import { resolveRepoSlug } from "../git.js";
+import { onceRepoSlug, remoteSlugOfCommonDir, resolveRepoSlug } from "../git.js";
 import { emitJson } from "../json.js";
 import { readInferredSkipped } from "../inferred_tally.js";
 import { readPruneTally } from "../pending_prune.js";
 import { resolveProjectKeys } from "../project.js";
 import { commitsWaitingForRepo, heldAtEndForRepo, inferredUnacknowledgedForRepo, lastReceiptForRepo, lastSendForRepo, leanHeldForRepo, leanSessionsForRepo, openTailForRepo, stuckForRepo, stoppedForRepo, stuckSpoolLinesForRepo, writtenOffForRepo, } from "../state.js";
 import { LABEL_GUTTER, WRAP_COLUMNS, glyph, labelled, paint, renderErrorBlock, tildePath, truncatePath, wrap, } from "../term.js";
-import { credentialProblem, rejectedCredentialBlock } from "./credential_problem.js";
-import { writeLines } from "./context.js";
+import { credentialProblem, credentialProblemBlock, rejectedCredentialBlock } from "./credential_problem.js";
+import { captureBasis } from "../machine_state.js";
+import { machineStatus } from "./status_machine.js";
+import { approvalPendingBlock } from "./approval_pending.js";
+import { readOrgPending } from "../org_pending.js";
+import { writeFailure, writeLines } from "./context.js";
+import { hookStateLines } from "./status_hooks.js";
 /** §10.3 indents the gutter rows four columns under the state line. */
 const ROW_INDENT = 4;
 export function status(ctx, argv = []) {
     // `TODOS[184]`. Check-first, before any git/credential/consent resolution — same ordering principle
     // every other verb's `--help` check uses. Reads and writes nothing.
     if (argv.includes("--help") || argv.includes("-h")) {
-        writeLines(ctx.stdout, [HELP.commands.status]);
+        const helpVerb = "status"; // an identifier, not a literal, at the writer: `copy-inline-literals` follows argument positions
+        writeLines(ctx.stdout, renderVerbHelp(helpVerb));
         return EXIT.ok;
     }
     // ⛔ THIS SCREEN USES BOTH ROLES AT ONCE (`D184 §1`), which is why the whole
@@ -55,16 +62,18 @@ export function status(ctx, argv = []) {
     // REPO IDENTITY and stay on the worktree toplevel. The `--json` field is
     // literally named `toplevel`, so moving it would make the document lie.
     const keys = resolveProjectKeys(ctx.cwd);
-    if (keys === null) {
-        writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", what: ERRORS.notAGitRepo, why: [] }, ctx.colour));
-        return EXIT.failure;
-    }
+    // 0.7.0, D6 · 2A: from a folder that is not a work tree `status` answers for the MACHINE, instead of "Not a git repository".
+    if (keys === null)
+        return machineStatus(ctx, argv);
     const projectKey = keys.worktree;
     // ⛔ CONSENT STATE, on the common dir. A worktree of a consented clone must
     // report ON here, because the hook that runs there is now admitted — a
     // `status` still keyed on the toplevel would tell that user they are
     // disconnected while their session was being captured.
-    const on = isProjectAllowed(ctx.home, keys.consent);
+    //
+    // ⛔ THE GATE IS `isCaptureAllowed` (0.7.0): the same decision the hooks make, so `status` cannot say "on" over a
+    // clone the hook is refusing (an excluded slug, an unreadable `grants.json`) or "off" over one it is admitting.
+    const on = isCaptureAllowed(ctx.home, keys, onceRepoSlug(projectKey));
     // ⛔ `ok` IS A HEALTH CLAIM, NOT ONLY A CONSENT ONE (`CR-228`, `TODOS[142]`).
     // The line beside the glyph is consent state and stays so; the glyph is what a
     // user reads as "fine". It printed `ok` over a session that had written off
@@ -124,7 +133,11 @@ export function status(ctx, argv = []) {
     // from what the hook last heard (`X-Credential-Expires`), so it is as fresh as the last capture.
     const endsAt = fingerprint === null ? null : endingSoon(metaFor(ctx.home, fingerprint), ctx.now().getTime());
     const endsText = endsAt === null ? null : endDateText(endsAt);
+    // 0.7.0: this repo's own last upload was refused because its org has not approved capture (a hook's `later`, remembered
+    // by `org_pending.ts`). Raised only for a repo that is on, and cleared by the next delivery.
+    const orgPending = on ? readOrgPending(ctx.home, resolveRepoSlug(projectKey)) : null;
     const kind = on &&
+        orgPending === null &&
         stopped === null &&
         endsText === null &&
         writtenOff.gaps === 0 &&
@@ -138,6 +151,7 @@ export function status(ctx, argv = []) {
     const lines = [
         `  ${paint(ctx.colour, kind, glyph(ctx.colour, kind))} ${paint(ctx.colour, "strong", on ? STATUS.onForRepo : STATUS.offForRepo)}`,
         labelled(ROW_INDENT, STATUS.repoLabel, repoValue(ctx, projectKey)),
+        ...(on ? [labelled(ROW_INDENT, STATUS.basisLabel, basisValue(ctx, projectKey))] : []),
     ];
     // Question 2: the last successful send FOR THIS REPO. `status` has no
     // session_id — it is interactive — so this is a scan of the repo's session
@@ -161,12 +175,19 @@ export function status(ctx, argv = []) {
     // `outcome` carries the on/off distinction the glyph carries on screen.
     if (argv.includes("--json")) {
         if (load.kind !== "ok" && load.kind !== "absent") {
-            writeLines(ctx.stderr, credentialProblem(load, ctx.colour, authCommand));
+            writeFailure(ctx, credentialProblemBlock(load, authCommand), "status");
             return EXIT.failure;
         }
         emitJson(ctx.stdout, "status", on ? "on" : "off", {
+            scope: "repo",
             repo: resolveRepoSlug(projectKey),
             toplevel: projectKey,
+            // 0.7.0, D6: why this repo is on — `owner`, `repo` or `per_clone`; `null` when it is off. A contract change,
+            // recorded in `json-read-verbs.test.ts`.
+            basis: on ? basisKind(ctx, projectKey) : null,
+            // 0.7.0: `{ at_ms }` when this repo's last upload was refused because its org has not approved capture, else `null`.
+            // A contract change, recorded in `json-read-verbs.test.ts`.
+            org_pending: orgPending === null ? null : { at_ms: orgPending.at },
             last_send: lastSend === null ? null : { at_ms: lastSend.at, seq: lastSend.seq },
             dashboard: URLS.dashboard,
             // `CR-216/U3`. A SOURCE NAME, never the credential — `IngestCredential.source`
@@ -229,7 +250,7 @@ export function status(ctx, argv = []) {
         stuckLines.push("", ...wrap(STATUS.liveStuck(stuck.liveStuck.bytes, stuck.liveStuck.sessions, stuckSpoolLines.liveCommits, stuck.liveStuck.ids), 2));
     }
     if (stuck.heldIdle.bytes > 0) {
-        stuckLines.push("", ...wrap(STATUS.heldIdle(stuck.heldIdle.bytes, stuck.heldIdle.sessions, stuckSpoolLines.idleCommits, stuck.heldIdle.ids), 2));
+        stuckLines.push("", ...wrap(STATUS.heldIdle(stuck.heldIdle.bytes, stuck.heldIdle.sessions, stuckSpoolLines.idleCommits, channelCommand(ctx.env, ctx.selfPath, FINALIZE.commandSessionBase), stuck.heldIdle.ids), 2));
     }
     const stuckCommitsTotal = stuckSpoolLines.liveCommits + stuckSpoolLines.idleCommits;
     // Absence is a SENTENCE, not a blank row. Triggered on the send record rather
@@ -258,7 +279,7 @@ export function status(ctx, argv = []) {
     // `TODOS[145]`/`[146]`: the consequence first (a session is over and its last turn never closed), then the
     // neutral fact (commits are waiting for a turn). Both omitted when zero — absence here is the healthy case.
     if (openTail.ids.length > 0) {
-        lines.push("", ...wrap(STATUS.openTail(openTail.ids.length), 2));
+        lines.push("", ...wrap(STATUS.openTail(openTail.ids.length, channelCommand(ctx.env, ctx.selfPath, COMMANDS.finalize)), 2));
     }
     else if (waiting - stuckCommitsTotal > 0) {
         lines.push("", ...wrap(STATUS.commitsWaiting(waiting - stuckCommitsTotal), 2));
@@ -295,6 +316,20 @@ export function status(ctx, argv = []) {
             standing: true,
         }));
     }
+    // 0.7.0. Loud, because the hook that is refusing cannot say why: an unreadable `grants.json` stops every clone
+    // that has a remote, whatever `projects.json` holds.
+    if (grantsUnreadable(ctx.home)) {
+        lines.push("", ...wrap(STATUS.grantsUnreadable(channelCommand(ctx.env, ctx.selfPath, COMMANDS.connect)), 2));
+    }
+    // 0.7.0, `SessionStart`: a missing registration (npm channel only), commit hooks that are off, or `core.hooksPath`.
+    lines.push(...hookStateLines(ctx, projectKey, on));
+    // §10.2's held beat, with its existing copy, for the repo whose own upload got the 403. Not a new sentence.
+    if (orgPending !== null) {
+        lines.push("", ...approvalPendingBlock(ctx.colour, resolveRepoSlug(projectKey), orgPending.ownersNotified));
+    }
+    // Codex runs no user-level hook until the user trusts it. Said, never detected (VQ + Alexander, 2026-10-24).
+    if (on)
+        lines.push("", ...wrap(AGENT_HOOKS.codexTrust, 2));
     lines.push("", ...actionLines(ctx, on));
     writeLines(ctx.stdout, lines);
     return on ? EXIT.ok : EXIT.notConnected;
@@ -330,6 +365,16 @@ function repoValue(ctx, toplevel) {
     }
     return value;
 }
+/** The `basis` row's value (D6): which of the three reasons admits this repo. */
+function basisValue(ctx, projectKey) {
+    const basis = captureBasis(ctx.home, resolveRepoSlug(projectKey));
+    return basis.kind === "owner" ? STATUS.basisOwner(basis.owner) : basis.kind === "repo" ? STATUS.basisRepo : STATUS.basisClone;
+}
+/** The `--json` spelling of the same three reasons. */
+function basisKind(ctx, projectKey) {
+    const basis = captureBasis(ctx.home, resolveRepoSlug(projectKey));
+    return basis.kind === "clone" ? "per_clone" : basis.kind;
+}
 /**
  * The two trailing actions, aligned as one pair — §10.3 draws their values in a
  * shared column, which only holds if both labels pad to the longer of the two.
@@ -340,11 +385,11 @@ function repoValue(ctx, toplevel) {
 function actionLines(ctx, on) {
     const pairs = on
         ? [
-            [STATUS.turnOffLabel, COMMANDS.off],
+            [STATUS.turnOffLabel, channelCommand(ctx.env, ctx.selfPath, COMMANDS.off)],
             [STATUS.revokeLabel, URLS.settings],
         ]
         : [
-            [STATUS.fixCommandLabel, COMMANDS.connect],
+            [STATUS.fixCommandLabel, channelCommand(ctx.env, ctx.selfPath, COMMANDS.connect)],
             [STATUS.revokeLabel, URLS.settings],
         ];
     const width = Math.max(...pairs.map(([label]) => label.length));
@@ -374,23 +419,75 @@ export function off(ctx, argv = []) {
     // every OTHER argument (including `--json`, which `off` has no mode for) still refuses.
     const rest = argv.filter((arg) => !OFF_RECOGNIZED_GLOBAL_FLAGS.includes(arg));
     if (rest.length > 0) {
-        writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", what: OFF.unrecognizedArgWhat, why: [OFF.unrecognizedArgWhy] }, ctx.colour));
+        writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", code: "UNRECOGNIZED_ARGUMENT", what: OFF.unrecognizedArgWhat, why: [OFF.unrecognizedArgWhy] }, ctx.colour));
         return EXIT.usage;
     }
     const keys = resolveProjectKeys(ctx.cwd);
     if (keys === null) {
-        writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", what: ERRORS.notAGitRepo, why: [] }, ctx.colour));
-        return EXIT.failure;
+        // D31 · 25B. Outside a work tree there is no repository to turn off, and the picker is where an owner or
+        // another repo is unticked. Exit 2: this is the verb used wrongly, not a failure of the machine.
+        writeLines(ctx.stderr, renderErrorBlock({
+            kind: "bad",
+            code: "OFF_NEEDS_REPO",
+            what: OFF.outsideRepoWhat,
+            why: [],
+            fixLabel: OFF.outsideRepoFixLabel,
+            fixes: [channelCommand(ctx.env, ctx.selfPath, COMMANDS.connect)],
+        }, ctx.colour));
+        return EXIT.usage;
     }
+    const slug = normalizeSlug(resolveRepoSlug(keys.worktree));
+    // Asked BEFORE anything is revoked: "was it on" decides whether there is an exclusion to record at all, and the
+    // answer after the revoke would always be no.
+    const wasOn = isCaptureAllowed(ctx.home, keys, slug);
     // ⛔ THE REVOKE SIDE, AND IT MUST DELETE THE KEY `connect` WROTE (`D184 §9`).
     // `revokeProject` deletes by exact string and reports `false` when the key is
     // absent — so a revoke still keyed on the toplevel would find nothing, print
     // "already off", and LEAVE THE GRANT IN PLACE. The user believes they
     // withdrew consent; capture continues. That is the worse direction of this
     // same bug, and it is the second mutation the cells below pin.
-    const changed = revokeProject(ctx.home, keys.consent);
+    let changed = revokeProject(ctx.home, keys.consent);
+    if (isLocalSlug(slug)) {
+        // No remote, no identity to turn off but this clone's own: 0.6.x behaviour, byte for byte.
+        writeLines(ctx.stdout, [
+            ...wrap(changed ? OFF.done : OFF.alreadyOff, 2),
+            ...wrap(OFF.note, 2),
+        ]);
+        return EXIT.ok;
+    }
+    // ⛔ A repo with a remote is turned off BY SLUG, so the exclusion does not depend on `grants.json` alone: every
+    // OTHER clone on this machine whose consent survives in `projects.json` and names the same repo loses it too.
+    // An entry whose directory is gone or has no readable remote is unknown, and unknown matches nothing.
+    for (const other of Object.keys(readAllowList(ctx.home))) {
+        const otherSlug = remoteSlugOfCommonDir(other);
+        if (otherSlug !== null && normalizeSlug(otherSlug) === slug) {
+            changed = revokeProject(ctx.home, other) || changed;
+        }
+    }
+    // An unreadable `grants.json` reads as "not on" above (it denies), but the user's `off` still has to be recorded, or
+    // be reported as not recorded: `excludeSlug` throws on it rather than rewrite a file whose exclusions it cannot see.
+    if (wasOn || grantsUnreadable(ctx.home)) {
+        try {
+            changed = excludeSlug(ctx.home, slug) || changed;
+        }
+        catch (error) {
+            if (!(error instanceof GrantsUnreadableError))
+                throw error;
+            // Fail closed already holds (an unreadable file denies this clone), and the clones' own consent is withdrawn
+            // above. What is missing is the record, and a rewrite would drop exclusions we cannot see.
+            writeLines(ctx.stderr, renderErrorBlock({
+                kind: "bad",
+                code: "GRANTS_UNREADABLE",
+                what: OFF.grantsUnreadableWhat,
+                why: [OFF.grantsUnreadableWhy],
+                fixLabel: OFF.grantsUnreadableFixLabel,
+                fixes: [channelCommand(ctx.env, ctx.selfPath, COMMANDS.off)],
+            }, ctx.colour));
+            return EXIT.failure;
+        }
+    }
     writeLines(ctx.stdout, [
-        ...wrap(changed ? OFF.done : OFF.alreadyOff, 2),
+        ...wrap(changed ? OFF.doneSlug(slug) : OFF.alreadyOff, 2),
         ...wrap(OFF.note, 2),
     ]);
     return EXIT.ok;

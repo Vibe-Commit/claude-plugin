@@ -29,12 +29,16 @@ import { connect } from "./commands/connect.js";
 import { finalize } from "./commands/finalize.js";
 import { off, status } from "./commands/status.js";
 import { report } from "./commands/report.js";
+import { backfill, backfillForConnect } from "./commands/backfill.js";
+import { scan } from "./commands/scan.js";
 import { why } from "./commands/why.js";
 import { HELP, INTERNAL, USAGE } from "./copy/index.js";
 import { EXIT } from "./exit.js";
 import { runHook } from "./hooks/entry.js";
 import { runPostCommit } from "./hooks/post_commit.js";
 import { runPostRewrite } from "./hooks/post_rewrite.js";
+import { channelCommand, installChannel } from "./install.js";
+import { renderJsonError } from "./json.js";
 import { LABEL_GUTTER, renderErrorBlock, resolveColour, wrap } from "./term.js";
 import { CLIENT_VERSION } from "./version.js";
 // `CR-216/U2` adds `auth`, and adding it MOVES `test/help.golden.txt` — which
@@ -44,7 +48,9 @@ import { CLIENT_VERSION } from "./version.js";
 // `auth` is typed by a human on a new machine before anything else works, so a
 // help screen that omitted it would be the defect one layer up. The golden file
 // exists to make a change to that screen deliberate, not to make it impossible.
-const VERBS = ["auth", "connect", "status", "off", "why", "report", "finalize"];
+/** The verbs with a `--json` mode (`src/json.ts`'s `JsonVerb`): a failure under the flag is a document, not a block. */
+const JSON_VERBS = ["status", "why", "report", "scan"];
+const VERBS = ["auth", "connect", "scan", "backfill", "status", "off", "why", "report", "finalize"];
 export function isVerb(value) {
     return VERBS.includes(value);
 }
@@ -157,7 +163,21 @@ async function main(argv) {
         return EXIT.ok;
     }
     if (!isVerb(verb)) {
-        process.stderr.write(`${USAGE.unknownCommand(verb)}\n\n${renderHelp()}\n`);
+        // PR 7 (Q6): a block like every other failure — a code, and the way to the command list as the LAST line. No help dump.
+        const colour = resolveColour({
+            env: process.env,
+            isTty: process.stderr.isTTY === true,
+            noColorFlag: argv.includes("--no-color"),
+            json: false,
+        });
+        process.stderr.write(`${renderErrorBlock({
+            kind: "bad",
+            code: "UNKNOWN_COMMAND",
+            what: USAGE.unknownCommandWhat(verb),
+            why: [],
+            fixLabel: USAGE.unknownCommandFix,
+            fixes: [channelCommand(process.env, process.argv[1] ?? "", USAGE.unknownCommandHelp)],
+        }, colour).join("\n")}\n`);
         return EXIT.usage;
     }
     const ctx = interactiveContext(argv);
@@ -195,7 +215,9 @@ async function runVerb(verb, argv, ctx) {
                 // ⛔ NO `browser` HERE, AND THAT IS THE "ONE AUTH" GUARANTEE: this verb just saved a credential, so
                 // the chained `connect` finds one; were it ever absent it falls to the old warning, never to a
                 // second sign-in. `test/auth-connect-chain.test.ts` brace-matches this call to keep it so.
-                connect: (c) => connect(c, {}, {}),
+                // The backfill offer IS passed: it is not a sign-in, it asks its own y/N (default N) on a terminal only, and the chain
+                // itself runs only on a terminal (the `!piped` gate, D32 guard 1), so a piped or CI `auth` never reaches it.
+                connect: (c) => connect(c, {}, { backfill: backfillForConnect }),
             });
         case "connect":
             // `--sign-in` (CR-084d) is a FLAG, not a verb: `VERBS` is what `renderHelp`
@@ -210,8 +232,19 @@ async function runVerb(verb, argv, ctx) {
                 signIn: argv.includes("--sign-in"),
                 // `CR-234d`: sign in by code.
                 device: argv.includes("--device"),
+                // `D28`: the typed prompt even on a terminal — the checklist's way out for a screen reader.
+                typed: argv.includes("--typed"),
                 help: argv.includes("--help") || argv.includes("-h"),
-            }, { browser: realBrowser });
+            }, 
+            // `D14`/`D15`: the backfill offer after "Capture is on" (PR 5's `backfillForConnect`).
+            { browser: realBrowser, backfill: backfillForConnect });
+        case "scan":
+            // `D33 · 27A`. Read-only, no network, and a public verb so an agent can list capturable repos
+            // without entering a consent flow. Reads its own `--json` like `status`.
+            return scan(ctx, argv.slice(1));
+        case "backfill":
+            // `D14`/`D15`. Asks first (default N), uploads earlier sessions one at a time, no commit links. Takes no arguments.
+            return await backfill(ctx, argv.slice(1));
         case "status":
             // `argv.slice(1)` for the same reason `why` and `report` take it: `status`
             // reads its own `--json` flag rather than this package acquiring an
@@ -312,15 +345,30 @@ function reportUnexpected(error, argv) {
         noColorFlag: argv.includes("--no-color"),
         json: argv.includes("--json"),
     });
-    const lines = renderErrorBlock({
+    const block = {
         kind: "bad",
+        code: "INTERNAL_ERROR",
         what: INTERNAL.unexpectedWhat,
         why: [INTERNAL.unexpectedWhy],
         fixLabel: INTERNAL.unexpectedFix,
-        fixes: [INTERNAL.unexpectedDebugCommand],
-    }, colour);
+        fixes: [INTERNAL.unexpectedDebugCommand(installChannel(process.env, process.argv[1] ?? "").command)],
+    };
+    // PR 7: under `--json` on a read verb the failure is ONE document on stdout and nothing on stderr — the same shape every
+    // other `--json` failure has. (`VIBECOMMIT_DEBUG` is an explicit opt-in to the raw detail on stderr, and still prints.)
+    const jsonVerb = argv.includes("--json") ? JSON_VERBS.find((v) => v === argv[0]) : undefined;
+    const lines = jsonVerb === undefined ? renderErrorBlock(block, colour) : [];
+    if (jsonVerb !== undefined) {
+        try {
+            writeSync(1, renderJsonError(jsonVerb, block));
+        }
+        catch {
+            // An unwritable stdout is not worth a second exception on this path.
+        }
+    }
     if (process.env.VIBECOMMIT_DEBUG !== undefined)
-        lines.push("", detailOf(error));
+        lines.push(...(lines.length > 0 ? [""] : []), detailOf(error));
+    if (lines.length === 0)
+        return;
     // `writeSync(2, …)` rather than `process.stderr.write`: stderr to a pipe is
     // asynchronous and `process.exit` does not flush it, so the caller below would
     // race its own diagnostic away. Same reason `finish()` uses it on fd 1.

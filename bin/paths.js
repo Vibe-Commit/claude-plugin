@@ -29,6 +29,13 @@ export function projectsPath(home) {
     return join(rootDir(home), "projects.json");
 }
 /**
+ * The slug-keyed grant list — owners, repos, exclusions and refusals. Read next to
+ * `projects.json` by `consent.ts`'s `isCaptureAllowed`, BEFORE any transcript read.
+ */
+export function grantsPath(home) {
+    return join(rootDir(home), "grants.json");
+}
+/**
  * The HUMAN lane's signed-in session — `CR-084d`. Mode 0600, enforced on read by
  * the same `readSecretFile` the ingest credential goes through.
  *
@@ -112,6 +119,21 @@ export function repoDayNoticePath(home, repoKey, day, state) {
  */
 export function machineDayNoticePath(home, day, key) {
     return join(stateDir(home), "notices", "machine-day", sanitise(day), `${sanitise(key)}.json`);
+}
+/**
+ * Once-per-CLONE marker — 0.7.0, notices 6-8 and the `SessionStart` install record (eng review D4 · A).
+ *
+ * `cloneKey` is `src/hooks/session_start.ts`'s `cloneKey`: the git common dir PLUS the clone's oldest HEAD
+ * reflog entry, so a fresh clone at a path that used to hold another one is a different clone and gets its own
+ * notice and its own install. It is hashed here for the reason `repoDigest` hashes a repo key — `sanitise`
+ * truncates, and two deep checkouts sharing a prefix would otherwise share a marker.
+ *
+ * `clone/<digest>/<state>.json` is a third depth under `notices/`, apart from `<session>/<state>.json`,
+ * `repo-day/…` and `machine-day/…`, so no session id can resolve onto one. `state` of `installed` is the
+ * install record, which is not a notice and is kept beside them on purpose.
+ */
+export function cloneMarkerPath(home, cloneKey, state) {
+    return join(stateDir(home), "notices", "clone", repoDigest(cloneKey), `${sanitise(state)}.json`);
 }
 /**
  * Per-`(repo, session)` send state — `CR-018`'s offset ledger, backlog and
@@ -509,6 +531,48 @@ export function claudeSettingsPath(home, env) {
         ? configured.trim()
         : join(home, ".claude");
     return join(root, "settings.json");
+}
+/**
+ * Codex's thread index — `D11 · A`, eng review D2, Open Question 6.
+ *
+ * ⛔ **EXACTLY `state_5.sqlite`, and no glob.** Measured by VS on 2026-10-24: every
+ * column `scan` selects is in upstream's first `threads` migration (rust-v0.93.0)
+ * and none was ever dropped, but the FILE NAME carries a schema generation —
+ * `state_5` first ships in rust-v0.131.0, and from there bumps are
+ * non-destructive. A different `state_N` is therefore a store this client has not
+ * been checked against, and the adapter reports it rather than reading it.
+ *
+ * Beside `codexTranscriptRoot` and not under it, for the same reason the root
+ * sits beside Claude's: `CODEX_HOME ?? ~/.codex` is one product's fact, and the
+ * sessions directory is a child of it, not a parent.
+ */
+export function codexIndexDir(home, env) {
+    const configured = env.CODEX_HOME;
+    return configured !== undefined && configured.trim() !== ""
+        ? configured.trim()
+        : join(home, ".codex");
+}
+/** The one index file name the Codex adapter accepts. See `codexIndexDir`. */
+export const CODEX_INDEX_FILE = "state_5.sqlite";
+/**
+ * Claude Code's own config file, whose `projects` map keys every folder it has
+ * been run in — `scan`'s second skip signal.
+ *
+ * `CLAUDE_CONFIG_DIR` is honoured as the other Claude paths honour it. ⚠ **That
+ * location is CARRIED, not measured**: the default `~/.claude.json` is the one
+ * this machine has. If a relocated config lives elsewhere the signal simply does
+ * not fire, which is the direction that skips less rather than more.
+ *
+ * ⚠ **The file holds far more than the map**
+ * (account and onboarding state), which is why its one reader takes the map's
+ * KEYS and nothing else, and never prints a parse error: Node 22's `JSON.parse`
+ * message quotes the text it choked on.
+ */
+export function claudeConfigPath(home, env) {
+    const configured = env.CLAUDE_CONFIG_DIR;
+    return configured !== undefined && configured.trim() !== ""
+        ? join(configured.trim(), ".claude.json")
+        : join(home, ".claude.json");
 }
 export function codexHooksPath(home, env) {
     const configured = env.CODEX_HOME;
