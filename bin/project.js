@@ -38,6 +38,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
+import { gitProbe } from "./git.js";
 import { spawnTimeoutMs } from "./spawn_budget.js";
 /** This spawn's own ceiling, used when no hook budget is armed. */
 const TOPLEVEL_TIMEOUT_MS = 5_000;
@@ -188,5 +189,127 @@ export function resolveProjectKeys(dir) {
  */
 export function resolveProjectKey(dir) {
     return gitToplevel(dir);
+}
+// ---------------------------------------------------------------------------
+// Redaction roots (moved from `hooks/entry.ts` so `session_targets.ts` can use them without an import cycle).
+// ---------------------------------------------------------------------------
+/** The porcelain record's opening line — `worktree <absolute path>`. */
+const WORKTREE_LINE = "worktree ";
+/**
+ * The MAIN work tree of the repository whose common dir this is, or **null**.
+ *
+ * ## ⛔ `rev-parse --show-toplevel` CANNOT ANSWER THIS, measured
+ *
+ * `D184 §4` mandates `git -C <common-dir> rev-parse --show-toplevel`. Measured
+ * on git 2.39.5 against real repositories, that command exits **128** —
+ * *"fatal: this operation must be run in a work tree"* — for **every shape a
+ * consent key takes**, because a consent key is always a git DIRECTORY and
+ * `--is-inside-work-tree` is `false` inside one:
+ *
+ * | `-C` | `--show-toplevel` |
+ * |---|---|
+ * | `<main>/.git` (main clone, and every worktree linked to it) | ⛔ ec 128 |
+ * | `<repos>/project.git` (bare) | ⛔ ec 128 |
+ *
+ * Implemented literally, "a failure means no second root" would fire 100% of
+ * the time: the set would be the singleton it is today, forever, and a
+ * main-clone file read from a worktree session would come back a marker. The
+ * whole change would pass its own tests while doing nothing.
+ *
+ * ## What answers instead, and why it is not a guess
+ *
+ * `git worktree list --porcelain` DOES run from a git dir and from a bare
+ * directory, and its FIRST record is the main work tree. Bare repositories say
+ * so in the record itself — `bare`, with no work tree of their own.
+ *
+ * ⛔ **The answer is then validated by CONTENT, never trusted by position:**
+ * `realpath(<candidate>/.git)` must BE the consented common dir. That check is
+ * independently fatal to every wrong answer this could produce — a bare repo
+ * (`<repos>/.git` does not exist), a linked worktree returned first by some
+ * future git (its `.git` is a FILE, so the realpath is the file, not the common
+ * dir), a submodule work tree (same). `D184 §4`'s hazard is what it is for: in a
+ * worktree of a bare repo the common dir is `…/repos/project.git`, whose parent
+ * is **the folder holding every other repository on the machine**, and a root
+ * derived by stripping a suffix would transmit every sibling repo's file
+ * contents verbatim.
+ *
+ * Every failure yields NO SECOND ROOT. Never a fallback, never a parent, never a
+ * suffix strip.
+ */
+export function mainWorkTree(commonDir) {
+    const out = gitProbe(commonDir, ["worktree", "list", "--porcelain"]);
+    if (out === null)
+        return null;
+    const record = [];
+    for (const line of out.split("\n")) {
+        if (line === "")
+            break;
+        record.push(line);
+    }
+    // A BARE repository HAS no work tree, and git says so in the record itself.
+    if (record.includes("bare"))
+        return null;
+    const first = record[0];
+    if (first === undefined || !first.startsWith(WORKTREE_LINE))
+        return null;
+    const candidate = first.slice(WORKTREE_LINE.length);
+    if (!isAbsolute(candidate))
+        return null;
+    try {
+        return realpathSync(join(candidate, ".git")) === commonDir ? candidate : null;
+    }
+    catch {
+        return null;
+    }
+}
+/**
+ * ⛔ **The redaction confinement ROOT SET — `D184 §3`.**
+ *
+ * ```
+ * isInsideAny([worktree, mainToplevel], candidate)
+ * ```
+ *
+ * ## Why it is a set, and why the common dir is not in it
+ *
+ * `D184` moved the consent key to the git common dir so that a session inside a
+ * `git worktree` is admitted at all. ⛔ **The confinement root MUST NOT follow
+ * it there.** `isInside` realpaths both sides and fail-closes anything it cannot
+ * place to *outside* — which here means REDACT — so a root at `<main>/.git`
+ * would judge every file of an external worktree to be outside the main clone
+ * and replace its `content`, `oldString`, `newString` and `structuredPatch` with
+ * markers. **The capture still succeeds. The turn counts still look right. The
+ * content is gone**, and a test asserting *"worktree sessions capture now"*
+ * passes on an empty payload.
+ *
+ * Two roots, because both are genuinely the user's own tree: the worktree the
+ * session is running in, and the main clone it was cut from — a builder in a
+ * worktree reads the main clone's files constantly.
+ *
+ * ## ⛔ The `paths.ts:487-489` prohibition, answered — `D184 §5`
+ *
+ * > *"`roots` comes from the REGISTRY. It must never be derived from input."*
+ *
+ * **That prohibition is about PROVENANCE, and both members have the right one.**
+ * The named hazard is *anything on hook stdin* — attacker-supplied. Neither of
+ * these is: `keys` can only be produced by `resolveProjectKeys`, which is git's
+ * own answer about the directory the session runs in; `mainToplevel` is git's
+ * answer about the repository **the consent gate already approved**, and it is
+ * content-validated by `mainWorkTree` above. The worktree root has exactly the
+ * same provenance and has been used this way since `CR-024d`.
+ *
+ * ⚠ **Provenance is the whole argument, so this code preserves it:** nothing
+ * here is read from stdin, the derivation is validated by content, and a failure
+ * yields no second root rather than a fallback. An empty set would refuse
+ * everything (`paths.ts:491-492`), which is the correct direction — but this
+ * function cannot return one, because `keys.worktree` is always a member.
+ *
+ * ⚠ The dedup is cosmetic. `isInsideAny` over a repeated root is a union with
+ * itself; it is dropped so that a main-clone session reads as the single root it
+ * has always had, and so a cell asserting "no second root" is asserting
+ * something.
+ */
+export function confinementRoots(keys) {
+    const main = mainWorkTree(keys.consent);
+    return main === null || main === keys.worktree ? [keys.worktree] : [keys.worktree, main];
 }
 //# sourceMappingURL=project.js.map

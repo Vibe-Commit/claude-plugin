@@ -19,6 +19,7 @@
  * @provenance vibecommit-mcp src/oauth/discovery.ts — `code_challenge_methods_supported`, retyped
  */
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { stripTrailing } from "../text_tail.js";
 /**
  * The one supported challenge method. Declared `const` so it is a literal type:
  * `method: "S256"` cannot be assigned `"plain"` anywhere downstream.
@@ -36,7 +37,7 @@ const VERIFIER_BYTES = 32;
 const STATE_BYTES = 32;
 /** RFC 4648 §5 base64url, unpadded — the encoding both ends of PKCE use. */
 export function base64url(bytes) {
-    return bytes.toString("base64").replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_");
+    return stripTrailing(bytes.toString("base64"), "=").replace(/\+/g, "-").replace(/\//g, "_");
 }
 /**
  * Mint a fresh verifier and its challenge.

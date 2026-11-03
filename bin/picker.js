@@ -12,6 +12,9 @@
  *               typing `-N`, deletes the grant. It is not an exclusion (`off` is), so the repo can be chosen again.
  *   owners      one group per owner NOT yet granted, its repos behind an `aN` "all, including repos you clone later"
  *               row (D9: at most 8 repos before `+ N more`).
+ *   folders     (any-folder capture, R3) folders outside every work tree that hold sessions, one `Folders` group. A folder grant
+ *               captures the sessions there that touch no repository, under a `local:folder:` identity that only the uploader
+ *               can read; its grant line SAYS so ("private to you", R7). Granted folders are `on now` rows, removable like any.
  *   turned off  slugs in `excluded`. Choosing one is a re-include; the grant block names it on a `turn on` row, inside
  *               the same y/N (D7 · 3A), and only a yes clears the exclusion.
  *   on your account  (slice 2) what the account grants that this machine has not named. Unticked until chosen, like any
@@ -22,6 +25,7 @@
  */
 import { ownerOfSlug, normalizeSlug, normalizeOwner, isLocalSlug } from "./consent.js";
 import { AGENT_HOOKS, SCAN, PICKER, shortDate } from "./copy/index.js";
+import { DIALECTS, agentIsolatesRecords } from "./agents/registry.js";
 import { LABEL_GUTTER, paint, truncateMiddle, wrap } from "./term.js";
 /** D9: each owner group shows at most this many repos before the `+ N more` row. */
 export const GROUP_CAP = 8;
@@ -44,7 +48,9 @@ export function isNoChange(change) {
         change.turnOn.length === 0 &&
         change.stopOwners.length === 0 &&
         change.stopRepos.length === 0 &&
-        change.stopClones.length === 0);
+        change.stopClones.length === 0 &&
+        (change.addFolders ?? []).length === 0 &&
+        (change.stopFolders ?? []).length === 0);
 }
 /**
  * What Enter means when the working folder's repo is pre-selected (D34): choosing it, which leads to the y/N and never to
@@ -59,7 +65,48 @@ export function preChange(model) {
 }
 /** Anything the person is ADDING needs the D65 disclosure; removals alone do not. */
 export function hasAdditions(change) {
-    return change.addOwners.length + change.addRepos.length + change.turnOn.length > 0;
+    return change.addOwners.length + change.addRepos.length + change.turnOn.length + (change.addFolders ?? []).length > 0;
+}
+/**
+ * The folder as a FOLDER GRANT would capture it (C34): only the sessions of agents whose records can be isolated count, because a
+ * Cursor session (or a Codex one, until its isolation lands) under a granted folder is never captured, and a count or an offer that
+ * included it would promise what does not happen. `null` when no session passes. Times and counts are recomputed from the members
+ * when the scan kept them; a hand-built folder without members keeps its own times and zeroes the agents that fail.
+ */
+export function capturableFolder(folder, isolates = agentIsolatesRecords) {
+    const agents = emptyAgents();
+    if (folder.members !== undefined) {
+        const kept = folder.members.filter((member) => isolates(member.agent));
+        if (kept.length === 0)
+            return null;
+        let sinceMs = Infinity;
+        let latestMs = 0;
+        for (const member of kept) {
+            const at = member.session.startedMs ?? member.session.mtimeMs;
+            sinceMs = Math.min(sinceMs, at);
+            latestMs = Math.max(latestMs, at);
+            agents[member.agent] += 1;
+        }
+        return { path: folder.path, sessions: kept.length, sinceMs, latestMs, agents, members: kept };
+    }
+    let sessions = 0;
+    for (const agent of Object.keys(agents)) {
+        if (isolates(agent)) {
+            agents[agent] = folder.agents[agent] ?? 0;
+            sessions += agents[agent];
+        }
+    }
+    return sessions === 0 ? null : { path: folder.path, sessions, sinceMs: folder.sinceMs, latestMs: folder.latestMs, agents };
+}
+/**
+ * The agents a folder grant captures, as the copy names them: `Claude Code`, `Claude Code or Codex`, `Claude Code, Codex or Cursor`.
+ * Built from the same predicate as the offers (C34), so the sentence and the behaviour cannot disagree.
+ */
+export function folderCaptureAgents(isolates = agentIsolatesRecords) {
+    const names = DIALECTS.filter((dialect) => isolates(dialect.id)).map((dialect) => SCAN.agent[dialect.id]);
+    if (names.length <= 1)
+        return names.join("");
+    return `${names.slice(0, -1).join(", ")} or ${names[names.length - 1]}`;
 }
 function splitSlug(slug) {
     const owner = ownerOfSlug(slug);
@@ -136,6 +183,37 @@ export function buildModel(input) {
             continue;
         onNow.push({ kind: "clone", key: slug, reason: PICKER.reasonPerClone, counts: countsOf(slug), reposHere: 0, commonDirs });
     }
+    // Folder grants (R3): a granted folder is an `on now` row (removable); every other folder with sessions is offered.
+    const folderLabel = input.folderLabel ?? ((path) => path);
+    const grantedFolders = new Set(input.grantedFolders ?? []);
+    // ⛔ C34: counts and offers cover only what a folder grant would capture. A folder with no passing session is not offered; a granted
+    // one stays a removable `on now` row, with no counts.
+    const isolates = input.isolates ?? agentIsolatesRecords;
+    const capturable = (input.folders ?? []).flatMap((folder) => {
+        const kept = capturableFolder(folder, isolates);
+        return kept === null ? [] : [kept];
+    });
+    const folderCounts = new Map(capturable.map((folder) => [folder.path, folder]));
+    for (const path of input.grantedFolders ?? []) {
+        onNow.push({ kind: "folder", key: path, label: folderLabel(path), reason: PICKER.reasonFolder, counts: folderCounts.get(path) ?? null, reposHere: 0, commonDirs: [] });
+    }
+    const excludedSet = new Set(input.excludedFolders ?? []);
+    const offered = capturable.filter((folder) => !grantedFolders.has(folder.path));
+    const folders = [
+        ...offered.map((folder) => ({
+            path: folder.path,
+            label: folderLabel(folder.path),
+            sessions: folder.sessions,
+            sinceMs: folder.sinceMs,
+            latestMs: folder.latestMs,
+            agents: folder.agents,
+            ...(excludedSet.has(folder.path) ? { excluded: true } : {}),
+        })),
+        // A folder turned off that no scan found any more is still a row, so it can be turned back on.
+        ...[...excludedSet]
+            .filter((path) => !offered.some((folder) => folder.path === path))
+            .map((path) => ({ path, label: folderLabel(path), sessions: 0, sinceMs: 0, latestMs: 0, agents: emptyAgents(), excluded: true })),
+    ];
     const isOn = (slug) => coveredByGrant(slug) || perCloneSlugs.has(slug);
     const byOwner = new Map();
     for (const repo of repos.values()) {
@@ -168,6 +246,7 @@ export function buildModel(input) {
         owners,
         account,
         turnedOff,
+        folders,
         notListed: input.notListed,
         found: input.repos.length,
         sawNothing: input.sawNothing,
@@ -184,6 +263,8 @@ export function numberedRows(model, showAll) {
         for (const repo of shown)
             rows.push({ kind: "repo", repo });
     }
+    for (const folder of showAll ? model.folders : model.folders.slice(0, GROUP_CAP))
+        rows.push({ kind: "folder", folder });
     for (const row of model.account)
         rows.push({ kind: "account", row });
     for (const row of model.turnedOff)
@@ -218,6 +299,8 @@ export function parseTyped(input, model, showAll, offerAccount = false) {
     const stopOwners = new Set();
     const stopRepos = new Set();
     const stopClones = new Set();
+    const addFolders = new Set();
+    const stopFolders = new Set();
     const grantedOwners = new Set(model.onNow.filter((r) => r.kind === "owner").map((r) => r.key));
     const grantedRepos = new Set(model.onNow.filter((r) => r.kind === "repo").map((r) => r.key));
     const cloneSlugs = new Set(model.onNow.filter((r) => r.kind === "clone").map((r) => r.key));
@@ -227,6 +310,8 @@ export function parseTyped(input, model, showAll, offerAccount = false) {
             stopOwners.add(row.key);
         else if (row.kind === "repo")
             stopRepos.add(row.key);
+        else if (row.kind === "folder")
+            stopFolders.add(row.key);
         else
             stopClones.add(row.key);
     };
@@ -257,6 +342,8 @@ export function parseTyped(input, model, showAll, offerAccount = false) {
                 bad.push(PICKER.alreadyOn(token, `-${token}`));
             else if (row.kind === "off")
                 turnOn.add(row.row.slug);
+            else if (row.kind === "folder")
+                addFolders.add(row.folder.path);
             else if (row.kind === "account") {
                 if (row.row.kind === "owner")
                     addOwners.add(row.row.key);
@@ -327,6 +414,9 @@ export function parseTyped(input, model, showAll, offerAccount = false) {
             stopOwners: [...stopOwners],
             stopRepos: [...stopRepos],
             stopClones: [...stopClones],
+            // Present only when something was chosen, so a repo-only answer is the object it always was.
+            ...(addFolders.size > 0 ? { addFolders: [...addFolders] } : {}),
+            ...(stopFolders.size > 0 ? { stopFolders: [...stopFolders] } : {}),
         },
     };
 }
@@ -349,9 +439,17 @@ function onNowDisplay(row, nowMs) {
         return { name: `${row.key}/`, meta: joinMeta(row.reason, PICKER.ownerOnReposHere(row.reposHere)), agents: "" };
     }
     return {
-        name: row.key,
+        name: row.kind === "folder" ? (row.label ?? row.key) : row.key,
         meta: joinMeta(row.reason, countsText(row.counts, nowMs)),
         agents: agentsText(row.counts),
+    };
+}
+function folderDisplay(folder, nowMs) {
+    const counts = folder.sessions === 0 ? null : folder;
+    return {
+        name: folder.label,
+        meta: joinMeta(folder.excluded === true ? PICKER.turnOnHint : "", countsText(counts, nowMs)),
+        agents: agentsText(counts),
     };
 }
 function repoDisplay(repo, nowMs) {
@@ -408,6 +506,7 @@ export function renderTyped(model, options) {
         model.onNow.length === 0 &&
         model.turnedOff.length === 0 &&
         model.owners.length === 0 &&
+        model.folders.length === 0 &&
         model.account.length === 0) {
         return [
             ...lines,
@@ -424,6 +523,8 @@ export function renderTyped(model, options) {
     const onNow = model.onNow.map((row) => onNowDisplay(row, nowMs));
     const shown = (g) => (showAll ? g.repos : g.repos.slice(0, GROUP_CAP));
     const repoRows = model.owners.flatMap((g) => shown(g).map((r) => repoDisplay(r, nowMs)));
+    const shownFolders = showAll ? model.folders : model.folders.slice(0, GROUP_CAP);
+    const folderRows = shownFolders.map((f) => folderDisplay(f, nowMs));
     const account = model.account.map((row) => ({
         name: row.kind === "owner" ? `${row.key}/` : row.key,
         meta: PICKER.onAccountHint,
@@ -434,7 +535,7 @@ export function renderTyped(model, options) {
         meta: PICKER.turnOnHint,
         agents: "",
     }));
-    const { cut, column, withAgents } = layout([...onNow, ...repoRows, ...account, ...off]);
+    const { cut, column, withAgents } = layout([...onNow, ...repoRows, ...folderRows, ...account, ...off]);
     const row = (n, display) => `${String(n).padStart(6)}  ${paint(colour, "text", cut(display.name).padEnd(column))}${" ".repeat(GAP)}${paint(colour, "muted", withAgents(display))}`;
     let n = 0;
     if (model.onNow.length > 0) {
@@ -450,6 +551,14 @@ export function renderTyped(model, options) {
         if (hidden > 0) {
             lines.push(paint(colour, "muted", `     +  ${PICKER.moreTyped(hidden, group.owner)}`));
         }
+    }
+    if (folderRows.length > 0) {
+        lines.push(paint(colour, "muted", `  ${PICKER.folders}`));
+        for (const d of folderRows)
+            lines.push(row(++n, d));
+        const hiddenFolders = model.folders.length - shownFolders.length;
+        if (hiddenFolders > 0)
+            lines.push(paint(colour, "muted", `     +  ${PICKER.moreFoldersTyped(hiddenFolders)}`));
     }
     if (account.length > 0) {
         lines.push(paint(colour, "muted", `  ${PICKER.onAccount}`));
@@ -501,12 +610,19 @@ heading = PICKER.chose) {
             PICKER.labelTurnOn,
             change.turnOn.map((slug) => (facts.accountOff?.has(slug) === true ? `${slug}  ${PICKER.turnedOffOnAccount}` : slug)),
         ],
+        // ⛔ THE FOLDER GRANT LINE SAYS WHO CAN READ IT (R7 · D9): the server makes a folder repository private to its uploader, and the
+        // person is told so at the one moment they are asked. Nothing here claims more than that.
+        [
+            PICKER.labelFolders,
+            (change.addFolders ?? []).map((path) => `${facts.folderLabels?.get(path) ?? path}  ${PICKER.folderPrivate}`),
+        ],
         [
             PICKER.labelStop,
             [
                 ...change.stopOwners.map((o) => `${o}/`),
                 ...change.stopRepos,
                 ...change.stopClones,
+                ...(change.stopFolders ?? []).map((path) => facts.folderLabels?.get(path) ?? path),
             ],
         ],
     ];
@@ -520,7 +636,15 @@ heading = PICKER.chose) {
 }
 /** The grant y/N: additions (with or without removals) get the upload question, removals alone the stop question. */
 export function grantQuestion(change, colour, answers) {
-    const q = hasAdditions(change) ? PICKER.questionGrant : PICKER.questionStop;
+    const folders = (change.addFolders ?? []).length > 0 || (change.stopFolders ?? []).length > 0;
+    const repos = change.addOwners.length + change.addRepos.length + change.turnOn.length + change.stopOwners.length + change.stopRepos.length + change.stopClones.length > 0;
+    const q = hasAdditions(change)
+        ? folders
+            ? repos ? PICKER.questionGrantMixed : PICKER.questionGrantFolders
+            : PICKER.questionGrant
+        : folders
+            ? repos ? PICKER.questionStopMixed : PICKER.questionStopFolders
+            : PICKER.questionStop;
     return `  ${paint(colour, "text", q)} ${paint(colour, "muted", answers)} `;
 }
 //# sourceMappingURL=picker.js.map

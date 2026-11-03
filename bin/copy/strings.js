@@ -270,6 +270,18 @@ export const STATUS = {
     ownersLabel: "owners",
     reposLabel: "repos",
     offLabel: "off",
+    /** Folders outside every repository whose repo-free sessions are captured (R3). */
+    foldersLabel: "folders",
+    /** A per-clone consent whose clone has no remote, or is gone: it is counted, so it is listed (Q3). */
+    noRemoteClone: (path) => `${path}  (no remote)`,
+    missingClone: (path) => `${path}  (clone not found)`,
+    /** Repos and folders recent sessions named that nobody has chosen or turned off (R8 · D11): a list, never a hook line. */
+    /** A granted folder whose repository another member's machine uploaded first (C3): named here because the hook says nothing. */
+    refusedFolderLabel: "refused",
+    refusedFolder: (path) => `${path}  (not captured)`,
+    refusedFolderWhy: "a folder at the same path was uploaded first from another member's machine, so this folder's sessions are not captured here",
+    undecidedLabel: "not chosen",
+    undecidedHint: (connect) => `recent sessions touched these and nothing was captured · to choose, run: ${connect}`,
     /**
      * Machine-level `status`: the repos whose own last upload was refused because their org has not approved capture. §10.2's held
      * vocabulary — the beat word `held`, and the backfill screen's "the org must approve capture" (Alexander, 2026-10-24 17:20).
@@ -1041,6 +1053,18 @@ export const BACKFILL = {
     held: (count) => `${count} held, the org must approve capture`,
     failed: (count, reason) => `${count} failed, ${reason}`,
     stopped: "stopped",
+    /**
+     * PARENT-FOLDER sessions (R4): sessions run from a folder outside every repository. Their repositories are not known until the
+     * transcript is read, which happens only after the yes, so the offer says what will be CHECKED and what the check can find.
+     */
+    parentHeading: (sessions) => `${sessions} ${sessions === 1 ? "session was" : "sessions were"} run from folders outside a repository.`,
+    parentNote: "Each is read after you say yes, to find the repositories you chose that it touched, and the folder if you chose one. A session that touched none of them is skipped.",
+    parentRowCounts: (sessions) => `${sessions} to check`,
+    /** The run line's label for the group: there is no repository to name. */
+    parentLabel: "outside a repository",
+    parentTouchedNothing: "touched nothing you chose",
+    parentBusy: "another process was writing it",
+    parentFolderRefused: "the folder's repository belongs to someone else",
     /** Skip reasons. */
     overSize: "over 50 MiB",
     folderDiffers: "folder differs",
@@ -1112,6 +1136,24 @@ export const PICKER = {
     reasonOwner: "owner",
     reasonRepo: "repo",
     reasonPerClone: "per clone",
+    reasonFolder: "folder",
+    /** The `Folders` group (R3): folders outside every repository that hold sessions. */
+    folders: "folders outside a repository",
+    moreFoldersTyped: (count) => `${count} more ${count === 1 ? "folder" : "folders"} · type more to list them`,
+    moreFoldersChecklist: (count) => `${count} more ${count === 1 ? "folder" : "folders"}`,
+    labelFolders: "folders",
+    /** The folder grant line (R7 · D9): the one claim about who can read a folder's sessions. */
+    folderPrivate: "(private to you)",
+    questionGrantFolders: "Upload transcripts from these folders?",
+    questionGrantMixed: "Upload transcripts from these repositories and folders?",
+    questionStopFolders: "Stop capturing these folders?",
+    questionStopMixed: "Stop capturing these repositories and folders?",
+    /** After a folder grant (R3 · R7), once, under "Capture is on": which folders, and who can read what they capture. */
+    onFolders: (names) => `Capture is on for the folders ${names} on this machine.`,
+    /** `agents` names who a folder grant captures, built from the registry predicate (`folderCaptureAgents`), never typed here (C34). */
+    onFoldersProof: (agents) => `A ${agents} session started there that touches no repository is captured when it ends. It is private to you: no one else in your organization can read it unless you share it. A session that touches a repository goes to that repository when it is on.`,
+    stoppedFolders: "Stopped capturing the folders above.",
+    stoppedMixed: "Stopped capturing the repositories and folders above.",
     /** The owner row ALWAYS states how many repos `aN` covers (D9), so a hidden repo is never covered unseen. */
     ownerAll: (count) => `all ${count} ${count === 1 ? "repo" : "repos"} here, including repos you clone later`,
     ownerOnReposHere: (count) => `${count} ${count === 1 ? "repo" : "repos"} here`,
@@ -1160,12 +1202,14 @@ export const PICKER = {
     questionStop: "Stop capturing these repositories?",
     stopped: "Stopped capturing the repositories above.",
     /** "1 owner and 2 repos" — the on-now summary of Enter-with-grants, `auth`'s one line and the status heading. */
-    summary: (owners, repos) => {
+    summary: (owners, repos, folders = 0) => {
         const o = `${owners} ${owners === 1 ? "owner" : "owners"}`;
         const r = `${repos} ${repos === 1 ? "repo" : "repos"}`;
-        if (owners > 0 && repos > 0)
-            return `${o} and ${r}`;
-        return owners > 0 ? o : r;
+        const base = owners > 0 && repos > 0 ? `${o} and ${r}` : owners > 0 ? o : repos > 0 || folders === 0 ? r : "";
+        if (folders === 0)
+            return base;
+        const f = `${folders} ${folders === 1 ? "folder" : "folders"}`;
+        return base === "" ? f : `${base} and ${f}`;
     },
     authStays: (summary) => `Capture stays on for ${summary} on this machine.`,
     /** The hooks step (D13 · 7A). */

@@ -38,6 +38,7 @@
  */
 import { isAllowedIngestUrl } from "../post.js";
 import { CHALLENGE_METHOD } from "./pkce.js";
+import { stripTrailing } from "../text_tail.js";
 /** RFC 9728 §3.1. */
 export const PROTECTED_RESOURCE_PATH = "/.well-known/oauth-protected-resource";
 /** RFC 8414 §3. */
@@ -115,7 +116,7 @@ export async function discover(resourceUrl, deps) {
     if (!isAllowedIngestUrl(issuer)) {
         return { kind: "malformed", url: prmUrl, detail: "insecure_endpoint" };
     }
-    const asUrl = `${issuer.replace(/\/+$/, "")}${AUTHORIZATION_SERVER_PATH}`;
+    const asUrl = `${stripTrailing(issuer, "/")}${AUTHORIZATION_SERVER_PATH}`;
     const as = await getJson(asUrl, deps);
     if (!as.ok)
         return { kind: "unreachable", url: asUrl };

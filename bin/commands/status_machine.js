@@ -21,11 +21,11 @@ import { emitJson } from "../json.js";
 import { credentialProblemBlock } from "./credential_problem.js";
 import { authCommandFor, channelCommand } from "../install.js";
 import { loadCredential } from "../credential.js";
-import { machineCapture, machineSummary } from "../machine_state.js";
+import { machineCapture, machineSummary, refusedFoldersNow, undecidedNow } from "../machine_state.js";
 import { isLocalSlug, normalizeSlug, ownerOfSlug } from "../consent.js";
 import { listOrgPending } from "../org_pending.js";
 import { lastSendOnMachine } from "../state.js";
-import { LABEL_GUTTER, WRAP_COLUMNS, glyph, labelled, paint, wrap } from "../term.js";
+import { LABEL_GUTTER, WRAP_COLUMNS, glyph, labelled, paint, tildePath, truncatePath, wrap } from "../term.js";
 import { writeFailure, writeLines } from "./context.js";
 import { readAccountView } from "../grants_verb.js";
 /** §10.3 indents the gutter rows four columns under the state line. */
@@ -58,6 +58,36 @@ function sentenceRow(label, text) {
     const lines = wrap(text, hang);
     return lines.map((line, i) => (i === 0 ? labelled(ROW_INDENT, label, line.slice(hang)) : line));
 }
+/** How a repository that is on is named in its row: its slug, or its clone's path with the reason there is no slug (Q3). */
+function repoRowName(entry, home) {
+    if (entry.state === "slug" && entry.slug !== null)
+        return entry.slug;
+    const path = truncatePath(tildePath(entry.path ?? entry.key, home), 56);
+    return entry.state === "missing" ? STATUS.missingClone(path) : STATUS.noRemoteClone(path);
+}
+/** Recent sessions' repos and folders nobody has chosen or turned off (R8 · D11 · B): the hook said nothing, so this is where they wait. */
+function undecidedRows(ctx) {
+    const names = undecidedNow(ctx.home, ctx.now().getTime() - UNDECIDED_WINDOW_MS);
+    if (names.length === 0)
+        return [];
+    const shown = names.map((row) => (row.kind === "folder" || row.name.startsWith("/") ? truncatePath(tildePath(row.name, ctx.home), 56) : row.name));
+    return [
+        ...rows(STATUS.undecidedLabel, shown),
+        ...wrap(STATUS.undecidedHint(channelCommand(ctx.env, ctx.selfPath, COMMANDS.connect)), ROW_INDENT + LABEL_GUTTER),
+    ];
+}
+/** Granted folders the server refused for good (C3): the hook stopped that target and said nothing, so this is where it is named. */
+function refusedFolderRows(ctx) {
+    const refused = refusedFoldersNow(ctx.home, ctx.now().getTime() - UNDECIDED_WINDOW_MS);
+    if (refused.length === 0)
+        return [];
+    return [
+        ...rows(STATUS.refusedFolderLabel, refused.map((row) => STATUS.refusedFolder(truncatePath(tildePath(row.folder, ctx.home), 56)))),
+        ...wrap(STATUS.refusedFolderWhy, ROW_INDENT + LABEL_GUTTER),
+    ];
+}
+/** "Recent": Claude Code keeps about 30 days of transcripts, so a name older than that has nothing left to capture. */
+const UNDECIDED_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 /**
  * Slice 2 (S4), brief §3.3: what the user's account grants that this machine has not named, and the changes queued for it.
  * Between `off` and `held`; and on a machine that names nothing, right under the heading.
@@ -117,6 +147,8 @@ export function machineStatus(ctx, argv, sync = { kind: "skipped" }) {
         ? null
         : readAccountView(ctx.home, capture.kind === "on" ? capture.perClone.flatMap((c) => (c.slug === null ? [] : [normalizeSlug(c.slug)])) : [], sync);
     const waiting = capture.kind === "on" ? waitingRepos(ctx, capture) : [];
+    const undecidedJson = argv.includes("--json") ? undecidedNow(ctx.home, ctx.now().getTime() - UNDECIDED_WINDOW_MS) : [];
+    const refusedJson = argv.includes("--json") ? refusedFoldersNow(ctx.home, ctx.now().getTime() - UNDECIDED_WINDOW_MS) : [];
     const load = loadCredential({ env: ctx.env, home: ctx.home });
     const last = lastSendOnMachine(ctx.home);
     const nowMs = ctx.now().getTime();
@@ -132,6 +164,12 @@ export function machineStatus(ctx, argv, sync = { kind: "skipped" }) {
             repos: on ? capture.grants.repos : [],
             excluded: on ? capture.grants.excluded : [],
             per_clone: on ? capture.perClone.length : 0,
+            // Any-folder capture (R3 · R8): present only when there is something to say, so a machine with no folders and nothing
+            // undecided keeps the exact document it always had (the key set is a pinned contract).
+            ...(on && capture.folders.length > 0 ? { folders: capture.folders } : {}),
+            ...(undecidedJson.length > 0 ? { undecided: undecidedJson } : {}),
+            // C3: a granted folder the server refused (another member's machine uploaded that path first). Same rule: only when non-empty.
+            ...(refusedJson.length > 0 ? { refused_folders: refusedJson.map((row) => ({ folder: row.folder, at_ms: row.at })) } : {}),
             // 0.7.0: the slugs whose own last upload was refused because their org has not approved capture (still on, deduped,
             // named). A machine key for the release paragraph; it does not change the exit code.
             org_pending: waiting,
@@ -168,15 +206,12 @@ export function machineStatus(ctx, argv, sync = { kind: "skipped" }) {
         for (const [i, owner] of grants.owners.entries()) {
             lines.push(labelled(ROW_INDENT, i === 0 ? STATUS.ownersLabel : "", `${owner}/  ${STATUS.ownerTail}`));
         }
-        const covered = (slug) => grants.owners.includes(ownerOfSlug(slug));
-        const repos = [
-            ...grants.repos.filter((r) => !grants.excluded.includes(r) && !covered(r)),
-            ...capture.perClone
-                .filter((c) => c.slug !== null && !grants.excluded.includes(c.slug.toLowerCase()) && !covered(c.slug.toLowerCase()))
-                .map((c) => c.slug.toLowerCase()),
-        ];
-        lines.push(...rows(STATUS.reposLabel, [...new Set(repos)]));
+        // ⛔ ONE LIST, whose length is the heading's count (Q3): a clone with no remote, or gone, is a row like any other.
+        lines.push(...rows(STATUS.reposLabel, capture.repoEntries.map((entry) => repoRowName(entry, ctx.home))));
+        lines.push(...rows(STATUS.foldersLabel, capture.folders.map((path) => truncatePath(tildePath(path, ctx.home), 60))));
+        lines.push(...refusedFolderRows(ctx));
         lines.push(...rows(STATUS.offLabel, grants.excluded));
+        lines.push(...undecidedRows(ctx));
         if (view !== null)
             lines.push(...accountRows(ctx, view));
         // §10.2's held vocabulary: the beat word and "the org must approve capture". One row, naming the repos; never an unnamed one.
@@ -185,6 +220,8 @@ export function machineStatus(ctx, argv, sync = { kind: "skipped" }) {
         }
     }
     // A machine that names nothing still shows what its account grants and what is queued, right under the heading.
+    if (capture.kind === "none")
+        lines.push(...undecidedRows(ctx));
     if (capture.kind === "none" && view !== null)
         lines.push(...accountRows(ctx, view));
     if (last !== null)

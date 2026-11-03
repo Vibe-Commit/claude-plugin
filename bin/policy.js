@@ -92,9 +92,17 @@ export function classifyStatus(status) {
  */
 export const REPOSITORY_EXCLUDED = "repository_excluded";
 /**
+ * C3 (any-folder capture, R7 · D9): a FOLDER repository (`local:folder:<12 hex>`) has ONE uploader, its creator. The server
+ * answers `403 { error: "folder_repository_forbidden" }` to any other caller (two members whose launch folder has the same
+ * absolute path hash to one slug), stores nothing, and names no org, user or repository in the body. Contract: the server's folder
+ * rule (A-T11, commit 9153abc on branch `w3/a-t11-t12-mcp`). Like `REPOSITORY_EXCLUDED` it is a code-keyed 403 and is `never`: the bytes are not held for a
+ * "later" that will refuse them again every firing. It is a PER-TARGET outcome: it is never credential-wide and never `fatal`.
+ */
+export const FOLDER_REPOSITORY_FORBIDDEN = "folder_repository_forbidden";
+/**
  * Classify one attempt, response or not.
  *
- * ⛔ **ONE 403 IS `never`, AND IT IS IDENTIFIED BY THE ERROR CODE ALONE** (`ErrorDetail.code` is the only thing a caller may
+ * ⛔ **TWO 403s ARE `never` (`repository_excluded`, `folder_repository_forbidden`), AND EACH IS IDENTIFIED BY THE ERROR CODE ALONE** (`ErrorDetail.code` is the only thing a caller may
  * branch on, `post.ts`) — and only on a 403. `never` drops bytes, so every doubt is `later`: a 403 with no body, a body that
  * did not parse or was cut off, a code this client does not know, and the same code on any other status all fall through
  * to the 403 row. Excluded means the user said not to capture this repo, so its bytes are not held for a "later" that the
@@ -103,8 +111,9 @@ export const REPOSITORY_EXCLUDED = "repository_excluded";
 export function classify(outcome) {
     if (outcome.kind === "unreachable")
         return NETWORK_CLASS;
-    if (outcome.status === 403 && outcome.detail?.code === REPOSITORY_EXCLUDED)
+    if (outcome.status === 403 && (outcome.detail?.code === REPOSITORY_EXCLUDED || outcome.detail?.code === FOLDER_REPOSITORY_FORBIDDEN)) {
         return "never";
+    }
     return classifyStatus(outcome.status);
 }
 /**

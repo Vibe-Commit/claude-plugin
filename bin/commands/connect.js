@@ -417,7 +417,7 @@ export async function sendTestCapture(ctx, keys, credential, found) {
         // artefact the user reads to decide whether redaction works. `isInside`
         // fail-closes an unresolvable path to REDACT, so the disagreement shows up
         // as a plausible, well-formed, emptier payload rather than an error.
-        (from, to) => readSpan(found.path, from, to, confinementRoots(keys), ctx.home, ctx.env), recordCutter(found.path));
+        (from, to) => readSpan(found.path, from, to, confinementRoots(keys), ctx.home, ctx.env, { kind: "repo", ownRoots: confinementRoots(keys) }), recordCutter(found.path));
     }
     return { delivery };
 }

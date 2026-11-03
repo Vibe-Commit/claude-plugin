@@ -13,12 +13,13 @@ import { dialectFor } from "../agents/registry.js";
 import { AGENT_HOOKS, COMMANDS, COMMIT_HOOK, CONNECT, PICKER, SCAN, URLS } from "../copy/index.js";
 import { EMPTY_GRANTS, GrantsUnreadableError, grantsUnreadable, isAffirmative, normalizeOwner, normalizeSlug, ownerOfSlug, readGrants, revokeProject, updateGrants, } from "../consent.js";
 import { loadCredential } from "../credential.js";
+import { excludeFolder, excludedFolders, grantFolder, grantedFolders } from "../folder_grants.js";
 import { EXIT } from "../exit.js";
 import { mergePending } from "../grants_sync.js";
 import { readAccountView, syncForVerb } from "../grants_verb.js";
 import { channelCommand, connectCommandFor, installCaptureHooks } from "../install.js";
 import { machineCapture, machineSummary, readPerClone } from "../machine_state.js";
-import { buildModel, grantQuestion, hasAdditions, isNoChange, NO_CHANGE, notUnderstoodLines, parseTyped, preChange, renderGrantBlock, renderTyped, } from "../picker.js";
+import { buildModel, folderCaptureAgents, grantQuestion, hasAdditions, isNoChange, NO_CHANGE, notUnderstoodLines, parseTyped, preChange, renderGrantBlock, renderTyped, } from "../picker.js";
 import { runChecklist } from "../picker_checklist.js";
 import { credentialFingerprint } from "../post.js";
 import { metaFor } from "../credential_meta.js";
@@ -108,6 +109,10 @@ async function connectPickerRun(ctx, options, deps, here, keys, g) {
         sawNothing: sawNoSession(scanned.notListed, ctx.home),
         here,
         accountNotHere: accountView === null ? [] : accountView.notHere,
+        folders: scanned.folders ?? [],
+        grantedFolders: grantedFolders(ctx.home),
+        excludedFolders: excludedFolders(ctx.home),
+        folderLabel: (path) => truncatePath(tildePath(path, ctx.home), 46),
     });
     // ⛔ `g` IS OFFERED ONLY WHERE THE CREDENTIAL BEAT WOULD MINT (exception 3): no credential at all (an `absent` file, not a faulty
     // one), a terminal, and a browser to sign in with. The `auth` chain passes no browser and always leaves a credential, so it can
@@ -162,13 +167,22 @@ async function connectPickerRun(ctx, options, deps, here, keys, g) {
     const change = split.change;
     // One disclosure and one y/N cover additions and removals together, and a No changes nothing. Removals alone skip the
     // disclosure and ask the stop question (§10.12 "The grant y/N").
-    const facts = { reposHere: reposByOwner(model), noClone: pick.noClone, accountOff: split.accountOff };
+    const facts = {
+        reposHere: reposByOwner(model),
+        noClone: pick.noClone,
+        accountOff: split.accountOff,
+        folderLabels: folderLabels(model),
+    };
     writeLines(ctx.stdout, hasAdditions(change) ? ["", ...disclosure(ctx, true)] : [""]);
     writeLines(ctx.stdout, renderGrantBlock(change, facts, ctx.colour, accountList === null ? PICKER.chose : PICKER.accountGrants));
     const answer = await askOrCancel(ctx, grantQuestion(change, ctx.colour, CONNECT.consentAnswers));
     if (answer === null)
         return abandon(true);
     if (!isAffirmative(answer)) {
+        // A No on a folder is a decision about it: it is turned off and stops being "undecided" in `status`. (A repo you leave unticked
+        // is left as it was: only what the person was ASKED about and refused is recorded.)
+        for (const path of change.addFolders ?? [])
+            excludeFolder(ctx.home, path, ctx.now());
         if (g.credential === null)
             writeLines(ctx.stdout, ["", ...wrap(CONNECT.declined, 2)]);
         return abandon(false);
@@ -187,7 +201,9 @@ async function connectPickerRun(ctx, options, deps, here, keys, g) {
         return EXIT.failure;
     }
     if (!hasAdditions(change)) {
-        writeLines(ctx.stdout, ["", ...wrap(PICKER.stopped, 2)]);
+        const stoppedFolders = (change.stopFolders ?? []).length > 0;
+        const stoppedRepos = change.stopOwners.length + change.stopRepos.length + change.stopClones.length > 0;
+        writeLines(ctx.stdout, ["", ...wrap(stoppedFolders ? (stoppedRepos ? PICKER.stoppedMixed : PICKER.stoppedFolders) : PICKER.stopped, 2)]);
         // Removals reach the account too; nothing more to say about it.
         if (queueOps && credentialAtStart)
             await syncForVerb(ctx, false, account, { quietFirst: firstSyncSaid });
@@ -274,12 +290,24 @@ async function connectPickerRun(ctx, options, deps, here, keys, g) {
     // The block cannot know whether an organization has approved capture for a repo it did not probe: it says one may need to,
     // when a granted owner is not the person's own account. In a repo the owner the test capture CHECKED is left out.
     const checkedOwner = probe !== null && here !== null && answeredWith2xx(probe.delivery) ? ownerOfSlug(normalizeSlug(here.slug)) : null;
-    captureOnBlock(ctx, model, change, clones.length === 0, otherOwnersCaveat(ctx, got.credential, checkedOwner), joined, accountNoteLines(ctx, accountSync));
+    // A run that granted only folders, on a machine with no repository on, has no repository block to print: "Capture is on for 0
+    // repos, no clone of it is here yet" would be false. The folder lines below are its whole answer.
+    const foldersOnly = (change.addFolders ?? []).length > 0 && change.addOwners.length + change.addRepos.length + change.turnOn.length === 0;
+    if (!(foldersOnly && machineCapture(ctx.home).kind !== "on")) {
+        captureOnBlock(ctx, model, change, clones.length === 0, otherOwnersCaveat(ctx, got.credential, checkedOwner), joined, accountNoteLines(ctx, accountSync));
+    }
+    // Folders granted in this run, said once, after the block that names the repos (R7: the claim is who can read them).
+    const grantedNow = change.addFolders ?? [];
+    if (grantedNow.length > 0) {
+        const names = folderLabels(model);
+        writeLines(ctx.stdout, ["", ...wrap(PICKER.onFolders(grantedNow.map((path) => names.get(path) ?? path).join(", ")), 2), ...wrap(PICKER.onFoldersProof(folderCaptureAgents()), 2)]);
+    }
     // The backfill offer. Left out (`deps.backfill`), no offer is made and the ending is the one after a no. The URL follows
     // what LANDED (D19): the conversations list once at least one session was uploaded, whether the run finished or stopped.
     let url = probeUrl(probe);
-    if (deps.backfill !== undefined && onRepos.length > 0 && !askedNoMore) {
-        const outcome = await deps.backfill(ctx, onRepos);
+    const parentFolders = scanned.folders ?? [];
+    if (deps.backfill !== undefined && (onRepos.length > 0 || parentFolders.length > 0) && !askedNoMore) {
+        const outcome = await deps.backfill(ctx, onRepos, parentFolders);
         if (outcome.kind !== "declined" && outcome.uploaded > 0)
             url = URLS.conversations;
     }
@@ -438,6 +466,19 @@ function applyChange(ctx, model, change, queueOps) {
                 revokeProject(ctx.home, commonDir);
         }
     }
+    // Folder grants are client-side only (R3): their own file, never queued for the account, which has no word for a path.
+    for (const path of change.addFolders ?? [])
+        grantFolder(ctx.home, path, ctx.now());
+    // A removal is a decision, not a forgetting: the folder is turned OFF (and offered again), so `status` does not call it undecided.
+    for (const path of change.stopFolders ?? [])
+        excludeFolder(ctx.home, path, ctx.now());
+}
+/** How every folder the picker knows is shown, so the grant block names a folder the way its row did. */
+function folderLabels(model) {
+    return new Map([
+        ...model.folders.map((folder) => [folder.path, folder.label]),
+        ...model.onNow.filter((row) => row.kind === "folder").map((row) => [row.key, row.label ?? row.key]),
+    ]);
 }
 /** Is this slug on once `change` is applied? Reads the grants just written, and keeps the per-clone consents not withdrawn. */
 function onSlugs(ctx, model, change) {
@@ -518,7 +559,7 @@ untold = []) {
     const summary = machineSummary(machineCapture(ctx.home));
     if (noClones) {
         const names = [
-            ...model.onNow.filter((r) => !change.stopOwners.includes(r.key) && !change.stopRepos.includes(r.key) && !change.stopClones.includes(r.key)).map((r) => (r.kind === "owner" ? `${r.key}/` : r.key)),
+            ...model.onNow.filter((r) => r.kind !== "folder" && !change.stopOwners.includes(r.key) && !change.stopRepos.includes(r.key) && !change.stopClones.includes(r.key)).map((r) => (r.kind === "owner" ? `${r.key}/` : r.key)),
             ...change.addOwners.map((o) => `${o}/`),
             ...change.addRepos,
             ...change.turnOn,

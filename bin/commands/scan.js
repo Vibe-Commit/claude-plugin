@@ -260,12 +260,21 @@ export function scanMachine(home, env, deps = {}) {
         return tree;
     };
     const groups = new Map();
+    const folderGroups = new Map();
     const noRemoteByCommonDir = new Map();
     const noReflog = new Set();
     for (const { agent, session, dir } of placed) {
         const tree = treeFor(dir);
         if (tree === null) {
             nonRepo += 1;
+            const at = session.startedMs ?? session.mtimeMs;
+            const folder = folderGroups.get(dir) ?? { path: dir, sessions: 0, sinceMs: at, latestMs: at, agents: emptyAgents(), members: [] };
+            folder.sessions += 1;
+            folder.sinceMs = Math.min(folder.sinceMs, at);
+            folder.latestMs = Math.max(folder.latestMs, at);
+            folder.agents[agent] += 1;
+            folder.members.push({ agent, session });
+            folderGroups.set(dir, folder);
             continue;
         }
         if (tree.firstReflogSec === null)
@@ -317,8 +326,10 @@ export function scanMachine(home, env, deps = {}) {
         // Most recent session first (the drawn screen), the slug to break a tie so the
         // order is the same on every run.
         .sort((a, b) => b.latestMs - a.latestMs || (a.slug < b.slug ? -1 : 1));
+    const folders = [...folderGroups.values()].sort((a, b) => b.latestMs - a.latestMs || (a.path < b.path ? -1 : 1));
     return {
         repos,
+        folders,
         notListed: {
             noRemote: [...noRemoteByCommonDir.values()].sort(),
             ambiguousSessions: ambiguous,

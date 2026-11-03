@@ -310,6 +310,17 @@ export const CODEX_CLI = {
     // Claude glob cannot run against a layout that has no `subagents/`.
     delegatedTranscripts: "announce",
     redaction: "codex-cli",
+    // A Codex rollout names a folder on few record types (measured on 369 rollouts, 18,798 records): `session_meta` and `turn_context` carry
+    // `payload.cwd`, and a finished command item (`event_msg` / `item_completed` / `CommandExecution`) carries `item.cwd` as a `file://` URL. The folder
+    // of every other record is its EFFECTIVE folder (`codex_folders.ts`: a call's `workdir` or patched files, an output's call, else the turn folder).
+    cwdKeys: [
+        { path: ["payload", "cwd"], types: ["session_meta", "turn_context"] },
+        { path: ["payload", "item", "cwd"], types: ["event_msg"] },
+    ],
+    // ⛔ TRUE (part (b)): every Codex record has an effective folder, told from the checkpoint the resolver writes (the turn-folder timeline and the call
+    // table) and, past the scan cursor, from the delivery's own bytes. A record that ran in another work tree is withheld from this repo's copy; one whose
+    // folder cannot be told is withheld in a multi-repo copy and kept in a single-repo one (a single-repo Codex session stays as 0.8.0 sends it).
+    isolatesContentRecords: true,
     // ⛔ **UNMEASURED.** `null` here does NOT mean "Codex CLI has no session id in
     // its environment" — it means nobody has run the measurement `M1` ran for
     // Claude Code (agent commit, human commit, worktree commit) against Codex, so
