@@ -20,6 +20,7 @@
 import { join } from "node:path";
 import { cursorHooksPath, cursorTranscriptRoot, isCursorTranscript } from "../paths.js";
 import { readEntries, sessionFile, subdirectories } from "./session_listing.js";
+import { stripEnds } from "../text_tail.js";
 /**
  * ⭐ **MEASURED. `D5`'s SECOND HALF IS ANSWERED (`TODOS[130]`), AND THE ANSWER IS
  * THAT CURSOR IMPOSES NO NUMBER OF ITS OWN.**
@@ -105,7 +106,7 @@ export const CURSOR_NAME_LIMIT = 61;
  * candidate rather than being assumed away.
  */
 export function encodeProjectPath(path) {
-    return path.replace(/[^A-Za-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+    return stripEnds(path.replace(/[^A-Za-z0-9]+/g, "-"), "-");
 }
 /**
  * Is this folder name one Cursor cut and hashed? See `CURSOR_NAME_LIMIT`.
@@ -248,6 +249,11 @@ export const CURSOR = {
     // a wrong declaration here is no longer a line nobody reaches.
     delegatedTranscripts: "announce",
     redaction: "cursor",
+    // Cursor records no folder per record (A7, `commands/backfill.ts`).
+    // ⛔ EMPTY ON PURPOSE, and it is a gate (C14): Cursor cannot be isolated per record, so `session_targets`
+    // gives it the turn-end repo only and reads no transcript for evidence. Filling this in would switch that gate off.
+    cwdKeys: [],
+    isolatesContentRecords: false,
     // ⛔ **UNMEASURED.** `null` here does NOT mean "Cursor has no session id in its
     // environment" — it means nobody has run the measurement `M1` ran for Claude
     // Code (agent commit, human commit, worktree commit) against Cursor, so this

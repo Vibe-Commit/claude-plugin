@@ -651,6 +651,11 @@ async function deliverChunk(ctx, eof, readBody, cutter) {
     const key = { repoKey: ctx.repoKey, sessionId: ctx.sessionId };
     if (key.repoKey === "")
         return { kind: "no-repo" };
+    // ⛔ C25 addendum: THE FIRST BEAT IS HERE, before any disposition that PERSISTS can run. An oversize record is skipped (its offset
+    // written) and an unsafe session id refused ("never") before the per-request beat below, so a holder that stalled past its lock's
+    // bound could otherwise write several skips with nobody checking it still owned the session. No request, no write.
+    if (ctx.beforeRequest !== undefined && !ctx.beforeRequest())
+        return { kind: "nothing-to-send" };
     const session = loadSessionState(ctx.home, key);
     if (isStopped(session, credentialFingerprint(ctx.credential)))
         return { kind: "stopped" };
@@ -738,6 +743,8 @@ async function deliverChunk(ctx, eof, readBody, cutter) {
     // full and lean requests depending on what the NEXT turn happens to contain,
     // which nobody can debug.
     let lean = current.lean;
+    if (ctx.beforeRequest !== undefined && !ctx.beforeRequest())
+        return { kind: "nothing-to-send" };
     let attempt = await attemptSend(withinBudget(ctx), agent, seq, span, body, lean, isLast);
     if (attempt.kind === "unsafe") {
         return refuse(ctx, key, session, current, span, caps, attempt.header === "authorization" ? "fatal" : "never", lean);
@@ -765,6 +772,10 @@ async function deliverChunk(ctx, eof, readBody, cutter) {
         // in-process retry here does not reopen D56 §D8, which governs hooks. Go
         // lean and retry ONCE, within this same invocation.
         lean = true;
+        // ⛔ A lock lost between the 431 and its retry stops here with NOTHING persisted: the first attempt recorded nothing either, so
+        // the span is simply unsent and whoever holds the session now resends it.
+        if (ctx.beforeRequest !== undefined && !ctx.beforeRequest())
+            return { kind: "nothing-to-send" };
         attempt = await attemptSend(withinBudget(ctx), agent, seq, span, body, lean, isLast);
         if (attempt.kind === "unsafe") {
             // Unreachable in practice — every lean header is already proven safe, or
@@ -805,6 +816,8 @@ async function deliverChunk(ctx, eof, readBody, cutter) {
         isLast = false;
         const half = readBody(span.from, span.to);
         if (half === null)
+            return { kind: "nothing-to-send" };
+        if (ctx.beforeRequest !== undefined && !ctx.beforeRequest())
             return { kind: "nothing-to-send" };
         attempt = await attemptSend(withinBudget(ctx), agent, seq, span, half, lean, false);
         if (attempt.kind === "unsafe") {
@@ -898,11 +911,16 @@ async function deliverChunk(ctx, eof, readBody, cutter) {
                 const nothingLanded = outcome.kind === "response" && outcome.captureId === "";
                 const holdForNextDelta = nothingLanded && (ctx.commits?.shas.length ?? 0) > 0;
                 if (ctx.commits !== undefined && ctx.commits.count > 0) {
-                    if (retry !== null) {
-                        settleSpooled(ctx.home, key, ctx.commits.count, new Set(retry));
-                    }
-                    else if (!holdForNextDelta) {
-                        dropSpooled(ctx.home, key, ctx.commits.count);
+                    // Each source is truncated by ITS OWN consumed count (O7); a single-source delivery is the ledger's spool alone.
+                    const sources = ctx.spoolSources?.commits ?? [{ repoKey: key.repoKey, count: ctx.commits.count }];
+                    for (const source of sources) {
+                        const sourceKey = { repoKey: source.repoKey, sessionId: key.sessionId };
+                        if (retry !== null) {
+                            settleSpooled(ctx.home, sourceKey, source.count, new Set(retry));
+                        }
+                        else if (!holdForNextDelta) {
+                            dropSpooled(ctx.home, sourceKey, source.count);
+                        }
                     }
                 }
                 // The rewrite spool is its own file with its own cap, so its own drop.
@@ -914,7 +932,9 @@ async function deliverChunk(ctx, eof, readBody, cutter) {
                 // keeps a squash-merged commit reachable." A `commit_sha_successors` row
                 // names no turn, so `X-Capture-Id` says nothing about whether it landed.
                 if (ctx.rewrites !== undefined && ctx.rewrites.length > 0) {
-                    dropRewrites(ctx.home, key, ctx.rewrites.length);
+                    const sources = ctx.spoolSources?.rewrites ?? [{ repoKey: key.repoKey, count: ctx.rewrites.length }];
+                    for (const source of sources)
+                        dropRewrites(ctx.home, { repoKey: source.repoKey, sessionId: key.sessionId }, source.count);
                 }
                 // `TODOS[177]` — the INFERRED pairs have their own file and their own drop. ⛔ UNLIKE `rewrites` above, this one is
                 // CONDITIONAL on the server's per-request ack (`x-rewrites-inferred-stored`): a 2xx alone is "the delta was
@@ -931,9 +951,11 @@ async function deliverChunk(ctx, eof, readBody, cutter) {
                 //                            attempt is counted (an attempt means a signal was RECEIVED), nothing is set aside.
                 if (ctx.inferredRewrites !== undefined && ctx.inferredRewrites.length > 0 && ctx.inferredGroups !== undefined && ctx.inferredGroups.length > 0) {
                     const group = ctx.inferredGroups[0];
+                    // The group lives in exactly ONE source's file (a squash was made in one work tree): every mark below goes there.
+                    const groupKey = { repoKey: ctx.spoolSources?.inferred?.repoKey ?? key.repoKey, sessionId: key.sessionId };
                     const stored = outcome.kind === "response" ? outcome.inferredStored : null;
                     if (stored === ctx.inferredRewrites.length) {
-                        dropInferredGroups(ctx.home, key, [group]);
+                        dropInferredGroups(ctx.home, groupKey, [group]);
                     }
                     else if (stored !== null) {
                         // ⛔⛔ `stored !== null` ALONE, never `stored !== null && stored > 0` (VG's mutant G5, 2026-10-08): the
@@ -942,15 +964,15 @@ async function deliverChunk(ctx, eof, readBody, cutter) {
                         // never answers `n-1`. An ack of `0` is a real signal ("the server saw this and stored none of it") and
                         // must count an attempt exactly like any other short ack, or a persistently-refused group is never set
                         // aside and head-of-line blocking comes back on the realistic path.
-                        const attempts = recordInferredAttempt(ctx.home, key, group);
+                        const attempts = recordInferredAttempt(ctx.home, groupKey, group);
                         if (attempts >= INFERRED_SET_ASIDE_AFTER) {
-                            setAsideInferredGroup(ctx.home, key, group, "short_ack");
+                            setAsideInferredGroup(ctx.home, groupKey, group, "short_ack");
                             // `TODOS[177]` follow-up (VL, 2026-10-08, VG's silent-loss finding): tally BEFORE any deletion can
                             // happen — `finalize` may delete this session's `.inferred.jsonl` outright once every group in it is
                             // resolved, and this tally is the ONLY record of `set_aside` left once that file is gone (VG's
                             // follow-up finding: an earlier version of this fix also kept a live gauge reading that same file,
                             // which double-counted these pairs once the group aged into the 7-day prune — removed).
-                            recordInferredSkipped(ctx.home, key.repoKey, "set_aside", ctx.nowMs, ctx.inferredRewrites.length);
+                            recordInferredSkipped(ctx.home, groupKey.repoKey, "set_aside", ctx.nowMs, ctx.inferredRewrites.length);
                             inferredSetAsidePairs = ctx.inferredRewrites.length;
                         }
                     }

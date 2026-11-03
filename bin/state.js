@@ -40,7 +40,7 @@ import { dirname, join } from "node:path";
 import { pendingFileExpired } from "./pending_prune.js";
 import { repoSessionsDir, sessionStatePath, stateDir } from "./paths.js";
 import { EMPTY_FILE_STATE } from "./policy.js";
-import { SESSION_LIVE_WINDOW_MS, WIRE_RUNGS, readInferred, readRewrites, readSpool } from "./spool.js";
+import { SESSION_LIVE_WINDOW_MS, WIRE_RUNGS, noteRepoKey, readInferred, readRewrites, readSpool } from "./spool.js";
 export const EMPTY_SESSION_STATE = {
     seq: 0,
     stop: null,
@@ -713,11 +713,29 @@ export function saveSessionState(home, key, next) {
         writeFileSync(path, `${JSON.stringify(next)}\n`, { mode: 0o600 });
         // `writeFileSync`'s `mode` is ignored when the file already exists.
         chmodSync(path, 0o600);
+        // A ledger now exists for this digest: leave the note that maps it back to a work tree, so a later firing that finds this
+        // session's ledger by digest alone (any-folder capture, R5) can name the repo it belongs to. One stat when it is there.
+        noteRepoKey(home, key.repoKey);
         return true;
     }
     catch {
         return false;
     }
+}
+/**
+ * Forget the parts of a SessionEnd hold that have since been delivered (what is owed is `eof - sentOffset`, derived when read,
+ * so this only keeps the record from naming streams that caught up). Shared by `finalize` and the idle-session drain (R19).
+ */
+export function pruneDeliveredEndHold(home, key) {
+    const session = loadSessionState(home, key);
+    if (session.endHold === null)
+        return;
+    const eof = {};
+    for (const [fileKey, size] of Object.entries(session.endHold.eof)) {
+        if (fileState(session, fileKey).sentOffset < size)
+            eof[fileKey] = size;
+    }
+    saveSessionState(home, key, { ...session, endHold: Object.keys(eof).length > 0 ? { at: session.endHold.at, eof } : null });
 }
 export function fileState(session, fileKey) {
     return session.files[fileKey] ?? EMPTY_FILE_STATE;

@@ -25,6 +25,8 @@ const AGENTS = ["claude-code", "codex-cli", "cursor"];
 const GAP = 3;
 /** `  › [x] ` — a cursor column and a tick box ahead of the name. */
 const LEAD = 8;
+/** The `expanded` key of the folders group's `+ N more` row. Not an owner: owners are `host/name`, never this. */
+const FOLDERS_KEY = "\u0000folders";
 /** The selectable rows in screen order, given what is expanded. */
 export function checklistRows(model, expanded) {
     const rows = model.onNow.map((row) => ({ id: `on:${row.kind}:${row.key}`, kind: "on", row }));
@@ -37,6 +39,11 @@ export function checklistRows(model, expanded) {
         if (hidden > 0)
             rows.push({ id: `more:${group.owner}`, kind: "more", group, hidden });
     }
+    const shownFolders = expanded.has(FOLDERS_KEY) ? model.folders : model.folders.slice(0, GROUP_CAP);
+    for (const folder of shownFolders)
+        rows.push({ id: `folder:${folder.path}`, kind: "folder", folder });
+    if (model.folders.length > shownFolders.length)
+        rows.push({ id: "morefolders", kind: "morefolders", hidden: model.folders.length - shownFolders.length });
     for (const row of model.account)
         rows.push({ id: `account:${row.kind}:${row.key}`, kind: "account", row });
     for (const row of model.turnedOff)
@@ -91,6 +98,10 @@ options = {}) {
                 const expanded = new Set(state.expanded).add(current.group.owner);
                 return { kind: "state", state: { ...state, expanded } };
             }
+            if (current.kind === "morefolders") {
+                const expanded = new Set(state.expanded).add(FOLDERS_KEY);
+                return { kind: "state", state: { ...state, expanded } };
+            }
             if (key.name === "return")
                 return { kind: "done", change: changeOf(model, state) };
             if (isCovered(state, current))
@@ -133,6 +144,8 @@ export function changeOf(model, state) {
         if (!list.includes(value))
             list.push(value);
     };
+    const addFolders = [];
+    const stopFolders = [];
     for (const row of model.onNow) {
         if (state.ticked.has(`on:${row.kind}:${row.key}`))
             continue;
@@ -140,6 +153,8 @@ export function changeOf(model, state) {
             change.stopOwners.push(row.key);
         else if (row.kind === "repo")
             change.stopRepos.push(row.key);
+        else if (row.kind === "folder")
+            stopFolders.push(row.key);
         else
             change.stopClones.push(row.key);
     }
@@ -168,7 +183,15 @@ export function changeOf(model, state) {
     for (const row of model.turnedOff)
         if (state.ticked.has(`off:${row.slug}`))
             change.turnOn.push(row.slug);
-    return change;
+    for (const folder of model.folders)
+        if (state.ticked.has(`folder:${folder.path}`))
+            addFolders.push(folder.path);
+    // Present only when something changed, so a repo-only pick is exactly the object it always was.
+    return {
+        ...change,
+        ...(addFolders.length > 0 ? { addFolders } : {}),
+        ...(stopFolders.length > 0 ? { stopFolders } : {}),
+    };
 }
 function counts(c, nowMs) {
     return c === null || c.sessions === 0 ? "" : `${SCAN.sessions(c.sessions)} · ${SCAN.since(shortDate(c.sinceMs, nowMs))}`;
@@ -189,7 +212,7 @@ export function renderFrame(model, state, options) {
             const r = row.row;
             return r.kind === "owner"
                 ? { name: `${r.key}/`, meta: [r.reason, PICKER.ownerOnReposHere(r.reposHere)].join(" · "), agents: "" }
-                : { name: r.key, meta: [r.reason, counts(r.counts, nowMs)].filter(Boolean).join(" · "), agents: agents(r.counts) };
+                : { name: r.kind === "folder" ? (r.label ?? r.key) : r.key, meta: [r.reason, counts(r.counts, nowMs)].filter(Boolean).join(" · "), agents: agents(r.counts) };
         }
         if (row.kind === "repo") {
             const flag = row.repo.here === "repo" ? PICKER.thisRepo : row.repo.here === "folder" ? PICKER.thisFolder : "";
@@ -197,6 +220,14 @@ export function renderFrame(model, state, options) {
                 name: row.repo.name,
                 meta: [counts(row.repo, nowMs), flag].filter(Boolean).join(" · "),
                 agents: agents(row.repo),
+            };
+        }
+        if (row.kind === "folder") {
+            const f = row.folder;
+            return {
+                name: f.label,
+                meta: [f.excluded === true ? PICKER.turnOnHint : "", counts(f, nowMs)].filter(Boolean).join(" · "),
+                agents: agents(f),
             };
         }
         if (row.kind === "off")
@@ -237,6 +268,7 @@ export function renderFrame(model, state, options) {
     let wroteOn = false;
     let wroteAccount = false;
     let wroteOff = false;
+    let wroteFolders = false;
     for (const entry of rows) {
         const m = metaOf(entry);
         if (entry.kind === "on") {
@@ -252,6 +284,10 @@ export function renderFrame(model, state, options) {
                 out.push(`  ${paint(colour, "text", `${owner}/`)}`);
             }
         }
+        else if ((entry.kind === "folder" || entry.kind === "morefolders") && !wroteFolders) {
+            out.push(paint(colour, "muted", `  ${PICKER.folders}`));
+            wroteFolders = true;
+        }
         else if (entry.kind === "account" && !wroteAccount) {
             out.push(paint(colour, "muted", `  ${PICKER.onAccount}`));
             wroteAccount = true;
@@ -265,6 +301,9 @@ export function renderFrame(model, state, options) {
         }
         else if (entry.kind === "more") {
             out.push(paint(colour, "muted", `${entry.id === state.cursor ? "  › " : "    "}+   ${PICKER.moreChecklist(entry.hidden, entry.group.owner)}`));
+        }
+        else if (entry.kind === "morefolders") {
+            out.push(paint(colour, "muted", `${entry.id === state.cursor ? "  › " : "    "}+   ${PICKER.moreFoldersChecklist(entry.hidden)}`));
         }
         else {
             const withAgents = m.agents !== "" && LEAD + column + GAP + m.meta.length + 3 + m.agents.length <= 80

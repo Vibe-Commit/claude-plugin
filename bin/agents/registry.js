@@ -101,6 +101,15 @@ export function dialectFor(agentId) {
     return DIALECTS.find((dialect) => dialect.id === agentId) ?? CLAUDE_CODE;
 }
 /**
+ * ⛔ **THE ONE PREDICATE FOR "CAN THIS AGENT'S SESSIONS BE CAPTURED UNDER A FOLDER?" (C34).** A folder target needs the dialect to isolate
+ * its content records (`isolatesContentRecords`): the resolver gates on the same registry value (`dialectIsolates`, by transcript path),
+ * and everything that OFFERS a folder (the picker, `connect`'s counts and copy, the parent-folder backfill) asks it here, by agent id.
+ * Never a constant or a list of names: when Codex's isolation lands and its capability flips, every one of them follows.
+ */
+export function agentIsolatesRecords(agentId) {
+    return DIALECTS.find((dialect) => dialect.id === agentId)?.isolatesContentRecords === true;
+}
+/**
  * ⛔ **WHICH OF THE THREE EVENTS IS THIS `hook_event_name`? — `CR-195`, D205.**
  *
  * Returns the canonical `HookEventName`, or `null` for a string that names none

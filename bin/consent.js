@@ -47,7 +47,9 @@
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { writeFileAtomic } from "./atomic_write.js";
+import { grantedFolders } from "./folder_grants.js";
 import { grantsAccountPath, grantsPath, projectsPath, rootDir } from "./paths.js";
+import { stripTrailing } from "./text_tail.js";
 /**
  * Read the allow list. **Every failure returns an empty list**, which means "no
  * project is consented" — a corrupt or unreadable file must not be able to grant
@@ -130,7 +132,7 @@ export function normalizeSlug(slug) {
 }
 /** An owner as stored: normalized, and without the trailing `/` the picker displays (`alexvibecommit/`). */
 export function normalizeOwner(owner) {
-    return normalizeSlug(owner).replace(/\/+$/, "");
+    return stripTrailing(normalizeSlug(owner), "/");
 }
 /** `local:` slugs name a path, not a repo: no grant can match one, and their consent stays per clone. */
 export function isLocalSlug(slug) {
@@ -431,6 +433,41 @@ export function isCaptureAllowed(home, keys, slug) {
     if (!byClone && grants.synced_at !== null && grantPendingFor(grants.pending, name) && !accountGrants(account, name))
         return false;
     return byClone || grants.repos.includes(name) || grants.owners.includes(ownerOfSlug(name));
+}
+/**
+ * Does this machine hold ANY capture consent at all? The hook asks BEFORE it opens a transcript or writes a byte of state: a
+ * machine that has granted nothing (no `projects.json` entry, no slug or owner grant) must not read or index a single session
+ * (any-folder capture widens what a hook reads, never who it reads it for).
+ *
+ * ⚠ An unreadable `grants.json` counts as "yes": it may hold exclusions we cannot see, and the resolver denies on it.
+ */
+export function hasAnyConsent(home) {
+    if (Object.keys(readAllowList(home)).length > 0)
+        return true;
+    if (grantedFolders(home).length > 0)
+        return true;
+    const read = readGrants(home);
+    if (read.kind === "unreadable")
+        return true;
+    const grants = read.kind === "ok" ? read.grants : EMPTY_GRANTS;
+    return grants.repos.length > 0 || grants.owners.length > 0;
+}
+export function captureStanding(home, keys, slug) {
+    if (isCaptureAllowed(home, keys, slug))
+        return "granted";
+    const read = readGrants(home);
+    const name = normalizeSlug(typeof slug === "function" ? slug() : slug);
+    if (isLocalSlug(name))
+        return "undecided";
+    if (read.kind === "unreadable")
+        return "denied";
+    const grants = read.kind === "ok" ? read.grants : EMPTY_GRANTS;
+    const account = readAccountState(home);
+    const denied = [grants.excluded, grants.refused, account.refused, account.account?.excluded ?? []];
+    if (denied.some((list) => list.includes(name)))
+        return "denied";
+    const basis = isProjectAllowed(home, keys.consent) || grants.repos.includes(name) || grants.owners.includes(ownerOfSlug(name));
+    return basis ? "held" : "undecided";
 }
 /** `updateGrants` refuses to rewrite a file it cannot read: overwriting would silently drop exclusions it never saw. */
 export class GrantsUnreadableError extends Error {

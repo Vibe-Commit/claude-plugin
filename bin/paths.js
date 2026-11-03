@@ -14,8 +14,8 @@
  * @provenance vibecommit-schema ingest_sessions.file_key — CHECK bound 1..128, retyped
  */
 import { createHash } from "node:crypto";
-import { realpathSync } from "node:fs";
 import { join, sep } from "node:path";
+import { physicalPath } from "./physical_path.js";
 /** Root of the client's own state. Never Claude Code's — see the plan's keychain note. */
 export function rootDir(home) {
     return join(home, ".vibecommit");
@@ -27,6 +27,15 @@ export function credentialsPath(home) {
 /** The per-project consent allow list. Consulted BEFORE any transcript read (D56 §D19). */
 export function projectsPath(home) {
     return join(rootDir(home), "projects.json");
+}
+/**
+ * Folder grants (any-folder capture, R3): a folder whose no-repo sessions may be captured under a `local:folder:` identity.
+ * ⛔ A separate file from `projects.json` on purpose: that one is keyed by git common dir and enumerated as clones (`status`,
+ * `machine_state`), and a folder in it would be listed as one. Keyed by the folder's REALPATH. Client-side only: never synced,
+ * because the server holds no path and never refuses a `local:` slug. Absent file: no folder is granted.
+ */
+export function foldersPath(home) {
+    return join(rootDir(home), "folders.json");
 }
 /**
  * The slug-keyed grant list — owners, repos, exclusions and refusals. Read next to
@@ -204,6 +213,41 @@ export function repoSessionsDir(home, repoKey) {
         return null;
     return join(stateDir(home), "sessions", repoDigest(repoKey));
 }
+/**
+ * ⛔ The directory that holds per-SESSION state which is not any one repo's: the session's target record
+ * (`session_targets.ts`) and the digest → work-tree notes.
+ *
+ * Under `state/notices/` and NOT beside the repo digests, and not a new `state/` entry, on purpose: two suites pin entry-name
+ * sets (`study-contract.test.ts` pins `state/` to `notices` and `sessions`; `agent-registry.test.ts` counts the entries of
+ * `state/sessions/` as repo digests, and the study harness binds both). `notices/` is already a mixed namespace
+ * (`machine-day`, `machine-epoch`, `clone`, `repo-day`, one directory per session id) that nothing enumerates. None of the
+ * files here has a `.json` suffix, so no scan that reads `*.json` can mistake one for a repo's session state.
+ */
+export function targetsDir(home) {
+    return join(stateDir(home), "notices", "_session-targets");
+}
+/** Where every repo's `<digest>/` state directory lives. */
+export function sessionsRoot(home) {
+    return join(stateDir(home), "sessions");
+}
+/** One session's target record: scan cursors, resolved roots, targets, undecided names. Not a `.json` (see `targetsDir`). */
+export function sessionTargetsPath(home, sessionId) {
+    return join(targetsDir(home), `${sanitise(sessionId)}.targets`);
+}
+/** Which work tree a state digest names — written by `spool.ts` when a commit is spooled. Null for no repo key. */
+export function repoKeyNotePath(home, repoKey) {
+    if (repoKey === "")
+        return null;
+    return join(targetsDir(home), `${repoDigest(repoKey)}.repo`);
+}
+/** The digest a work tree's state directory is named by (`repoSessionsDir`). Exposed for the spool-evidence reader. */
+export function repoKeyDigest(repoKey) {
+    return repoDigest(repoKey);
+}
+/** The stem every file of one session is named by (`<stem>.json`, `.spool.jsonl`, …). */
+export function sessionFileStem(sessionId) {
+    return sanitise(sessionId);
+}
 /** A fixed-length, collision-free filename component for a work-tree path. */
 function repoDigest(repoKey) {
     return createHash("sha256").update(repoKey).digest("hex").slice(0, 32);
@@ -263,7 +307,12 @@ export function codexTranscriptRoot(home, env) {
  * all**. The repository that IS one sits a directory below it, so its project
  * key munges to that workspace's name with the child directory appended — a
  * name with no directory under `projects/` — and a project-key-derived root
- * would refuse the one real transcript there is.
+ * would refuse the one real transcript there is. (That is the same shape as the
+ * parent-folder sessions any-folder capture now reads: a session launched in a
+ * folder above its repos has no single repo whose key could name its transcript's
+ * directory. The boundary therefore stays registry-computed and can only refuse;
+ * WHICH repos or folder a session's bytes go to is `session_targets`' decision,
+ * made after this confinement, never an input to it.)
  *
  * ⇒ ⛔ **The interior shape is enforced by `isCursorTranscript` instead**, which
  * runs AFTER the registry-computed boundary and can only refuse. Read that
@@ -357,15 +406,11 @@ export function isTranscriptFile(_root, path) {
 export function isCursorTranscript(root, path) {
     if (!isInside(root, path))
         return false;
-    let realRoot;
-    let realPath;
-    try {
-        realRoot = realpathSync(root);
-        realPath = realpathSync(path);
-    }
-    catch {
+    // C71 (3): the one resolver.
+    const realRoot = physicalPath(root, "fail");
+    const realPath = physicalPath(path, "fail");
+    if (realRoot === null || realPath === null)
         return false;
-    }
     if (!realPath.endsWith(TRANSCRIPT_SUFFIX))
         return false;
     const segments = realPath.slice(realRoot.length + 1).split(sep);
@@ -491,8 +536,13 @@ export function isInside(root, candidate) {
     let realRoot;
     let realCandidate;
     try {
-        realRoot = realpathSync(root);
-        realCandidate = realpathSync(candidate);
+        // C70: physical resolution (`..` after a link is the link target's parent), missing = outside, as `realpathSync` threw.
+        const rootPath = physicalPath(root, "fail");
+        const candidatePath = physicalPath(candidate, "fail");
+        if (rootPath === null || candidatePath === null)
+            return false;
+        realRoot = rootPath;
+        realCandidate = candidatePath;
     }
     catch {
         return false;

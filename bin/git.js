@@ -145,9 +145,10 @@ const REPO = /^[A-Za-z0-9._-]+$/;
  * `owner/repo` for a work tree whose `origin` is GitHub, `host/owner/repo` for
  * any other host, else `local:<sha256(abspath)[0:12]>`.
  *
- * **Takes the TOPLEVEL, not a `cwd`.** Every caller already has it: the consent
- * gate resolves `resolveProjectKey(input.cwd)` before anything else runs and
- * refuses when it is null, so re-deriving it here would be a second
+ * **Takes the TOPLEVEL, not a `cwd`.** Every caller already has it: the hook
+ * resolves `resolveProjectKey(input.cwd)` once, before consent is asked (a null
+ * there only means the turn ended outside a work tree; the session's own records
+ * may still name granted repos, see `session_targets`), so re-deriving it here would be a second
  * `git rev-parse` spent against the hook's wall-clock budget (DESIGN.md §13.7)
  * to recompute a value the caller is holding — and a second call could disagree
  * with the first, which is the same reason `CR-017d` reuses it for the state key
@@ -175,6 +176,61 @@ export function resolveRepoSlug(toplevel) {
     const remote = gitRemoteUrl(toplevel);
     const slug = remote === null ? null : parseRemoteSlug(remote);
     return slug ?? localSlug(toplevel);
+}
+/**
+ * `resolveRepoSlug` WITHOUT its silent fallback (any-folder capture, R16 · D18): the wire identity, or **null when git could not
+ * say**.
+ *
+ * `resolveRepoSlug` answers `local:<hash of the path>` whenever the remote lookup returns nothing, and "nothing" covers a remote
+ * that is truly absent AND a lookup that timed out or failed. With a spawn budget armed the caller can tell them apart by asking
+ * whether the window is spent; `finalize` and `backfill` arm none, so a timeout there stored a WRONG REPOSITORY IDENTITY as the
+ * target's sticky slug. This tells them apart at the source: `git remote get-url` exits **2** for "No such remote" (measured,
+ * git 2.39.5) and anything else (a timeout, a missing binary, 128) is an error → null → the caller defers.
+ *
+ * A non-GitHub host reached by an ssh alias is resolved with `ssh -G`; if that lookup FAILS (absent, timed out, no `hostname` line)
+ * the plain parse would answer `alias/owner/repo`, an identity that is wrong and, being sticky, stays wrong (C17 #13a). Here that is
+ * null as well: the caller defers.
+ */
+export function strictRepoSlug(toplevel) {
+    const timeout = spawnTimeoutMs(GIT_TIMEOUT_MS);
+    if (timeout === null)
+        return null;
+    let url;
+    try {
+        const out = execFileSync("git", ["-C", toplevel, "remote", "get-url", "origin"], {
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "ignore"],
+            timeout,
+        }).trim();
+        url = out === "" ? null : out;
+    }
+    catch (error) {
+        if (error.status === 2)
+            url = null;
+        else
+            return null;
+    }
+    let aliasFailed = false;
+    const slug = url === null ? null : parseRemoteSlug(url, () => (aliasFailed = true));
+    if (aliasFailed)
+        return null;
+    return slug ?? localSlug(toplevel);
+}
+/**
+ * `strictRepoSlug` as a memoized thunk, for the resolver's `known` repo (C17 #13b): the hook's `onceRepoSlug` falls back to
+ * `local:<hash>` on a timeout, and the resolver stores what it is given as the target's sticky identity. The consent gate keeps its
+ * own thunk.
+ */
+export function onceStrictRepoSlug(toplevel) {
+    let done = false;
+    let slug = null;
+    return () => {
+        if (!done) {
+            slug = strictRepoSlug(toplevel);
+            done = true;
+        }
+        return slug;
+    };
 }
 /**
  * `resolveRepoSlug` as a memoized thunk — what the consent gates hand to `isCaptureAllowed`.
@@ -491,7 +547,7 @@ export function currentBranch(dir) {
  * is pure apart from one `ssh -G`, so it is tested directly rather than through
  * a spawned `git`.
  */
-export function parseRemoteSlug(remoteUrl) {
+export function parseRemoteSlug(remoteUrl, onAliasFailure) {
     const raw = remoteUrl.trim();
     if (raw === "")
         return null;
@@ -516,7 +572,7 @@ export function parseRemoteSlug(remoteUrl) {
     if (!REPO.test(repo) || repo === "." || repo === "..")
         return null;
     // Hostnames are case-insensitive; `GitHub.com` is the same host.
-    const host = resolveSshAlias(parts).toLowerCase();
+    const host = resolveSshAlias(parts, onAliasFailure).toLowerCase();
     // A host we would not hand to `ssh` is a host we will not put on the wire
     // either. Same guard, same reason: doubt resolves to `local:`.
     if (!GITHUB_HOSTS.has(host) && !HOSTNAME.test(host))
@@ -582,7 +638,7 @@ const SLUG_MAX = 256;
  * tighter bound than the git probes that predate the concern. 2s is ~500x the
  * measured cost; the only way to approach it is a user's own `Match exec`.
  */
-function resolveSshAlias(parts) {
+function resolveSshAlias(parts, onFailure) {
     const { host, ssh } = parts;
     if (!ssh)
         return host;
@@ -598,8 +654,10 @@ function resolveSshAlias(parts) {
     const timeout = spawnTimeoutMs(SSH_TIMEOUT_MS);
     // Budget spent: the host is returned UNEXPANDED, which is the same answer as
     // ssh being absent — a slug that is merely unqualified, never a wrong one.
-    if (timeout === null)
+    if (timeout === null) {
+        onFailure?.();
         return host;
+    }
     let out;
     try {
         // `--` is the second guard: even if `HOSTNAME` were widened one day, ssh
@@ -612,6 +670,7 @@ function resolveSshAlias(parts) {
         });
     }
     catch {
+        onFailure?.();
         return host;
     }
     for (const line of out.split("\n")) {
@@ -623,9 +682,14 @@ function resolveSshAlias(parts) {
         // Re-check the ANSWER, not just the question: `ssh_config` is user-supplied
         // and its `HostName` can be anything, including a `%h` token that did not
         // expand.
-        if (found !== null)
-            return HOSTNAME.test(found[1]) ? found[1] : host;
+        if (found !== null) {
+            if (HOSTNAME.test(found[1]))
+                return found[1];
+            onFailure?.();
+            return host;
+        }
     }
+    onFailure?.();
     return host;
 }
 /**
@@ -734,8 +798,15 @@ export function firstReflogSeconds(top, probe = gitProbe) {
         const line = end >= 0 ? text.slice(0, end) : text;
         if (line === "")
             return null;
-        const match = /(\d+) [+-]\d{4}$/.exec(line.split("\t")[0]);
-        return match === null ? null : Number(match[1]);
+        // C67: the zone is a fixed-length tail; the digits before it are walked back by hand (an unanchored `(\d+) [+-]\d{4}$` is quadratic on a long digit run).
+        const head = line.split("\t")[0];
+        const zone = / [+-]\d{4}$/.exec(head);
+        if (zone === null)
+            return null;
+        let from = zone.index;
+        while (from > 0 && head[from - 1] >= "0" && head[from - 1] <= "9")
+            from -= 1;
+        return from === zone.index ? null : Number(head.slice(from, zone.index));
     }
     catch {
         return null;

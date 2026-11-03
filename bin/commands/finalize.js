@@ -36,17 +36,21 @@ import { join } from "node:path";
 import { DEFAULT_AGENT_ID, admitsTranscript, transcriptRoots } from "../agents/registry.js";
 import { BACKFILL, COMMANDS, ERRORS, FINALIZE } from "../copy/index.js";
 import { renderVerbHelp } from "../verb_help.js";
-import { isCaptureAllowed } from "../consent.js";
+import { hasAnyConsent, isCaptureAllowed } from "../consent.js";
 import { authCommandFor, channelCommand, connectCommandFor } from "../install.js";
 import { loadCredential } from "../credential.js";
 import { EXIT } from "../exit.js";
-import { headRef, onceRepoSlug } from "../git.js";
+import { headRef, onceRepoSlug, onceStrictRepoSlug } from "../git.js";
 import { confinementRoots, deliverSubagents, fileSize, readSpan, recordCutter, sendTimeoutMs, wait } from "../hooks/entry.js";
+import { STALE_MARGIN_MS, claimSessionWriter } from "../hooks/fire_lock.js";
+import { FOLDER_REPOSITORY_FORBIDDEN } from "../policy.js";
+import { LockLostError, dialectIsolates, isolationOf, pastCursorOf, resolveTargets, stopKeyOf, stopTarget } from "../session_targets.js";
 import { repoSessionsDir, sessionStatePath } from "../paths.js";
 import { deliver, ingestUrl } from "../post.js";
 import { resolveProjectKeys } from "../project.js";
-import { capInferred, capSpool, capSuccessors, deleteInferredSpool, inferredFullyResolved, readInferred, readRewrites, readSpool } from "../spool.js";
-import { fileState, loadSessionState, saveSessionState } from "../state.js";
+import { deleteInferredSpool, inferredFullyResolved } from "../spool.js";
+import { fileState, loadSessionState, pruneDeliveredEndHold } from "../state.js";
+import { readSpoolUnion } from "../spool_union.js";
 import { renderErrorBlock, wrap } from "../term.js";
 import { notAGitRepoBlock, writeFailure, writeLines } from "./context.js";
 import { credentialProblem } from "./credential_problem.js";
@@ -96,7 +100,141 @@ function parseArgs(argv) {
         return null; // exactly one of the two
     return { session, latest, force };
 }
+/** How long the verb waits for another writer of the same session (a hook firing) before it says so and stops. */
+const WRITER_WAIT_MS = 30_000;
+/**
+ * ⛔ HOW LONG THE VERB'S WRITER LOCK MAY SIT UNTOUCHED before another writer may take it from a holder presumed dead (C25).
+ *
+ * The verb HEARTBEATS the lock (`FireClaim.refresh`, same nonce) before every request, every delegated file, every target and every
+ * root the resolver names, so what matters is the LONGEST GAP between two heartbeats, not the length of the job. That gap is one
+ * request (`sendTimeoutMs(SEND_BUDGET_MS, 0)` = 36 s at most) or one root's naming (a few git calls at 5 s each, one ssh at 2 s),
+ * plus the local read, redaction and compression of one delta: well under a minute. The bound is TWICE the request gap plus the
+ * hook margin (76 s): slack for a slow disk without leaving a dead holder's lock in the way for long. It is stamped into the lock
+ * (C18 #2), so a hook contender honours it instead of its own seven seconds, and `fire_lock.ts` caps it at ten minutes whatever
+ * a file claims. It used to be the whole send budget plus the margin (62 s) with NO heartbeat, so a session that took longer than
+ * that, a long backfill of a large transcript, was reclaimed while its holder was still sending, and two writers ran at once.
+ */
+function holderStaleMs() {
+    return 2 * (sendTimeoutMs(SEND_BUDGET_MS, 0) + STALE_MARGIN_MS);
+}
+/** Resolver calls one `finalize` makes while discovery is still moving (each reads a bounded window). */
+/**
+ * A SAFETY bound on the interactive resolver loop, not a limit anyone should meet (C18 #11). The loop ends when discovery is settled or
+ * a round changes nothing the resolver keeps; every round either advances a scan cursor, resolves a root, or counts a bounded failure,
+ * so it is finite. A fixed 16 meant a transcript naming more than 128 repositories returned unsettled and uploaded only some targets.
+ */
+const RESOLVE_ROUNDS_MAX = 100_000;
+/**
+ * Take the session's one writer lock (O5) and resolve every target the session names, as a session that is OVER (`end` mode, the
+ * only mode that may decide a folder target). The lock is released by the caller's `releases`, after the sends. Shared by
+ * `finalize` and `backfill`: one resolver loop, so a session is judged the same whichever verb closes it.
+ * `busy`: another writer held the session for the whole wait.
+ */
+export async function resolveSessionTargets(env, sessionId, transcriptPath, known, releases) {
+    const claim = await claimSessionWriter(env.home, sessionId, {
+        staleAfterMs: holderStaleMs(),
+        deadlineAtMs: Date.now() + WRITER_WAIT_MS,
+        wait,
+    });
+    if (claim === null)
+        return { kind: "busy" };
+    releases.push(() => claim.release());
+    const heartbeat = () => claim.refresh();
+    const base = {
+        home: env.home,
+        env: env.env,
+        sessionId,
+        transcriptPath,
+        turnEndCwd: env.turnEndCwd,
+        mode: "end",
+        nowMs: env.nowMs,
+        heartbeat,
+        ...(known === null ? {} : { known }),
+    };
+    // Each call reads one bounded window AND resolves at most a bounded number of roots, so a fully-scanned transcript can still have
+    // a queue of unresolved roots (the granted repo may be the last of twenty). Keep going until discovery is SETTLED, and stop
+    // only when a call changed nothing the resolver keeps: not the cursors, not the queue, not the roots, not the failure counts.
+    //
+    // ⛔ The queue's ORDER is not progress (C21 iv): failed roots rotate to the back, so a round in which every tried root fails again
+    // changes only the order. `unresolved` is compared as a SET, and a root's failure counts once per invocation (`counted`), so each
+    // round either moves a cursor, resolves a root, counts a NEW failure, or the loop stops. The record keeps its rotated order.
+    const progress = (r) => JSON.stringify([
+        r.record.scan,
+        [...r.record.unresolved].sort(),
+        Object.keys(r.record.roots),
+        r.record.failures,
+        r.record.oversize,
+        r.targets.length,
+    ]);
+    const counted = new Set();
+    const round0 = { ...base, countedThisInvocation: counted };
+    let res;
+    try {
+        res = resolveTargets(round0);
+        for (let round = 1; round < RESOLVE_ROUNDS_MAX && !res.settled; round += 1) {
+            if (!heartbeat())
+                return { kind: "busy" };
+            const next = resolveTargets(round0);
+            const same = progress(next) === progress(res);
+            res = next;
+            if (same)
+                break;
+        }
+    }
+    catch (error) {
+        // C25: the lock was lost while naming a root, before the resolver wrote anything. Another writer has the session: stop.
+        if (error instanceof LockLostError)
+            return { kind: "busy" };
+        throw error;
+    }
+    const record = res.record;
+    const targets = res.targets.filter((target) => record.stopped[stopKeyOf(target)] === undefined);
+    return {
+        kind: "ok",
+        targets,
+        scan: Object.fromEntries(Object.entries(record.scan).map(([fileKey, cursor]) => [fileKey, cursor.offset])),
+        record,
+        capRepos: dialectIsolates(env.home, env.env, transcriptPath),
+        heartbeat,
+    };
+}
+/** What `closeSession` is told for one resolved target: the repo (or folder) and everything `closeSession` needs about it. */
+export function closeSpecOf(target, scan, facts) {
+    return specOf(target, scan, facts);
+}
+function specOf(target, scan, facts) {
+    // C43: a copy delivered from the start of a stream whose call checkpoint has been pruned (a repo granted after the others were sent) cannot judge a
+    // result by the log, so a repo copy of an isolating dialect observes its own delivered bytes in order (the same observer the hook uses past the cursor).
+    const base = isolationOf(target, facts?.record);
+    const isolation = facts?.capRepos === true && facts.record !== undefined ? { ...base, past: pastCursorOf(base, scan) } : base;
+    return {
+        projectKey: target.ledgerKey,
+        redactionRoots: target.redactionRoots,
+        repoSlug: target.slug,
+        worktrees: target.worktrees.length > 0 ? target.worktrees : [target.ledgerKey],
+        allowNeverCaptured: true,
+        ...(target.kind === "folder" || facts?.capRepos === true ? { sizeCap: scan } : {}),
+        isolation,
+        target,
+    };
+}
 export async function finalize(ctx, argv) {
+    const releases = [];
+    try {
+        return await finalizeBody(ctx, argv, releases);
+    }
+    finally {
+        for (const release of releases) {
+            try {
+                release();
+            }
+            catch {
+                // A lock that cannot be released ages out by itself.
+            }
+        }
+    }
+}
+async function finalizeBody(ctx, argv, releases) {
     // `TODOS[184]`. Check-first, before `parseArgs`/anything else — the ONE change this ticket makes to
     // `finalize`. Reads and writes nothing; every other line below (`parseArgs`, session resolution, the
     // seal call, the drain loop, every exit code and receipt string) is byte-identical to 0.4.4 for any
@@ -118,24 +256,106 @@ export async function finalize(ctx, argv) {
         }, ctx.colour));
         return EXIT.usage;
     }
-    const keys = resolveProjectKeys(ctx.cwd);
-    if (keys === null) {
-        writeFailure(ctx, notAGitRepoBlock(ctx));
-        return EXIT.failure;
-    }
-    const projectKey = keys.worktree;
-    const slugOf = onceRepoSlug(projectKey);
-    if (!isCaptureAllowed(ctx.home, keys, slugOf)) {
-        // "This repository is not allowed to be captured": the repo's own consent, not the machine's credential.
+    const nowMs = ctx.now().getTime();
+    const stillWriting = (sessionId) => {
         writeLines(ctx.stderr, renderErrorBlock({
             kind: "bad",
-            code: "NOT_CONNECTED",
-            what: ERRORS.notConnected,
+            code: "FINALIZE_STILL_WRITING",
+            what: FINALIZE.stillWriting,
             why: [],
-            fixLabel: ERRORS.notConnectedFix,
-            fixes: [connectCommandFor(ctx.env, ctx.selfPath)],
+            fixLabel: FINALIZE.stillWritingFix,
+            fixes: [channelCommand(ctx.env, ctx.selfPath, FINALIZE.commandSessionForce(sessionId))],
         }, ctx.colour));
-        return EXIT.notConnected;
+        return EXIT.usage;
+    };
+    // ANY-FOLDER (A-T3): at the three places this verb used to refuse because the folder it ran in is not the session's repo, a
+    // `--session <id>` whose transcript exists is resolved by the SAME resolver the hook uses. Only `--session`: `--latest` names a
+    // session through THIS repo's ledgers, so it has nothing to look up elsewhere. No targets (or no transcript) leaves the
+    // ORIGINAL refusal and its exit code exactly as they were.
+    // C25: the heartbeat of the session lock `resolveSessionTargets` took, handed to every `closeSession`. Absent only when no resolver
+    // ran (a plain in-repo close of a session picked by `--latest`), which holds no session lock to keep.
+    let heartbeat;
+    const prepareAnyFolder = async () => {
+        if (args.session === null || !SESSION_ID.test(args.session))
+            return { kind: "none" };
+        const sessionId = args.session;
+        // ⛔ NOTHING IS READ FOR A MACHINE THAT HAS GRANTED NOTHING (C18 #5): the resolver reads the transcript for evidence, so the same
+        // gate the hook has comes first, before any transcript is looked for or opened and before any state is written.
+        if (!hasAnyConsent(ctx.home))
+            return { kind: "none" };
+        const transcriptPath = findTranscript(ctx.home, ctx.env, sessionId);
+        if (transcriptPath === null)
+            return { kind: "none" };
+        try {
+            if (!args.force && nowMs - statSync(transcriptPath).mtimeMs < STILL_WRITING_MS)
+                return { kind: "still-writing", sessionId };
+        }
+        catch {
+            return { kind: "none" };
+        }
+        const eof = fileSize(transcriptPath);
+        if (eof === null)
+            return { kind: "none" };
+        // ⛔ `turnEndCwd` is NULL (C18 #1): the CLI's cwd is where the person TYPED this, not where the session ended. Passing it made
+        // `finalize --session S` run inside granted repo B create a B target for a session that never touched B. Which repos a session
+        // belongs to comes from the session's own records only; the cwd repo's own close is the ledger-gated branch below.
+        const resolved = await resolveSessionTargets({ home: ctx.home, env: ctx.env, nowMs: ctx.now().getTime(), turnEndCwd: null }, sessionId, transcriptPath, null, releases);
+        if (resolved.kind === "busy")
+            return { kind: "busy" };
+        heartbeat = resolved.heartbeat;
+        if (resolved.targets.length === 0)
+            return { kind: "none" };
+        return { kind: "ready", sessionId, transcriptPath, eof, specs: resolved.targets.map((target) => specOf(target, resolved.scan, resolved)) };
+    };
+    const busyBlock = () => {
+        writeLines(ctx.stderr, renderErrorBlock({
+            kind: "bad",
+            code: "DELIVERY_FAILED",
+            what: FINALIZE.notDelivered,
+            why: [],
+            fixLabel: FINALIZE.retryFix,
+            fixes: [channelCommand(ctx.env, ctx.selfPath, args.session === null ? FINALIZE.commandSessionAny : FINALIZE.commandSession(args.session))],
+        }, ctx.colour));
+        return EXIT.failure;
+    };
+    const refuseAnyFolder = (prepared) => {
+        if (prepared.kind === "still-writing")
+            return stillWriting(prepared.sessionId);
+        if (prepared.kind === "busy")
+            return busyBlock();
+        return null;
+    };
+    let anyFolder = { kind: "none" };
+    const keys = resolveProjectKeys(ctx.cwd);
+    if (keys === null) {
+        anyFolder = await prepareAnyFolder();
+        const refused = refuseAnyFolder(anyFolder);
+        if (refused !== null)
+            return refused;
+        if (anyFolder.kind !== "ready") {
+            writeFailure(ctx, notAGitRepoBlock(ctx));
+            return EXIT.failure;
+        }
+    }
+    const projectKey = keys === null ? null : keys.worktree;
+    const slugOf = projectKey === null ? null : onceRepoSlug(projectKey);
+    if (keys !== null && slugOf !== null && !isCaptureAllowed(ctx.home, keys, slugOf)) {
+        anyFolder = await prepareAnyFolder();
+        const refused = refuseAnyFolder(anyFolder);
+        if (refused !== null)
+            return refused;
+        if (anyFolder.kind !== "ready") {
+            // "This repository is not allowed to be captured": the repo's own consent, not the machine's credential.
+            writeLines(ctx.stderr, renderErrorBlock({
+                kind: "bad",
+                code: "NOT_CONNECTED",
+                what: ERRORS.notConnected,
+                why: [],
+                fixLabel: ERRORS.notConnectedFix,
+                fixes: [connectCommandFor(ctx.env, ctx.selfPath)],
+            }, ctx.colour));
+            return EXIT.notConnected;
+        }
     }
     const load = loadCredential({ env: ctx.env, home: ctx.home });
     if (load.kind !== "ok") {
@@ -160,94 +380,173 @@ export async function finalize(ctx, argv) {
         return EXIT.failure;
     }
     // ── Which session. ──
-    const nowMs = ctx.now().getTime();
     let sessionId;
-    if (args.session !== null) {
-        if (!SESSION_ID.test(args.session)) {
-            writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", code: "FINALIZE_BAD_SESSION_ID", what: FINALIZE.badSessionId, why: [] }, ctx.colour));
-            return EXIT.usage;
-        }
-        sessionId = args.session;
+    let transcriptPath;
+    let eof;
+    let specs;
+    if (anyFolder.kind === "ready") {
+        ({ sessionId, transcriptPath, eof, specs } = anyFolder);
     }
     else {
-        const recent = recentSessions(ctx.home, projectKey, nowMs);
-        if (recent.length === 0) {
-            writeLines(ctx.stderr, renderErrorBlock({
-                kind: "bad",
-                code: "FINALIZE_NO_RECENT_SESSION",
-                what: FINALIZE.noRecentSession,
-                why: [],
-                fixLabel: FINALIZE.noRecentSessionFix,
-                fixes: [channelCommand(ctx.env, ctx.selfPath, FINALIZE.commandSessionAny)],
-            }, ctx.colour));
-            return EXIT.usage;
+        // Here the cwd IS an allowed repo (the two gates above passed), so `keys`, `projectKey` and `slugOf` exist.
+        if (keys === null || projectKey === null || slugOf === null)
+            return EXIT.failure;
+        if (args.session !== null) {
+            if (!SESSION_ID.test(args.session)) {
+                writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", code: "FINALIZE_BAD_SESSION_ID", what: FINALIZE.badSessionId, why: [] }, ctx.colour));
+                return EXIT.usage;
+            }
+            sessionId = args.session;
         }
-        if (recent.length > 1) {
-            writeLines(ctx.stderr, renderErrorBlock({
-                kind: "bad",
-                code: "FINALIZE_SEVERAL_RECENT",
-                what: FINALIZE.severalRecent,
-                why: recent.map((r) => FINALIZE.recentRow(r.id, Math.round((nowMs - r.at) / 60000))),
-                fixLabel: FINALIZE.severalRecentFix,
-                fixes: [channelCommand(ctx.env, ctx.selfPath, FINALIZE.commandSessionAny)],
-            }, ctx.colour));
-            return EXIT.usage;
+        else {
+            const recent = recentSessions(ctx.home, projectKey, nowMs);
+            if (recent.length === 0) {
+                writeLines(ctx.stderr, renderErrorBlock({
+                    kind: "bad",
+                    code: "FINALIZE_NO_RECENT_SESSION",
+                    what: FINALIZE.noRecentSession,
+                    why: [],
+                    fixLabel: FINALIZE.noRecentSessionFix,
+                    fixes: [channelCommand(ctx.env, ctx.selfPath, FINALIZE.commandSessionAny)],
+                }, ctx.colour));
+                return EXIT.usage;
+            }
+            if (recent.length > 1) {
+                writeLines(ctx.stderr, renderErrorBlock({
+                    kind: "bad",
+                    code: "FINALIZE_SEVERAL_RECENT",
+                    what: FINALIZE.severalRecent,
+                    why: recent.map((r) => FINALIZE.recentRow(r.id, Math.round((nowMs - r.at) / 60000))),
+                    fixLabel: FINALIZE.severalRecentFix,
+                    fixes: [channelCommand(ctx.env, ctx.selfPath, FINALIZE.commandSessionAny)],
+                }, ctx.colour));
+                return EXIT.usage;
+            }
+            sessionId = recent[0].id;
         }
-        sessionId = recent[0].id;
-    }
-    // ── The session must be one THIS repo captured (it has a state file here) and its transcript must be findable inside the agent's own root. ──
-    const state = sessionStatePath(ctx.home, { repoKey: projectKey, sessionId });
-    if (state === null || !existsSync(state)) {
-        writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", code: "FINALIZE_UNKNOWN_SESSION", what: FINALIZE.unknownSession(sessionId), why: [] }, ctx.colour));
-        return EXIT.usage;
-    }
-    const transcriptPath = findTranscript(ctx.home, ctx.env, sessionId);
-    if (transcriptPath === null) {
-        writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", code: "FINALIZE_TRANSCRIPT_MISSING", what: FINALIZE.transcriptMissing(sessionId), why: [] }, ctx.colour));
-        return EXIT.failure;
-    }
-    try {
-        if (!args.force && nowMs - statSync(transcriptPath).mtimeMs < STILL_WRITING_MS) {
-            writeLines(ctx.stderr, renderErrorBlock({
-                kind: "bad",
-                code: "FINALIZE_STILL_WRITING",
-                what: FINALIZE.stillWriting,
-                why: [],
-                fixLabel: FINALIZE.stillWritingFix,
-                fixes: [channelCommand(ctx.env, ctx.selfPath, FINALIZE.commandSessionForce(sessionId))],
-            }, ctx.colour));
-            return EXIT.usage;
+        // ── The session must be one THIS repo captured (it has a state file here) and its transcript must be findable inside the agent's own root. ──
+        const state = sessionStatePath(ctx.home, { repoKey: projectKey, sessionId });
+        if (state === null || !existsSync(state)) {
+            // A session this folder's repo never captured may still belong to other repos it named (any-folder capture).
+            anyFolder = await prepareAnyFolder();
+            const refused = refuseAnyFolder(anyFolder);
+            if (refused !== null)
+                return refused;
+            if (anyFolder.kind !== "ready") {
+                writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", code: "FINALIZE_UNKNOWN_SESSION", what: FINALIZE.unknownSession(sessionId), why: [] }, ctx.colour));
+                return EXIT.usage;
+            }
+        }
+        if (anyFolder.kind === "ready") {
+            ({ transcriptPath, eof, specs } = anyFolder);
+        }
+        else {
+            const found = findTranscript(ctx.home, ctx.env, sessionId);
+            if (found === null) {
+                writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", code: "FINALIZE_TRANSCRIPT_MISSING", what: FINALIZE.transcriptMissing(sessionId), why: [] }, ctx.colour));
+                return EXIT.failure;
+            }
+            transcriptPath = found;
+            try {
+                if (!args.force && nowMs - statSync(transcriptPath).mtimeMs < STILL_WRITING_MS)
+                    return stillWriting(sessionId);
+            }
+            catch {
+                return EXIT.failure;
+            }
+            const size = fileSize(transcriptPath);
+            if (size === null)
+                return EXIT.failure;
+            eof = size;
+            // The session's other repos (parent-folder turns touched them too): resolved by the one resolver, under the one session lock.
+            // This repo's own ledger target is closed exactly as before; a resolved target for the same repo REPLACES it (the hook's own
+            // ledger choice), and a resolver that finds nothing leaves exactly today's single target.
+            const resolved = await resolveSessionTargets({ home: ctx.home, env: ctx.env, nowMs: ctx.now().getTime(), turnEndCwd: null }, sessionId, transcriptPath, { keys, slugOf: onceStrictRepoSlug(keys.worktree) }, releases);
+            if (resolved.kind === "busy")
+                return busyBlock();
+            heartbeat = resolved.heartbeat;
+            const own = resolved.targets.find((target) => target.worktrees.includes(projectKey) || target.ledgerKey === projectKey);
+            const manual = {
+                projectKey,
+                redactionRoots: confinementRoots(keys),
+                repoSlug: slugOf(),
+                worktrees: [projectKey],
+                allowNeverCaptured: false,
+                target: null,
+            };
+            specs = [
+                own === undefined ? manual : specOf(own, resolved.scan, resolved),
+                ...resolved.targets.filter((target) => target !== own).map((target) => specOf(target, resolved.scan, resolved)),
+            ];
         }
     }
-    catch {
-        return EXIT.failure;
-    }
-    const eof = fileSize(transcriptPath);
-    if (eof === null)
-        return EXIT.failure;
     // ── Deliver: promote what was pending, then sub-agents FIRST, then the main stream with the assertion. ──
     // ⛔ NO PENDING-LINE PROMOTION HERE, deliberately. Every hook fire of this session already ran it (`hooks/entry.ts`), and
     // the session necessarily has a state file (required above), so a first-turn commit was promoted by the first
     // `Stop` that wrote one. Promoting from this verb would add a second call site to a function whose only call site
     // is a pinned property (`post-commit-spool.test.ts`, D208): a dead session must never reach it.
-    const closed = await closeSession({
-        home: ctx.home,
-        env: ctx.env,
-        nodeVersion: ctx.nodeVersion,
-        agentId: ctx.agentId ?? DEFAULT_AGENT_ID,
-        cwd: ctx.cwd,
-        url,
-        credential: load.credential,
-        projectKey,
-        redactionRoots: confinementRoots(keys),
-        repoSlug: slugOf(),
-        sessionId,
-        transcriptPath,
-        eof,
-        seal: true,
-        allowNeverCaptured: false,
-        completeSubagents: false,
-    });
+    const outcomes = [];
+    // ⛔ LEAST RECENTLY SENT FIRST (C18 #8), as the hook orders its targets: resolver order is discovery order, and a session with many
+    // targets would always serve the same first ones if the credential or the clock ran out part-way. Never-sent targets (0) go first.
+    const lastSentAt = (spec) => {
+        const state = loadSessionState(ctx.home, { repoKey: spec.projectKey, sessionId });
+        return Math.max(0, ...Object.values(state.files).map((file) => file.lastSentAt));
+    };
+    specs = specs
+        .map((spec, index) => ({ spec, index, at: lastSentAt(spec) }))
+        .sort((a, b) => a.at - b.at || a.index - b.index)
+        .map((entry) => entry.spec);
+    for (const spec of specs) {
+        const closedOne = await closeSession({
+            home: ctx.home,
+            env: ctx.env,
+            nodeVersion: ctx.nodeVersion,
+            agentId: ctx.agentId ?? DEFAULT_AGENT_ID,
+            cwd: ctx.cwd,
+            url,
+            credential: load.credential,
+            projectKey: spec.projectKey,
+            redactionRoots: spec.redactionRoots,
+            repoSlug: spec.repoSlug,
+            sessionId,
+            transcriptPath,
+            eof: spec.sizeCap === undefined ? eof : Math.min(eof, spec.sizeCap.main ?? 0),
+            seal: true,
+            allowNeverCaptured: spec.allowNeverCaptured,
+            completeSubagents: false,
+            worktrees: spec.worktrees,
+            ...(spec.sizeCap === undefined ? {} : { sizeCap: spec.sizeCap }),
+            ...(spec.isolation === undefined ? {} : { isolation: spec.isolation }),
+            ...(heartbeat === undefined ? {} : { heartbeat }),
+        });
+        // C25: the session's lock was taken from us. Stop BEFORE the next target's write; this outcome is the verb's answer.
+        if (closedOne.kind === "lock-lost") {
+            outcomes.push(closedOne);
+            break;
+        }
+        // C3: the server refused THIS target for good. It is stopped (recorded, never retried), and it does not fail the others.
+        if (spec.target !== null &&
+            "delivery" in closedOne &&
+            closedOne.delivery.kind === "attempted" &&
+            closedOne.delivery.detail?.code === FOLDER_REPOSITORY_FORBIDDEN) {
+            // C35 (iii): recording the stop is a WRITE, so only while the session is still ours. A lost lock reports the refusal and leaves it
+            // for the next holder, who meets the same 403.
+            if (heartbeat === undefined || heartbeat())
+                stopTarget(ctx.home, sessionId, spec.target, FOLDER_REPOSITORY_FORBIDDEN, Date.now());
+            continue;
+        }
+        outcomes.push(closedOne);
+        if (closedOne.kind === "stopped")
+            break; // a fatal class for the credential: no other target can send either
+    }
+    // ONE answer: the first target that did not close cleanly, else one line for all of them.
+    const closed = outcomes.find((outcome) => outcome.kind !== "sealed" && outcome.kind !== "already") ??
+        (outcomes.length === 0
+            ? { kind: "never-captured" }
+            : {
+                ...(outcomes.find((outcome) => outcome.kind === "sealed") ?? outcomes[0]),
+                setAsidePairs: outcomes.reduce((sum, outcome) => sum + ("setAsidePairs" in outcome ? outcome.setAsidePairs : 0), 0),
+            });
     // ── What the server said. ──
     if (closed.kind === "stopped") {
         writeLines(ctx.stderr, renderErrorBlock({
@@ -282,7 +581,8 @@ export async function finalize(ctx, argv) {
         writeLines(ctx.stderr, renderErrorBlock({ kind: "warn", what: FINALIZE.notAcknowledged, why: [] }, ctx.colour));
         return EXIT.unacknowledged;
     }
-    // Anything else did not deliver (`not-delivered`; `finalize` never asks for the outcomes only a backfill can get).
+    // Anything else did not deliver (`not-delivered`, or `lock-lost` (C25: another writer took the session; the retry command is the
+    // right advice and no new line is needed); `finalize` never asks for the outcomes only a backfill can get).
     writeLines(ctx.stderr, renderErrorBlock({
         kind: "bad",
         code: "DELIVERY_FAILED",
@@ -332,9 +632,14 @@ export async function closeSession(input) {
         if (state === null || !existsSync(state))
             return { kind: "never-captured" };
     }
-    const spooled = capSpool(readSpool(home, spoolKey));
-    const rewritten = capSuccessors(readRewrites(home, spoolKey));
-    const inferred = capInferred(readInferred(home, spoolKey)); // `TODOS[177]`
+    // ⛔ THE SPOOL UNION (any-folder capture, O7): the commit, rewrite and inferred spools of every work tree of this repo for the
+    // session, acknowledged per source. With one work tree this is exactly the three reads it always was.
+    const worktrees = input.worktrees ?? [projectKey];
+    const isolation = input.isolation ?? { kind: "repo", ownRoots: redactionRoots };
+    const union = readSpoolUnion(home, sessionId, projectKey, worktrees);
+    const spooled = union.commits;
+    const rewritten = union.rewrites;
+    const inferred = union.inferred; // `TODOS[177]`
     const hookEnv = {
         env,
         home,
@@ -344,7 +649,11 @@ export async function closeSession(input) {
     };
     const hookInput = { sessionId, transcriptPath, cwd: input.cwd, eventName: "Stop" };
     const budget = input.sendBudgetMs ?? SEND_BUDGET_MS;
+    const beat = input.heartbeat;
+    const holding = () => beat === undefined || beat();
     let startedAt = Date.now();
+    if (!holding())
+        return { kind: "lock-lost" };
     if (!input.completeSubagents) {
         await deliverSubagents({
             ctx: hookEnv,
@@ -357,10 +666,17 @@ export async function closeSession(input) {
             startedAt,
             sendBudget: budget,
             byHook: false,
+            ...(input.sizeCap === undefined ? {} : { sizeCap: input.sizeCap }),
+            isolation,
+            ...(beat === undefined ? {} : { heartbeat: beat }),
         });
+        if (!holding())
+            return { kind: "lock-lost" };
     }
     else {
         for (let round = 0; round < SUBAGENT_ROUNDS_MAX; round += 1) {
+            if (!holding())
+                return { kind: "lock-lost" };
             const sent = await deliverSubagents({
                 ctx: hookEnv,
                 input: hookInput,
@@ -373,7 +689,12 @@ export async function closeSession(input) {
                 startedAt: Date.now(),
                 sendBudget: budget,
                 byHook: false,
+                ...(input.sizeCap === undefined ? {} : { sizeCap: input.sizeCap }),
+                isolation,
+                ...(beat === undefined ? {} : { heartbeat: beat }),
             });
+            if (!holding())
+                return { kind: "lock-lost" };
             const blocked = sent.deliveries.find(blocksMain);
             if (blocked !== undefined)
                 return { kind: "subagents-held", delivery: blocked };
@@ -386,6 +707,8 @@ export async function closeSession(input) {
         // the clock it always had.
         startedAt = Date.now();
     }
+    if (!holding())
+        return { kind: "lock-lost" };
     const delivery = await deliver({
         home,
         env,
@@ -397,17 +720,28 @@ export async function closeSession(input) {
         fileKey: "main",
         transcriptPath,
         timeoutMs: sendTimeoutMs(budget, Date.now() - startedAt),
+        // ⛔ NO `deadlineAtMs` HERE (C21 #2, retracting C18 #8's deadline): `finalize` and `backfill` are interactive and "set no deadline
+        // and run on" (post.ts). A deadline would stop a main stream that needs longer part-way, never send the final request, and
+        // report a session 0.8.0 completed as failed.
         nowMs: Date.now(),
         head: headRef(projectKey),
         commits: spooled,
         rewrites: rewritten.pairs,
         inferredRewrites: inferred.pairs,
         inferredGroups: inferred.groups,
+        spoolSources: union.sources,
         ...(input.seal ? { final: true } : {}),
         byHook: false,
-    }, eof, (from, to) => readSpan(transcriptPath, from, to, redactionRoots, home, env), recordCutter(transcriptPath));
+        ...(beat === undefined ? {} : { beforeRequest: beat }),
+    }, eof, (from, to) => readSpan(transcriptPath, from, to, redactionRoots, home, env, isolation), recordCutter(transcriptPath));
     if (delivery.kind === "stopped")
         return { kind: "stopped" };
+    // C25: `deliver` makes no request once the lock is gone. It answers `nothing-to-send` (which a close that does not seal reads as
+    // "already delivered") or, after some deltas went, the last good one. Ask again: a lock that is not ours, with bytes still unsent,
+    // is not a delivery. (Everything sent and acknowledged is reported as it happened, whoever holds the session now.)
+    if (!holding() && (delivery.kind === "nothing-to-send" || fileState(loadSessionState(home, spoolKey), "main").sentOffset < eof)) {
+        return { kind: "lock-lost" };
+    }
     if (!input.seal) {
         return delivery.kind === "nothing-to-send" || (delivery.kind === "attempted" && delivery.disposition === "ok")
             ? { kind: "delivered", delivery }
@@ -416,7 +750,9 @@ export async function closeSession(input) {
     if (delivery.kind !== "attempted" || delivery.disposition !== "ok")
         return { kind: "not-delivered", delivery };
     if (delivery.finalAck === "sealed" || delivery.finalAck === "already") {
-        clearDeliveredHold(home, spoolKey);
+        // C25: a write, so only while the session is still ours. The close itself DID happen (the server said so), and is reported.
+        if (holding())
+            clearDeliveredHold(home, spoolKey);
         // ⭐ `TODOS[177]` follow-up (VL, 2026-10-08) — DRAIN what the first delivery's caps left spooled. A session
         // over 16 exact pairs or 64 inferred pairs (one squash of 64 is already the server's own cap; several
         // squashes in one session is what overflows this) would otherwise leave the rest spooled FOREVER: nobody
@@ -439,8 +775,11 @@ export async function closeSession(input) {
         // existing "absent ack, stop asking" guard below never fires either).
         const lean = fileState(loadSessionState(home, spoolKey), "main").lean;
         for (let i = 0; !lean && i < FINALIZE_DRAIN_MAX_ITERATIONS; i += 1) {
-            const moreRewritten = capSuccessors(readRewrites(home, spoolKey));
-            const moreInferred = capInferred(readInferred(home, spoolKey));
+            if (!holding())
+                break;
+            const more = readSpoolUnion(home, sessionId, projectKey, worktrees);
+            const moreRewritten = more.rewrites;
+            const moreInferred = more.inferred;
             if (moreRewritten.pairs.length === 0 && moreInferred.pairs.length === 0)
                 break;
             const groupId = moreInferred.groups.length > 0 ? `${moreInferred.groups[0].successor}:${moreInferred.groups[0].patchId}` : null;
@@ -463,9 +802,11 @@ export async function closeSession(input) {
                 rewrites: moreRewritten.pairs,
                 inferredRewrites: moreInferred.pairs,
                 inferredGroups: moreInferred.groups,
+                spoolSources: more.sources,
                 final: true,
                 byHook: false,
-            }, eof, (from, to) => readSpan(transcriptPath, from, to, redactionRoots, home, env), recordCutter(transcriptPath));
+                ...(beat === undefined ? {} : { beforeRequest: beat }),
+            }, eof, (from, to) => readSpan(transcriptPath, from, to, redactionRoots, home, env, isolation), recordCutter(transcriptPath));
             if (drain.kind !== "attempted" || drain.disposition !== "ok")
                 break;
             setAsidePairs += drain.inferredSetAsidePairs;
@@ -498,8 +839,11 @@ export async function closeSession(input) {
         // ⛔⛔ Fine to delete AFTER `setAsidePairs` is computed above, NEVER before (VL, 2026-10-08, VG's silent-loss
         // finding B1): `setAsidePairs` is read from `deliver()`'s own return values — which were captured before this
         // point — not re-derived from the spool afterward, which is the file this line is about to delete.
-        if (inferredFullyResolved(home, spoolKey))
-            deleteInferredSpool(home, spoolKey);
+        for (const source of holding() ? [projectKey, ...worktrees.filter((worktree) => worktree !== projectKey)] : []) {
+            const sourceKey = { repoKey: source, sessionId };
+            if (inferredFullyResolved(home, sourceKey))
+                deleteInferredSpool(home, sourceKey);
+        }
         return { kind: delivery.finalAck, delivery, setAsidePairs };
     }
     if (delivery.finalAck === "refused")
@@ -553,14 +897,6 @@ function findTranscript(home, env, sessionId) {
 }
 /** After a successful close, forget end-of-session holds whose bytes have now been delivered. */
 function clearDeliveredHold(home, key) {
-    const session = loadSessionState(home, key);
-    if (session.endHold === null)
-        return;
-    const eof = {};
-    for (const [fileKey, size] of Object.entries(session.endHold.eof)) {
-        if (fileState(session, fileKey).sentOffset < size)
-            eof[fileKey] = size;
-    }
-    saveSessionState(home, key, { ...session, endHold: Object.keys(eof).length > 0 ? { at: session.endHold.at, eof } : null });
+    pruneDeliveredEndHold(home, key);
 }
 //# sourceMappingURL=finalize.js.map

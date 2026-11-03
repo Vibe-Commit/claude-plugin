@@ -299,6 +299,19 @@ export const CLAUDE_CODE = {
     // over. `CR-124`, D76.
     delegatedTranscripts: "discover",
     redaction: "claude-code",
+    // Every Claude Code record carries the shell's current `cwd` at its top level (measured, 2026-10-31).
+    cwdKeys: [{ path: ["cwd"] }],
+    // Every CONVERSATION record carries `cwd`; 27.9% of all records carry none (measured 2026-11-01, local corpus, counts only): session metadata
+    // (last-prompt, queue-operation, api-request blobs, titles, file-history ...), several of them content-bearing, and every one of them repeated
+    // text found only in other folders' records. So a record with no folder is decided by its TYPE, never by an inherited folder (C27, C38):
+    //   - last-prompt, queue-operation, api-request-blob, api-request, api-request-shape, file-history-snapshot, file-history-delta: content withheld
+    //     in EVERY copy (their path-shaped keys stay);
+    //   - mode, permission-mode, atis-latch, bridge-session, cost-state, tools-used, fork-context-ref, launched: kept in a multi-repo copy within their
+    //     measured keys;
+    //   - everything else (titles, agent-name, pr-link, a type Claude Code adds next year): withheld from a multi-repo copy, kept in a single-repo one.
+    // "Multi-repo" is `Target.multi`: the session named a work tree other than the target's (see `resolveTargets`). A record that carries a folder is
+    // decided by that folder (R17). What stays is stated in the README.
+    isolatesContentRecords: true,
     sessionIdFromEnv: claudeSessionIdFromEnv,
     sessionSource: claudeSessionSource,
     locateCurrentTranscript,

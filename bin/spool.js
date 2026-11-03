@@ -43,7 +43,8 @@
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { keepsPendingLine } from "./pending_bound.js";
-import { repoSessionsDir, sessionStatePath } from "./paths.js";
+import { repoKeyNotePath, repoSessionsDir, sessionStatePath } from "./paths.js";
+import { writeFileAtomic } from "./atomic_write.js";
 /**
  * How many SHAs one hook may put on the wire.
  *
@@ -97,12 +98,36 @@ export function spoolPath(home, key) {
  * `appendFileSync` with `a` is a single positioned write, so two commits racing
  * in one repo interleave whole lines rather than corrupting each other.
  */
+/**
+ * Remember which work tree a state digest belongs to, so a later firing of THIS session can find the repo a commit was
+ * spooled in (any-folder capture, R2: "plus repos holding a spooled commit for this session id").
+ *
+ * ⛔ WHY IT EXISTS: a session's spool lives under `sessions/<sha256(repoKey)[0:32]>/`, and a digest cannot be turned back
+ * into a path. A commit made with `git -C <repo>` from a parent folder leaves no `cwd` or path key in the transcript, so
+ * the spool is the ONLY evidence of that repo, and without this note it names a directory nobody can map to a work tree.
+ * Written beside (never inside) the digest directories, in `state/notices/_session-targets/`, so no scan of `sessions/` or of a repo directory sees it.
+ *
+ * Best effort and NEVER throws: this runs inside `git commit`, exactly like the append that calls it.
+ */
+export function noteRepoKey(home, repoKey) {
+    const path = repoKeyNotePath(home, repoKey);
+    if (path === null || existsSync(path))
+        return;
+    try {
+        mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+        writeFileAtomic(path, `${repoKey}\n`, 0o600);
+    }
+    catch {
+        // The note is an index, not the record: a missing one costs discovery of one repo, never a commit.
+    }
+}
 export function appendSpool(home, key, entry) {
     const path = spoolPath(home, key);
     if (path === null)
         return false;
     try {
         mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+        noteRepoKey(home, key.repoKey);
         appendFileSync(path, `${JSON.stringify(entry)}\n`, { mode: 0o600 });
         chmodSync(path, 0o600);
         return true;
@@ -524,6 +549,7 @@ export function appendRewrites(home, key, pairs) {
     let written = 0;
     try {
         mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+        noteRepoKey(home, key.repoKey);
         for (const pair of pairs) {
             const wire = wirePair(pair);
             if (seen.has(wire))
@@ -703,6 +729,7 @@ export function appendInferred(home, key, pairs) {
     let written = 0;
     try {
         mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+        noteRepoKey(home, key.repoKey);
         const existing = readStored(path);
         const known = new Set([...existing.delivered, ...existing.setAside, ...existing.groups.map(identityOf)]);
         for (const successor of order) {
@@ -1337,6 +1364,7 @@ export function appendPending(home, key, entry) {
             return false;
         const kept = [...existing, entry].slice(-MAX_PENDING_SHAS);
         mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+        noteRepoKey(home, key.repoKey);
         writeFileSync(path, kept.map((e) => `${JSON.stringify(e)}\n`).join(""), { mode: 0o600 });
         chmodSync(path, 0o600);
         return true;

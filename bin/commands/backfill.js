@@ -31,24 +31,26 @@
  * the offer open no transcript, and nothing else is read from this one. Codex needs no check (its index already holds the
  * real `cwd`). Cursor records no folder at all (measured, STATIC), so its sessions are never uploaded and are counted instead.
  */
-import { closeSync, lstatSync, openSync, readSync, realpathSync } from "node:fs";
+import { lstatSync, realpathSync } from "node:fs";
 import { basename, isAbsolute } from "node:path";
-import { admitsTranscript, DIALECTS } from "../agents/registry.js";
+import { admitsTranscript, agentIsolatesRecords, DIALECTS } from "../agents/registry.js";
 import { BACKFILL, COMMANDS, SCAN, URLS, shortDate } from "../copy/index.js";
-import { grantsUnreadable, isCaptureAllowed } from "../consent.js";
+import { captureStanding, grantsUnreadable, hasAnyConsent, isCaptureAllowed } from "../consent.js";
+import { folderStandingOf } from "../folder_grants.js";
 import { loadCredential } from "../credential.js";
 import { EXIT } from "../exit.js";
-import { firstReflogSeconds, resolveRepoSlug } from "../git.js";
-import { confinementRoots } from "../hooks/entry.js";
+import { firstReflogSeconds, onceStrictRepoSlug } from "../git.js";
+import { FOLDER_REPOSITORY_FORBIDDEN } from "../policy.js";
 import { CAPTURE_NOT_APPROVED, ingestUrl } from "../post.js";
 import { resolveProjectKeys } from "../project.js";
+import { TOP_LEVEL_CWD_ONLY, findSubagentTranscriptsChecked, groupKey, loadTargetRecord, scanTranscriptKeys, stopKeyOf, stopTarget } from "../session_targets.js";
 import { SESSION_LIVE_WINDOW_MS } from "../spool.js";
 import { fileState, loadSessionState } from "../state.js";
 import { glyph, paint, renderErrorBlock, tildePath, truncateMiddle, truncatePath, wrap, WRAP_COLUMNS } from "../term.js";
 import { writeLines } from "./context.js";
 import { credentialProblem } from "./credential_problem.js";
 import { authCommandFor, channelCommand, connectCommandFor } from "../install.js";
-import { closeSession, ingestUrlUnavailableBlock } from "./finalize.js";
+import { closeSession, closeSpecOf, ingestUrlUnavailableBlock, resolveSessionTargets } from "./finalize.js";
 import { scanMachine } from "./scan.js";
 import { renderVerbHelp } from "../verb_help.js";
 /** A transcript larger than this on disk is not offered (the 50 MiB policy cap). Sub-agent streams are not capped. */
@@ -155,13 +157,149 @@ export function planBackfill(ctx, scanFn = scanMachine) {
         repos.push({ slug: repo.slug, candidates });
         total += candidates.length;
     }
+    const parent = planParentSessions(ctx, scanned);
+    total += parent.length;
     return {
         repos,
+        parent,
         total,
         cursorSessions,
         overSize,
         noReflog: [...noReflog.entries()].map(([path, sessions]) => ({ path, sessions })).sort((a, b) => (a.path < b.path ? -1 : 1)),
     };
+}
+/**
+ * The sessions run from folders outside every repository, minus those already fully delivered. ⛔ Opens no transcript. Offered only
+ * where this machine consents to anything at all. Only a dialect that can isolate records (Claude Code and Codex; see `isolatesContentRecords`):
+ * Cursor records no folder, so it is not offered. A session whose target
+ * record says it is settled with every target's ledger at its end is done; one that touched nothing chosen is re-checked each run
+ * (cheap, and a later grant may change the answer), which the offer says plainly.
+ */
+function planParentSessions(ctx, scanned) {
+    const nowMs = (ctx.now ?? (() => new Date()))().getTime();
+    if (!hasAnyConsent(ctx.home))
+        return [];
+    const out = [];
+    for (const folder of scanned.folders ?? []) {
+        for (const member of folder.members ?? []) {
+            // ⛔ C28: only a dialect that can isolate records (`isolatesContentRecords`) is offered here: a parent-folder session is judged by the
+            // repos its records name, and a dialect that cannot keep one repo's copy free of another's would send every repo it named the
+            // others' prompts and output. Such a session is uploaded, if at all, by the in-repo path, to the repo it ended in.
+            if (!agentIsolatesRecords(member.agent))
+                continue;
+            const found = statFile(member.session.path);
+            if (found === null || found.size > MAX_SESSION_BYTES)
+                continue;
+            const sessionId = sessionIdOf(member.agent, member.session.path);
+            if (sessionId === null)
+                continue;
+            if (parentDone(ctx.home, ctx.env, sessionId, member.session.path, found.size, nowMs - found.mtimeMs >= SESSION_LIVE_WINDOW_MS))
+                continue;
+            out.push({
+                agent: member.agent,
+                sessionId,
+                path: member.session.path,
+                dir: folder.path,
+                mtimeMs: found.mtimeMs,
+                startedMs: member.session.startedMs ?? member.session.mtimeMs,
+                size: found.size,
+            });
+        }
+    }
+    return out.sort((a, b) => a.mtimeMs - b.mtimeMs || (a.path < b.path ? -1 : 1));
+}
+/**
+ * Has this target's ledger sent EVERY stream of the session to its end (C29 ii)? The main stream to `mainEof` and each delegated file to
+ * its own size, each capped at `sizeCap[fileKey]` when the target is a folder's (a folder never sends past what was scanned).
+ */
+function streamsSentTo(state, mainEof, subs, sizeCap) {
+    if (fileState(state, "main").sentOffset < mainEof)
+        return false;
+    for (const sub of subs) {
+        const to = sizeCap === undefined ? sub.size : Math.min(sub.size, sizeCap[sub.fileKey] ?? 0);
+        if (fileState(state, sub.fileKey).sentOffset < to)
+            return false;
+    }
+    return true;
+}
+/**
+ * Nothing a backfill could add for this session, under TODAY's consent and the file's CURRENT size (C18 #9, #10). Needs no transcript
+ * read: it is decided from the session's target record and its ledgers.
+ *
+ *   - discovery is settled (the whole transcript was read and no root is waiting);
+ *   - every repo root the record names that is GRANTED NOW has a target whose ledger has sent to the current end of the file and
+ *     holds nothing back. A repo granted after the session was last uploaded has no target yet, so the session is offered again,
+ *     and the run then uploads only the repos that still owe bytes;
+ *   - the folder decision still holds: a folder target is done only when the scan reached the current end AND its ledger sent that
+ *     far (bytes appended since are offered, not skipped for ever), and a session that named no repository at all whose launch
+ *     folder is granted now but has no folder target yet is not done.
+ */
+function parentDone(home, env, sessionId, transcriptPath, size, quiet) {
+    const record = loadTargetRecord(home, sessionId);
+    if (record === null || !record.settled)
+        return false;
+    // ⛔ C29 (i): THE SCAN MUST HAVE SEEN EVERY STREAM AS IT IS NOW. `settled` says the streams that were scanned were read to their end;
+    // it says nothing about a delegated file that appeared, or a file that GREW, since. Each stream's cursor remembers the size it
+    // scanned (`size`), so a stream whose file is a different size now has unread bytes, and a stream with no cursor at all was never read.
+    // A directory that cannot be LISTED is not an empty one (C17 #2): the delegated streams are unknown, so the session is not done.
+    const listing = findSubagentTranscriptsChecked(home, env, transcriptPath);
+    if (listing.listFailed)
+        return false;
+    const subs = listing.found;
+    let scanCurrent = record.scan.main?.size === size;
+    for (const sub of subs)
+        if (record.scan[sub.fileKey]?.size !== sub.size)
+            scanCurrent = false;
+    // The one exception is C21 #3: a FOLDER target the server refused for good can never be sent, so bytes appended after the refusal do
+    // not bring the session back (they could only ever be sent under that same folder).
+    const folderRefused = record.targets.some((t) => t.kind === "folder" && record.stopped[stopKeyOf(t)] !== undefined);
+    if (!scanCurrent && !folderRefused)
+        return false;
+    // ⛔ C29 (ii), the same rule for what was SENT: every stream of the target (main and each delegated file), not main alone.
+    const sentToEnd = (target) => {
+        const state = loadSessionState(home, { repoKey: target.ledgerKey, sessionId });
+        // ⛔ C35 (v): A QUIET SESSION IS NOT DONE UNTIL IT IS SEALED. An upload made while the transcript was recent or running leaves the target
+        // unfinalized; once the file has been quiet for the live window `uploadParent` would seal it, so the session must be offered again
+        // for that. (A session still running is not asked to seal: `quiet` is false.)
+        return state.endHold === null && streamsSentTo(state, size, subs, undefined) && (state.finalized !== null || !quiet);
+    };
+    const owed = new Set();
+    for (const info of Object.values(record.roots)) {
+        if (info.state !== "repo")
+            continue;
+        if (captureStanding(home, { worktree: info.toplevel, consent: info.commonDir }, info.slug) !== "granted")
+            continue;
+        owed.add(groupKey(info));
+    }
+    for (const key of owed) {
+        const target = record.targets.find((t) => t.kind === "repo" && t.groupKey === key);
+        // A target the server refused for good (C3: `record.stopped`) owes nothing: it can never be sent, and `status` names it. Without
+        // this the session would be offered again on every run and then reported with the wrong reason.
+        if (target !== undefined && record.stopped[stopKeyOf(target)] !== undefined)
+            continue;
+        if (target === undefined || !sentToEnd(target))
+            return false;
+    }
+    const noRepoNamed = Object.keys(record.roots).length === 0 && record.unresolved.length === 0 && !record.oversize;
+    const folder = record.targets.find((t) => t.kind === "folder");
+    if (folder !== undefined) {
+        if (record.stopped[stopKeyOf(folder)] !== undefined)
+            return true;
+        if (noRepoNamed && folderStandingOf(home, folder.folder ?? "") === "granted") {
+            return record.scan.main?.offset === size && sentToEnd(folder);
+        }
+        return true;
+    }
+    if (noRepoNamed && record.launchFolder !== null) {
+        try {
+            if (folderStandingOf(home, realpathSync(record.launchFolder)) === "granted")
+                return false;
+        }
+        catch {
+            // A launch folder that is gone cannot be a folder target.
+        }
+    }
+    return true;
 }
 function candidateOf(member, slug, sessionId, found) {
     return {
@@ -224,20 +362,41 @@ export function renderOffer(plan, options) {
         .map((id) => `${SCAN.agent[id]} ${counts[id]}`)
         .join(" · ");
     const folders = plan.repos.map((repo) => folderRows(repo));
-    const widestRight = Math.max(...plan.repos.map(countsOf).map((text) => text.length), ...folders.flatMap((rows) => rows.map((row) => agentsOf(row.counts).length)));
+    const widestRight = Math.max(0, ...plan.repos.map(countsOf).map((text) => text.length), ...folders.flatMap((rows) => rows.map((row) => agentsOf(row.counts).length)));
     // The column the right-hand text may start at without passing 80.
     const limit = WRAP_COLUMNS - widestRight;
-    const slugWidth = Math.max(8, Math.min(SLUG_MAX, ...[Math.max(...plan.repos.map((repo) => repo.slug.length))], limit - ROW_INDENT - COLUMN_GAP));
+    const slugWidth = Math.max(8, Math.min(SLUG_MAX, ...[Math.max(0, ...plan.repos.map((repo) => repo.slug.length))], limit - ROW_INDENT - COLUMN_GAP));
     const pathCap = Math.max(PATH_MIN, limit - FOLDER_INDENT - 2);
     const pathOf = (dir) => truncatePath(tildePath(dir, home), pathCap);
-    const longestPath = Math.max(...folders.flatMap((rows) => rows.map((row) => pathOf(row.dir).length)));
+    const longestPath = Math.max(0, ...folders.flatMap((rows) => rows.map((row) => pathOf(row.dir).length)));
     const column = Math.max(ROW_INDENT + slugWidth + COLUMN_GAP, FOLDER_INDENT + longestPath + 2);
-    const lines = ["", ...wrap(BACKFILL.offerHeading(plan.repos.length, options.standalone !== false), 2), ""];
+    const lines = [""];
+    if (plan.repos.length > 0)
+        lines.push(...wrap(BACKFILL.offerHeading(plan.repos.length, options.standalone !== false), 2), "");
     for (const [index, repo] of plan.repos.entries()) {
         lines.push(`${" ".repeat(ROW_INDENT)}${paint(colour, "text", `${truncateMiddle(repo.slug, slugWidth).padEnd(column - ROW_INDENT)}${countsOf(repo)}`)}`);
         for (const row of folders[index]) {
             lines.push(`${" ".repeat(FOLDER_INDENT)}${paint(colour, "muted", `${pathOf(row.dir).padEnd(column - FOLDER_INDENT)}${agentsOf(row.counts)}`)}`);
         }
+    }
+    const parent = plan.parent ?? [];
+    if (parent.length > 0) {
+        // R4: sessions run from folders outside a repository. Their repositories are not known until the transcript is read, after the
+        // yes, so this block says what will be CHECKED and what the check can find: never a promise of an upload.
+        if (plan.repos.length > 0)
+            lines.push("");
+        lines.push(...wrap(BACKFILL.parentHeading(parent.length), 2), "");
+        const byDir = new Map();
+        for (const candidate of parent)
+            byDir.set(candidate.dir, (byDir.get(candidate.dir) ?? 0) + 1);
+        const rows = [...byDir.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1));
+        const parentCap = Math.max(PATH_MIN, WRAP_COLUMNS - ROW_INDENT - COLUMN_GAP - BACKFILL.parentRowCounts(99999).length);
+        const shown = rows.map(([dir, count]) => ({ path: truncatePath(tildePath(dir, home), parentCap), count }));
+        const width = Math.max(...shown.map((row) => row.path.length));
+        for (const row of shown) {
+            lines.push(`${" ".repeat(ROW_INDENT)}${paint(colour, "text", `${row.path.padEnd(width + COLUMN_GAP)}${BACKFILL.parentRowCounts(row.count)}`)}`);
+        }
+        lines.push("", ...wrap(BACKFILL.parentNote, ROW_INDENT).map((line) => paint(colour, "muted", line)));
     }
     const notOffered = notOfferedLines(plan, colour, home);
     if (notOffered.length > 0)
@@ -246,73 +405,26 @@ export function renderOffer(plan, options) {
     return lines;
 }
 // ---------------------------------------------------------------------------
-// The folder check — exception 1. Everything between the markers is the ONLY code that reads a transcript.
+// The folder check — exception 1. It no longer reads a transcript itself.
 // ---------------------------------------------------------------------------
-// folder-check:begin
 /**
- * The `cwd` of the transcript's first record that has one. ⛔ ONE VALUE. The record is parsed to read its top-level `cwd`
- * and nothing else is looked at, kept, returned or sent; a line that does not mention `"cwd"` is not parsed at all.
- * `none` (no record carries one in the first `FOLDER_CHECK_MAX_BYTES`) and `unreadable` (the file cannot be opened) both
- * fail closed — the session is skipped — but they are different facts and are told apart.
+ * The `cwd` of the transcript's first record that has one. ⛔ ONE VALUE, and ONE READER: this is a call to
+ * `scanTranscriptKeys` (`session_targets.ts`, R13 · D15 · A), the only code that reads a field out of a transcript, with
+ * the spec narrowed to a top-level `cwd` and nothing else, so the 10-24 one-value reading of D60 §D6 exception 1 is exactly
+ * what backfill's own check still does. `none` (no record carries one in the first `FOLDER_CHECK_MAX_BYTES`) and
+ * `unreadable` (the file cannot be opened) both fail closed — the session is skipped — but they are different facts and
+ * are told apart.
  */
 export function firstRecordedCwd(path) {
-    let fd;
-    try {
-        fd = openSync(path, "r");
-    }
-    catch {
+    const scan = scanTranscriptKeys(path, 0, FOLDER_CHECK_MAX_BYTES, TOP_LEVEL_CWD_ONLY, {
+        first: true,
+        includeUnterminatedTail: true,
+    });
+    if (scan.kind === "unreadable")
         return { kind: "unreadable" };
-    }
-    try {
-        const block = Buffer.alloc(64 * 1024);
-        let pending = Buffer.alloc(0);
-        let readBytes = 0;
-        while (readBytes < FOLDER_CHECK_MAX_BYTES) {
-            const n = readSync(fd, block, 0, block.length, readBytes);
-            if (n === 0)
-                break;
-            readBytes += n;
-            pending = Buffer.concat([pending, block.subarray(0, n)]);
-            for (let end = pending.indexOf(0x0a); end >= 0; end = pending.indexOf(0x0a)) {
-                const line = pending.subarray(0, end).toString("utf8");
-                pending = pending.subarray(end + 1);
-                if (!line.includes('"cwd"'))
-                    continue;
-                const cwd = cwdOfLine(line);
-                if (cwd !== null)
-                    return { kind: "found", cwd };
-            }
-        }
-        const last = cwdOfLine(pending.toString("utf8"));
-        return last === null ? { kind: "none" } : { kind: "found", cwd: last };
-    }
-    catch {
-        return { kind: "unreadable" };
-    }
-    finally {
-        try {
-            closeSync(fd);
-        }
-        catch {
-            // Nothing useful to do.
-        }
-    }
+    const found = scan.hits.find((hit) => hit.kind === "cwd");
+    return found === undefined ? { kind: "none" } : { kind: "found", cwd: found.value };
 }
-function cwdOfLine(line) {
-    if (!line.includes('"cwd"'))
-        return null;
-    try {
-        const record = JSON.parse(line);
-        if (record === null || typeof record !== "object" || Array.isArray(record))
-            return null;
-        const cwd = record.cwd;
-        return typeof cwd === "string" && cwd !== "" ? cwd : null;
-    }
-    catch {
-        return null;
-    }
-}
-// folder-check:end
 /**
  * Does the folder the session recorded still resolve to the clone it was matched to?
  *
@@ -357,6 +469,10 @@ function classify(outcome) {
             return { kind: "uploaded" };
         case "never-captured":
             return { kind: "failed", reason: BACKFILL.refusedByServer };
+        case "lock-lost":
+            // C25: another writer took the session while this run held it; nothing more was written. The session is "busy", as when the
+            // lock could not be had at all, and a later run uploads what is left.
+            return { kind: "skipped", reason: BACKFILL.parentBusy };
         case "not-delivered":
         case "subagents-held": {
             const delivery = outcome.delivery;
@@ -415,32 +531,175 @@ async function uploadOne(run, candidate) {
         if (!folderMatches(recorded.cwd, candidate.commonDir))
             return { kind: "skipped", reason: BACKFILL.folderDiffers };
     }
-    let slug = run.slugs.get(candidate.clone);
-    if (slug === undefined) {
-        slug = resolveRepoSlug(keys.worktree);
-        run.slugs.set(candidate.clone, slug);
-    }
     const quiet = ctx.now().getTime() - found.mtimeMs >= SESSION_LIVE_WINDOW_MS;
-    const outcome = await run.close({
-        home: ctx.home,
-        env: ctx.env,
-        nodeVersion: ctx.nodeVersion,
-        agentId: candidate.agent,
-        cwd: candidate.dir,
-        url: run.url,
-        credential: run.credential,
-        projectKey: keys.worktree,
-        redactionRoots: confinementRoots(keys),
-        repoSlug: slug,
-        sessionId: candidate.sessionId,
-        transcriptPath: candidate.path,
-        eof: found.size,
-        // Sealed only when the transcript has been quiet for 30 minutes and it is not the session running this command.
-        seal: quiet && !run.running.has(candidate.sessionId),
-        allowNeverCaptured: true,
-        completeSubagents: true,
-    });
-    return classify(outcome);
+    // ⛔ EVERY BACKFILL UPLOAD GOES THROUGH THE ONE RESOLVER, UNDER THE SESSION'S ONE WRITER LOCK (C18 #3). This path used to call
+    // `closeSession` with `keys.worktree` directly: no lock (it could interleave with a live hook on the same session) and no sticky
+    // ledger (a session the hook already adopted another work tree's ledger for would start a second ledger and re-send from 0). The
+    // resolver gives the target this repo already has for the session, ledger and slug included.
+    //
+    // ⛔ NO FALLBACK UPLOAD (C21 #1). When the resolver returns no target for this repo, the session is SKIPPED: nothing is sent and no
+    // ledger is written. It returns none when the strict slug failed (git timed out: the old fallback answered `local:<hash>`, a WRONG
+    // repository identity that a later hook would then adopt along with its ledger) or when the root was deferred (a fresh ledger at
+    // `keys.worktree` is the double send that deferral exists to prevent). The next run, with git answering, uploads it properly.
+    const releases = [];
+    try {
+        // `turnEndCwd` is the folder the OFFER verified this session belongs to (the agent's own index, or the first `cwd` the transcript
+        // records): the evidence that put it in this repo's offer, handed to the resolver so a transcript with no `cwd` of its own still
+        // resolves. It cannot name a repo the offer did not (the candidate is this repo's) and it is no fallback identity.
+        const resolved = await resolveSessionTargets({ home: ctx.home, env: ctx.env, nowMs: ctx.now().getTime(), turnEndCwd: candidate.dir }, candidate.sessionId, candidate.path, { keys, slugOf: onceStrictRepoSlug(keys.worktree) }, releases);
+        if (resolved.kind === "busy")
+            return { kind: "skipped", reason: BACKFILL.parentBusy };
+        const heartbeat = resolved.heartbeat;
+        // This repo's target: one of its work trees, or any work tree of the same git common dir (a session recorded in a LINKED work tree
+        // belongs to the clone the offer was made for).
+        const own = resolved.targets.find((target) => target.kind === "repo" &&
+            (target.worktrees.includes(keys.worktree) || target.ledgerKey === keys.worktree || target.commonDir === keys.consent));
+        if (own === undefined)
+            return { kind: "failed", reason: BACKFILL.noRepoIdentity };
+        const spec = closeSpecOf(own, resolved.scan, resolved);
+        const outcome = await run.close({
+            home: ctx.home,
+            env: ctx.env,
+            nodeVersion: ctx.nodeVersion,
+            agentId: candidate.agent,
+            cwd: candidate.dir,
+            url: run.url,
+            credential: run.credential,
+            projectKey: spec.projectKey,
+            redactionRoots: spec.redactionRoots,
+            repoSlug: spec.repoSlug,
+            sessionId: candidate.sessionId,
+            transcriptPath: candidate.path,
+            eof: found.size,
+            // Sealed only when the transcript has been quiet for 30 minutes and it is not the session running this command.
+            seal: quiet && !run.running.has(candidate.sessionId),
+            allowNeverCaptured: true,
+            completeSubagents: true,
+            worktrees: spec.worktrees,
+            ...(spec.isolation === undefined ? {} : { isolation: spec.isolation }),
+            heartbeat,
+        });
+        return classify(outcome);
+    }
+    finally {
+        for (const release of releases) {
+            try {
+                release();
+            }
+            catch {
+                // A lock that cannot be released ages out by itself.
+            }
+        }
+    }
+}
+/**
+ * One parent-folder session (R4): find, by the resolver `finalize` and the hook use, every granted repository it touched (and the
+ * folder, when it touched none and the folder is granted), then close it once per target through `closeSession`, so a
+ * multi-repo session uploads once per granted repo with each repo's own redaction scope. ⛔ The first read of this transcript
+ * happens HERE, after the yes and after the consent check, one session at a time.
+ */
+async function uploadParent(run, candidate) {
+    const { ctx } = run;
+    const found = statFile(candidate.path);
+    if (found === null)
+        return { kind: "skipped", reason: BACKFILL.fileGone };
+    if (found.size > MAX_SESSION_BYTES)
+        return { kind: "skipped", reason: BACKFILL.overSize };
+    if (!admitsTranscript(ctx.home, ctx.env, candidate.path))
+        return { kind: "skipped", reason: BACKFILL.outsideAgentFolder };
+    // ⛔ NOTHING IS READ without some consent on the machine (`vibecommit off` everywhere since the offer leaves nothing to find).
+    if (!hasAnyConsent(ctx.home))
+        return { kind: "skipped", reason: BACKFILL.turnedOff };
+    const releases = [];
+    try {
+        const resolved = await resolveSessionTargets({ home: ctx.home, env: ctx.env, nowMs: ctx.now().getTime(), turnEndCwd: null }, candidate.sessionId, candidate.path, null, releases);
+        if (resolved.kind === "busy")
+            return { kind: "skipped", reason: BACKFILL.parentBusy };
+        const heartbeat = resolved.heartbeat;
+        if (resolved.targets.length === 0)
+            return { kind: "skipped", reason: BACKFILL.parentTouchedNothing };
+        const quiet = ctx.now().getTime() - found.mtimeMs >= SESSION_LIVE_WINDOW_MS;
+        const results = [];
+        for (const target of resolved.targets) {
+            const spec = closeSpecOf(target, resolved.scan, resolved);
+            // ⛔ A target that is already delivered to the end of what this run would send, and already sealed when this run would seal
+            // (or would not seal), owes nothing (C18 #9): a repo chosen LATER brings the session back into the offer, and only the repos
+            // that still owe bytes are uploaded. Re-closing the others would send each an empty final request for nothing.
+            const sealing = quiet && !run.running.has(candidate.sessionId);
+            const toEof = spec.sizeCap === undefined ? found.size : Math.min(found.size, spec.sizeCap.main ?? 0);
+            const ledger = loadSessionState(ctx.home, { repoKey: spec.projectKey, sessionId: candidate.sessionId });
+            // ⛔ C29 (ii): ONLY WHEN EVERY STREAM IS AT ITS END. Main alone said "delivered" for a session whose delegated files (new since, or
+            // never sent) still owed bytes, and the target was skipped with them unsent.
+            // A listing that FAILED (EACCES, EIO) is "unknown", never "no delegated streams": the target is not skipped, and `run.close` handles it.
+            const subListing = findSubagentTranscriptsChecked(ctx.home, ctx.env, candidate.path);
+            if (!subListing.listFailed &&
+                ledger.endHold === null &&
+                streamsSentTo(ledger, toEof, subListing.found, spec.sizeCap) &&
+                (ledger.finalized !== null || !sealing)) {
+                results.push({ kind: "uploaded" });
+                continue;
+            }
+            const outcome = await run.close({
+                home: ctx.home,
+                env: ctx.env,
+                nodeVersion: ctx.nodeVersion,
+                agentId: candidate.agent,
+                cwd: candidate.dir,
+                url: run.url,
+                credential: run.credential,
+                projectKey: spec.projectKey,
+                redactionRoots: spec.redactionRoots,
+                repoSlug: spec.repoSlug,
+                sessionId: candidate.sessionId,
+                transcriptPath: candidate.path,
+                eof: spec.sizeCap === undefined ? found.size : Math.min(found.size, spec.sizeCap.main ?? 0),
+                seal: quiet && !run.running.has(candidate.sessionId),
+                allowNeverCaptured: true,
+                completeSubagents: true,
+                worktrees: spec.worktrees,
+                ...(spec.sizeCap === undefined ? {} : { sizeCap: spec.sizeCap }),
+                ...(spec.isolation === undefined ? {} : { isolation: spec.isolation }),
+                heartbeat,
+            });
+            // C25: the lock was taken from us. Stop BEFORE the next target's write.
+            if (outcome.kind === "lock-lost") {
+                results.push(classify(outcome));
+                break;
+            }
+            // C3: the server refused THIS folder target for good. Stopped and recorded; it does not fail the session or the run.
+            if ("delivery" in outcome &&
+                outcome.delivery.kind === "attempted" &&
+                outcome.delivery.detail?.code === FOLDER_REPOSITORY_FORBIDDEN) {
+                // C35 (iii): the stop is a write, so only while the session is still ours (the 403 is reported either way).
+                if (heartbeat())
+                    stopTarget(ctx.home, candidate.sessionId, target, FOLDER_REPOSITORY_FORBIDDEN, Date.now());
+                results.push({ kind: "skipped", reason: BACKFILL.parentFolderRefused });
+                continue;
+            }
+            const result = classify(outcome);
+            results.push(result.kind === "held" ? { kind: "held", slug: target.slug } : result);
+        }
+        // One answer for the session: a stop of the run wins, then a hold, then a failure; else it uploaded if anything did.
+        return (results.find((r) => r.kind === "rejected") ??
+            results.find((r) => r.kind === "stopped") ??
+            results.find((r) => r.kind === "held") ??
+            results.find((r) => r.kind === "failed") ??
+            // C25: a lock lost part-way leaves a target unsent, so the session is not "uploaded" however many targets went first. It is
+            // busy: a later run finds what is still owed (`parentDone` reads the ledgers) and sends it.
+            results.find((r) => r.kind === "skipped" && r.reason === BACKFILL.parentBusy) ??
+            results.find((r) => r.kind === "uploaded") ??
+            results[0]);
+    }
+    finally {
+        for (const release of releases) {
+            try {
+                release();
+            }
+            catch {
+                // A lock that cannot be released ages out by itself.
+            }
+        }
+    }
 }
 const newTally = () => ({
     uploaded: 0,
@@ -581,31 +840,41 @@ async function upload(ctx, plan, connection, deps, signal) {
         close: deps.closeSession ?? closeSession,
         readCwd: deps.readCwd ?? firstRecordedCwd,
         running: runningSessionIds(ctx.env),
-        slugs: new Map(),
     };
-    const column = ROW_INDENT + Math.min(SLUG_MAX, Math.max(...plan.repos.map((repo) => repo.slug.length))) + COLUMN_GAP;
-    const repoLine = (repo, text) => `${" ".repeat(ROW_INDENT)}${truncateMiddle(repo.slug, column - ROW_INDENT - COLUMN_GAP).padEnd(column - ROW_INDENT)}${text}`;
+    const parent = plan.parent ?? [];
+    const names = [...plan.repos.map((repo) => repo.slug), ...(parent.length > 0 ? [BACKFILL.parentLabel] : [])];
+    const column = ROW_INDENT + Math.min(SLUG_MAX, Math.max(...names.map((name) => name.length))) + COLUMN_GAP;
+    const nameLine = (name, text) => `${" ".repeat(ROW_INDENT)}${truncateMiddle(name, column - ROW_INDENT - COLUMN_GAP).padEnd(column - ROW_INDENT)}${text}`;
+    /** A repo's sessions, then the parent-folder group. A repo whose owner has not approved capture is held whole; the parent group is not (its targets differ per session). */
+    const groups = [
+        ...plan.repos.map((repo) => ({ name: repo.slug, slug: repo.slug, items: repo.candidates })),
+        ...(parent.length > 0 ? [{ name: BACKFILL.parentLabel, slug: null, items: parent }] : []),
+    ];
     writeLines(ctx.stdout, [...wrap(BACKFILL.runHeading(plan.total), 2)]);
     let uploaded = 0;
     let skipped = 0;
     let held = 0;
     let failed = 0;
     const heldRepos = [];
-    for (const repo of plan.repos) {
+    for (const group of groups) {
         const tally = newTally();
         let slowShown = false;
         const timer = setTimeout(() => {
             // A static line, overwritten once when the repo finishes — and only where an overwrite is possible (§13.8).
             slowShown = true;
-            ctx.stdout.write(`${paint(ctx.colour, "muted", repoLine(repo, "…"))}`);
+            ctx.stdout.write(`${paint(ctx.colour, "muted", nameLine(group.name, "…"))}`);
         }, deps.slowAfterMs ?? SLOW_REPO_MS);
         let heldRepo = false;
         try {
-            for (const candidate of repo.candidates) {
+            for (const candidate of group.items) {
                 if (signal.aborted)
                     break;
                 // A repo whose owner has not approved capture is held whole: the rest of it is not even tried.
-                const result = heldRepo ? { kind: "held" } : await uploadOne(run, candidate);
+                const result = heldRepo && group.slug !== null
+                    ? { kind: "held" }
+                    : "clone" in candidate
+                        ? await uploadOne(run, candidate)
+                        : await uploadParent(run, candidate);
                 if (result.kind === "uploaded")
                     tally.uploaded += 1;
                 else if (result.kind === "skipped")
@@ -614,7 +883,10 @@ async function upload(ctx, plan, connection, deps, signal) {
                     bump(tally.failed, result.reason);
                 else if (result.kind === "held") {
                     tally.held += 1;
-                    heldRepo = true;
+                    if (group.slug !== null)
+                        heldRepo = true;
+                    else if (result.slug !== undefined)
+                        heldRepos.push(result.slug);
                 }
                 else {
                     // `stopped` (the server asked to try later, or could not be reached) and `rejected` (the credential was refused)
@@ -639,10 +911,10 @@ async function upload(ctx, plan, connection, deps, signal) {
         skipped += sumOf(tally.skipped);
         failed += sumOf(tally.failed);
         held += tally.held;
-        if (tally.held > 0)
-            heldRepos.push(repo.slug);
+        if (tally.held > 0 && group.slug !== null)
+            heldRepos.push(group.slug);
         const role = tally.held > 0 || tally.stopped ? "warn" : "text";
-        const line = paint(ctx.colour, role, repoLine(repo, tallyLine(tally)));
+        const line = paint(ctx.colour, role, nameLine(group.name, tallyLine(tally)));
         // Overwrite the `…` line in place on a terminal; elsewhere it stays and the result prints beneath it.
         ctx.stdout.write(slowShown && ctx.colour ? `\r${line}\n` : `${slowShown ? "\n" : ""}${line}\n`);
         if (tally.stopped)
@@ -705,8 +977,14 @@ const NOTHING_NOT_LISTED = {
  * user did not choose is dropped by `planBackfill` however it got into `repos`; so is a clone with no reflog, which the plan asks
  * git about itself.
  */
-export async function backfillForConnect(ctx, repos, deps = {}) {
-    const result = await runBackfill(ctx, { ...deps, fromConnect: true, scanMachine: () => ({ repos, notListed: NOTHING_NOT_LISTED }) });
+export async function backfillForConnect(ctx, repos, 
+/** The folders outside every repository `connect`'s own scan found: their sessions are the parent-folder offer (R4). */
+folders = [], deps = {}) {
+    const result = await runBackfill(ctx, {
+        ...deps,
+        fromConnect: true,
+        scanMachine: () => ({ repos, folders, notListed: NOTHING_NOT_LISTED }),
+    });
     switch (result.end) {
         case "declined":
         case "nothing":
