@@ -23,6 +23,7 @@ import { UNKNOWN_AGENT_ID } from "./agents/types.js";
 import { noteGrantEpoch, recordRefused } from "./consent.js";
 import { headerSafe, sessionIdSafe } from "./header_safety.js";
 import { recordInferredSkipped } from "./inferred_tally.js";
+import { COMMIT_FILES_HEADER, planTrailer } from "./commit_files.js";
 import { clearOrgPending, markOrgPending } from "./org_pending.js";
 import { MAX_DELTA_FRAME_BYTES, MAX_DELTA_RAW_BYTES, REPOSITORY_EXCLUDED, classify, markDelivered, markHeld, markSkipped, nextSpan, planChunk, resolveCaps, splitPoint, } from "./policy.js";
 import { fileState, isStopped, loadSessionState, saveSessionState, withFileState, } from "./state.js";
@@ -197,6 +198,10 @@ export function buildIngestHeaders(credential, delta) {
     // empty. `parseRewritePairs` drops silently on a wrong separator, a third
     // colon-field, a bad sha or a self-pair, so the spelling is fixed by
     // `capSuccessors` and asserted literally by the wire cell.
+    // E8: the trailer's length, only beside the commits it describes (the server keys it by those shas).
+    if (headers["x-commits"] !== undefined && delta.commitFilesLength !== undefined && delta.commitFilesLength > 0) {
+        headers[COMMIT_FILES_HEADER] = String(delta.commitFilesLength);
+    }
     if (delta.rewrites !== undefined && delta.rewrites.length > 0) {
         headers["x-rewrites"] = delta.rewrites.join(",");
     }
@@ -222,6 +227,7 @@ export const LEAN_OMIT_HEADERS = new Set([
     "x-head-branch",
     "x-commits",
     "x-commit-attributions",
+    COMMIT_FILES_HEADER,
     "x-rewrites",
     "x-rewrites-inferred",
 ]);
@@ -540,7 +546,14 @@ async function attemptSend(ctx, agent, seq, span, body, lean,
 // sealing before the rest of the span has arrived would seal a poorer turn (`finalize.ts`'s docblock). The commits,
 // rewrites and head describe the END of the session, and `capture_commits`' PK admits one row per (capture, sha), so they
 // ride on one delta and not on every one. A delta that is not the last sends none of them, and the spool keeps them.
-isLast = true) {
+isLast = true, 
+// E8: the compressed-frame ceiling the trailer must still fit under; without it no trailer is attempted.
+frameBytes) {
+    // ⛔ ALL OR NOTHING (`commit_files.ts`): the trailer and `x-commit-files-length` go together or neither does; `planTrailer` is the
+    // one place the conditions live (granted repo, the delta that carries `x-commits`, never lean, still one frame).
+    const planned = planTrailer({ granted: ctx.commitFiles === true, isLast, lean, frameBytes, commits: ctx.commits }, body);
+    const sendBody = planned === null ? body : planned.body;
+    const commitFilesLength = planned === null ? undefined : planned.length;
     const full = buildIngestHeaders(ctx.credential, {
         sessionId: ctx.sessionId,
         seq,
@@ -553,6 +566,7 @@ isLast = true) {
         commits: isLast ? ctx.commits : undefined,
         rewrites: isLast ? ctx.rewrites : undefined,
         inferredRewrites: isLast ? ctx.inferredRewrites : undefined,
+        commitFilesLength,
     });
     const headers = lean ? leanHeaders(full) : full;
     const badHeader = firstUnsafeHeader(headers);
@@ -566,7 +580,7 @@ isLast = true) {
         return { kind: "unsafe", header: "" };
     return {
         kind: "sent",
-        outcome: await send(ctx.url, headers, body, ctx.timeoutMs, { readConversationId: ctx.readConversationId === true }),
+        outcome: await send(ctx.url, headers, sendBody, ctx.timeoutMs, { readConversationId: ctx.readConversationId === true }),
     };
 }
 /**
@@ -745,7 +759,7 @@ async function deliverChunk(ctx, eof, readBody, cutter) {
     let lean = current.lean;
     if (ctx.beforeRequest !== undefined && !ctx.beforeRequest())
         return { kind: "nothing-to-send" };
-    let attempt = await attemptSend(withinBudget(ctx), agent, seq, span, body, lean, isLast);
+    let attempt = await attemptSend(withinBudget(ctx), agent, seq, span, body, lean, isLast, limits.frameBytes);
     if (attempt.kind === "unsafe") {
         return refuse(ctx, key, session, current, span, caps, attempt.header === "authorization" ? "fatal" : "never", lean);
     }

@@ -177,6 +177,9 @@ function parseTurn(value) {
         return null;
     return {
         position,
+        // Lenient on purpose, the safe direction: anything that is not a count reads as "no stored number", and the row then
+        // prints no number. It can never print a wrong one.
+        sequence: value.sequence === undefined || value.sequence === null ? null : asCount(value.sequence),
         tool: typeof rawTool === "string" ? rawTool : null,
         files,
         excerpt,
@@ -184,6 +187,16 @@ function parseTurn(value) {
         agentIdPresent,
         subagentCount: value.subagent_count === undefined ? null : asCount(value.subagent_count),
     };
+}
+/**
+ * Lenient on purpose, the safe direction: anything that is not a well-formed window reads as "no stored numbers", and the notice
+ * then carries no turn numbers at all. `total` is a count, so `last` must be below it.
+ */
+function parseSequenceWindow(value) {
+    if (value === undefined || value === null)
+        return null;
+    const w = parseWindow(value);
+    return w !== null && w.last < w.total ? w : null;
 }
 function parseWindow(value) {
     if (!isRecord(value))
@@ -289,6 +302,7 @@ export function parseBlameCommitPayload(document) {
             grades: [],
             turns: [],
             window: null,
+            sequenceWindow: null,
             filesWithoutTurn: null,
         };
     }
@@ -300,6 +314,7 @@ export function parseBlameCommitPayload(document) {
             grades: [],
             turns: [],
             window: null,
+            sequenceWindow: null,
             filesWithoutTurn: null,
         };
     }
@@ -341,6 +356,7 @@ export function parseBlameCommitPayload(document) {
         grades: rawGrades,
         turns,
         window,
+        sequenceWindow: parseSequenceWindow(document.sequence_window),
         filesWithoutTurn: asCount(document.files_without_turn),
     };
 }
@@ -513,7 +529,7 @@ function absence(ctx, state, fixes, commit) {
  */
 function turnRow(turn) {
     const marker = attributionMarker(turn);
-    const head = `${" ".repeat(TURN_INDENT)}${WHY.turnLabel} ${turn.position}${turn.tool === null ? "" : `${GAP}[${turn.tool}]`}`;
+    const head = `${" ".repeat(TURN_INDENT)}${WHY.turnLabel}${turn.sequence === null ? "" : ` ${turn.sequence + 1}`}${turn.tool === null ? "" : `${GAP}[${turn.tool}]`}`;
     const tail = marker === "" ? "" : `${GAP}${marker}`;
     const files = turn.files.join(", ");
     if (files === "")
@@ -603,9 +619,21 @@ function turnLines(ctx, payload, file) {
     // ⚠ The truncation notice renders only when the payload SAYS the list is
     // partial, and every number in it is the payload's. D60 §D1a: windowing an
     // already-ordered list for display is rendering; deriving the numbers is not.
+    //
+    // ⛔ R7 / D18: THE NOTICE SPEAKS THE ROWS' NUMBER SPACE. The rows print `sequence + 1`; `window` is in positions inside one upload,
+    // a different number for any upload after the first of a chain. So with `sequence_window` the notice prints first + 1, last + 1 and
+    // the total of the same space, and without it (nothing stored) it prints a COUNT with no turn numbers. It never prints a position.
+    const sw = payload.sequenceWindow;
     const w = payload.window;
-    if (w !== null && (w.first > 1 || w.last < w.total)) {
-        out.push(...wrap(WHY.truncation(String(w.first), String(w.last), String(w.total)), BODY_INDENT));
+    if (sw !== null) {
+        if (sw.first > 0 || sw.last + 1 < sw.total) {
+            out.push(...wrap(WHY.truncation(String(sw.first + 1), String(sw.last + 1), String(sw.total)), BODY_INDENT));
+        }
+    }
+    else if (w !== null && payload.turns.length < w.total) {
+        // `window` is 0-based POSITIONS inside the capture and `total` is its turn count, so the old gate (`last < total`) was always
+        // true: a complete un-numbered list printed a notice. The list is partial exactly when it shows fewer turns than the capture has.
+        out.push(...wrap(WHY.truncationCount(String(payload.turns.length), String(w.total)), BODY_INDENT));
     }
     return out;
 }
@@ -841,6 +869,7 @@ const ABSENCE_EXIT = {
 function turnDocument(turn) {
     return {
         position: turn.position,
+        sequence: turn.sequence,
         tool: turn.tool,
         files: turn.files.length === 0 ? null : turn.files,
         agent_id: turn.agentId,
@@ -873,6 +902,9 @@ function whyDocument(payload, commit, file) {
         window: payload.window === null
             ? null
             : { first: payload.window.first, last: payload.window.last, total: payload.window.total },
+        sequence_window: payload.sequenceWindow === null
+            ? null
+            : { first: payload.sequenceWindow.first, last: payload.sequenceWindow.last, total: payload.sequenceWindow.total },
         files_without_turn: payload.filesWithoutTurn,
     };
 }

@@ -31,14 +31,15 @@
  * only when that question has an answer, and the answer carries the rung that
  * produced it so the server can tell an observation from a guess.
  *
- * ## The line is deliberately small, and the file list stays here
+ * ## The line is deliberately small; the file list rides in the BODY, never a header
  *
- * `{sha, branch, at, files}`. Only the SHA reaches the wire in wave 1 (`CR-170`
+ * `{sha, branch, at, files}`. Only the SHA reaches a HEADER (`CR-170`
  * §4): commit messages were MEASURED at 9/20, 8/20 and 5/20 commits over 4096
  * bytes across the three repos, largest 12,112, so a quarter of real commits
  * would land permanently truncated in a header. Metadata is backfillable from
- * the sha; the observation is not. `files` is carried for wave 2 and never put
- * in a header.
+ * the sha; the observation is not. `files` is git's changed-file list; since 0.10.0 it
+ * goes out in the length-framed body trailer of `commit_files.ts` (granted
+ * repositories only) and is never put in a header.
  */
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -491,13 +492,15 @@ export function capSpool(entries) {
     const taken = entries.slice(0, MAX_SPOOLED_SHAS);
     const shas = [];
     const attributions = [];
+    const files = [];
     for (const entry of taken) {
         if (!WIRE_RUNGS.includes(entry.attribution))
             continue;
         shas.push(entry.sha);
         attributions.push(entry.attribution);
+        files.push(entry.files);
     }
-    return { shas, attributions, count: taken.length };
+    return { shas, attributions, files, count: taken.length };
 }
 /**
  * How many rewrite pairs one hook may put on the wire.

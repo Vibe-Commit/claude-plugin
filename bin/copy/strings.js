@@ -553,13 +553,15 @@ export const CONNECT = {
      * | the session it was linked to | `x-session-id` | pre-`CR-170` |
      * | how that link was made | `x-commit-attributions` | `D190`, NEW |
      * | the replaced commit's ID | `x-rewrites` | `D190`, NEW |
+     * | the path of every file the commit changed | the body trailer (`commit_files.ts`), NOT a header | 0.10.0, NEW |
      *
-     * ⛔ **AND WHAT IS DELIBERATELY NOT HERE, BECAUSE IT DOES NOT LEAVE THE
-     * MACHINE.** `post_commit.ts` gathers the changed-file list and the committer
-     * date because they are free at that moment, and `capSpool` returns only
-     * `{shas, attributions, count}`. **Describing them as uploaded would be a FALSE
-     * DISCLOSURE, which is as much a claims defect as a missing one** — and it is
-     * the easier mistake, because over-disclosing feels safe.
+     * ⛔ **THE CHANGED-FILE LIST NOW LEAVES THE MACHINE (0.10.0, E8), SO IT IS HERE.** Until 0.9.0 this note said the opposite, and
+     * rightly: `post_commit.ts` gathered the list and it stayed in the spool. From 0.10.0 `capSpool` also returns `files` and the
+     * delta that carries `x-commits` carries the list too, for a GRANTED REPOSITORY only (never a folder). The paths are git's own
+     * (`git diff-tree -z --name-only`), unchanged, and the transcript scrubber does not run on them, which the sentence says
+     * because "a scrubber removes 12 known secret formats" two paragraphs up would otherwise read as covering them. **Not
+     * describing the paths as uploaded would now be the FALSE DISCLOSURE, which is as much a claims defect as describing what
+     * does not leave.** The committer DATE still stays local.
      *
      * ⚠ **`SpoolEntry.branch` and `delta.head.branch` are NOT the same noun.** The
      * per-commit one stays local; the repo's CURRENT branch goes out on every
@@ -582,7 +584,7 @@ export const CONNECT = {
      * ## ⛔ NO NEGATIVE LIST, AND THAT IS A DECISION
      *
      * An earlier draft closed with *"commit messages, authors, dates and the
-     * changed-file list are not uploaded."* True today (`post.ts:166-174`), and
+     * changed-file list are not uploaded."* True then (`post.ts:166-174`; the changed-file list stopped being true at 0.10.0), and
      * CUT: `D190 §6` says this wire has **no compiler, no schema and no shared
      * type**, so a negative claim in shipping copy goes false the first time anyone
      * adds a header — silently, with no gate able to see it. Positive claims only.
@@ -592,7 +594,7 @@ export const CONNECT = {
      * truth. Repairing the scope where a skimmer meets it; the heading itself is a
      * bigger copy change than this task was scoped for.
      */
-    consentCommits: "Not only the transcript. Commits you make while a session is recording are uploaded too: the commit ID, the branch name, the session it was linked to, and how that link was made. If you amend, rebase, or squash with git reset, the ID of the commit you replaced goes with them — that commit may never have left this machine, and git will eventually delete it from here. A squash made with git reset also sends a hash of the combined change.",
+    consentCommits: "Not only the transcript. Commits you make while a session is recording are uploaded too: the commit ID, the branch name, the session it was linked to, how that link was made, and the path of every file the commit changed, as git lists them. The scrubber does not run on those paths. If you amend, rebase, or squash with git reset, the ID of the commit you replaced goes with them — that commit may never have left this machine, and git will eventually delete it from here. A squash made with git reset also sends a hash of the combined change.",
     /** §10.2's first labelled link. Points at `HELP.docsUrl` — one definition. */
     consentDocsLabel: "Read the full list:",
     /**
@@ -1541,6 +1543,8 @@ export const WHY = {
      * is rendering; DERIVING the numbers is not, so `why.ts` never counts the
      * array it was handed.
      */
+    /** R7: the notice when no turn has a stored number. A COUNT only: positions are not the numbers the rows print. */
+    truncationCount: (shown, total) => `Showing ${shown} of ${total} turns.`,
     truncation: (from, to, total) => `Showing turns ${from}-${to} of ${total} that touched this file in this commit, in turn order.`,
     /** §R3's L2: files in the commit whose `turn_hash` is NULL are COUNTED, never dropped. */
     filesWithoutTurn: (count) => `${count} more files in this commit have no linked turn.`,

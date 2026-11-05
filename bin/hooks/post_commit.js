@@ -117,8 +117,9 @@ export function observe(ctx) {
         at: committedAt(toplevel),
         // ⚠ Gathered here because it is FREE here and impossible later: the file
         // list is a property of the commit, and reconstructing it server-side
-        // would need the repository. It stays in the spool for wave 2 and never
-        // reaches a header (`CR-170` §4).
+        // would need the repository. It reaches the server in the upload BODY, as
+        // the length-framed trailer of `commit_files.ts`, and never in a header
+        // (`CR-170` §4), and only for a granted repository (E8).
         files: changedFiles(toplevel),
         // ⛔ RECORDED AT OBSERVATION TIME, because the evidence expires. By the
         // time the next hook delivers this line, the environment belonged to a
@@ -179,10 +180,13 @@ function committedAt(dir) {
  * it is rather than papered over with `-m`, which would emit the diff against
  * every parent and multiply the list.
  */
-function changedFiles(dir) {
-    const out = gitProbe(dir, ["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"]);
+export function changedFiles(dir) {
+    // `-z`: NUL-terminated and NEVER C-quoted. Plain `--name-only` writes a non-ASCII path as `"\303\251.ts"`, which would never match
+    // an Edit's `file_path` once this list reaches the server (E8). A path may begin or end with a space, so nothing is trimmed.
+    // `--root`: the first commit of a repository is a commit like any other.
+    const out = gitProbe(dir, ["diff-tree", "-z", "--root", "--no-commit-id", "--name-only", "-r", "HEAD"]);
     if (out === null)
         return [];
-    return out.split("\n").map((l) => l.trim()).filter((l) => l !== "");
+    return out.split("\0").filter((l) => l !== "");
 }
 //# sourceMappingURL=post_commit.js.map

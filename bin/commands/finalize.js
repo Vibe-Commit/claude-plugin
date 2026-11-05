@@ -726,6 +726,8 @@ export async function closeSession(input) {
         nowMs: Date.now(),
         head: headRef(projectKey),
         commits: spooled,
+        // E8: only a REPO target (the same resolver as the hook returns granted targets only); a folder has no commits to describe.
+        commitFiles: isolation.kind === "repo",
         rewrites: rewritten.pairs,
         inferredRewrites: inferred.pairs,
         inferredGroups: inferred.groups,
