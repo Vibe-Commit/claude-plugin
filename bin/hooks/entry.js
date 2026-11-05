@@ -811,6 +811,8 @@ async function deliverTarget(opts) {
             // ⛔ THE WHOLE OBJECT, NOT `spooled.shas` (`T5`, `D190 §1`): shas and rungs are only safe as a pair, and `count` is the
             // number of spool LINES consumed, which is what a 2xx truncates by.
             commits: union.commits,
+            // E8: this target IS a granted repo (the resolver only returns granted targets); a folder has no commits to describe.
+            commitFiles: target.kind === "repo",
             rewrites: union.rewrites.pairs,
             inferredRewrites: union.inferred.pairs,
             inferredGroups: union.inferred.groups,
