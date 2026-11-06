@@ -13,6 +13,25 @@
  * always made, and `sources` names the ledger key alone, so the 0.8.0 wire and truncation are unchanged (R14).
  */
 import { capInferred, capSpool, capSuccessors, readInferred, readRewrites, readSpool, } from "./spool.js";
+/**
+ * U4 — THE PIN. A firing replayed late may carry only the commits that existed when its hook fired: the PREFIX of one source's lines that
+ * are UNSTAMPED or have `observedAt <= pinAtMs`. A turn N+1 commit must not ride a delivery capped at turn N, or the server places it on
+ * the wrong turn (and a permanent row cannot be corrected).
+ *
+ *  - ⛔ **Unstamped counts as pinned.** `undefined <= pinAtMs` is false in JS, so a naive prefix would stop at the first line from an older
+ *    client and that spool would never drain, with no error.
+ *  - ⛔ **Per source, BEFORE the flatten** (the caller maps it over `commitLists`): flattened first, a newer line in work tree A would hold
+ *    back an older line in work tree B.
+ *  - A prefix, not a filter: the drops remove the FIRST `count` well-formed lines of each file, so what is carried must be a head of it.
+ *  - A clock stepping back only delays a line until the clock catches up. Nothing is lost.
+ * No firing (`pinAtMs` unset) means no pin: `finalize`, `backfill`, the idle drain and the inline hook read the whole spool.
+ */
+export function pinnedPrefix(entries, pinAtMs) {
+    if (pinAtMs === undefined)
+        return entries;
+    const stop = entries.findIndex((entry) => entry.observedAt !== undefined && entry.observedAt > pinAtMs);
+    return stop === -1 ? entries : entries.slice(0, stop);
+}
 /** `total` lines consumed from the front of lists with these lengths → how many came from each. */
 function prefixSplit(total, lengths) {
     let left = total;
@@ -26,10 +45,12 @@ function prefixSplit(total, lengths) {
  * Read the union. `ledgerKey` is the target's ledger worktree and always the FIRST source, so a single-worktree target reads
  * exactly what it always did; `worktrees` are every work tree of the repo this session was seen in.
  */
-export function readSpoolUnion(home, sessionId, ledgerKey, worktrees) {
+export function readSpoolUnion(home, sessionId, ledgerKey, worktrees, 
+/** U4: the moment the firing being replayed fired. Unset for the inline hook, `finalize`, `backfill` and the drain: no pin. */
+pinAtMs) {
     const keys = [ledgerKey, ...worktrees.filter((worktree) => worktree !== ledgerKey)];
     const at = (repoKey) => ({ repoKey, sessionId });
-    const commitLists = keys.map((key) => readSpool(home, at(key)));
+    const commitLists = keys.map((key) => pinnedPrefix(readSpool(home, at(key)), pinAtMs));
     const commits = capSpool(commitLists.flat());
     const commitCounts = prefixSplit(commits.count, commitLists.map((list) => list.length));
     const rewriteLists = keys.map((key) => readRewrites(home, at(key)));

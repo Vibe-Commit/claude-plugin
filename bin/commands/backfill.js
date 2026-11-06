@@ -50,6 +50,7 @@ import { glyph, paint, renderErrorBlock, tildePath, truncateMiddle, truncatePath
 import { writeLines } from "./context.js";
 import { credentialProblem } from "./credential_problem.js";
 import { authCommandFor, channelCommand, connectCommandFor } from "../install.js";
+import { identityDigest } from "../identity.js";
 import { closeSession, closeSpecOf, ingestUrlUnavailableBlock, resolveSessionTargets } from "./finalize.js";
 import { scanMachine } from "./scan.js";
 import { renderVerbHelp } from "../verb_help.js";
@@ -501,6 +502,18 @@ function classify(outcome) {
         }
     }
 }
+/**
+ * U5b — what a session's recorded firings are replayed with (`finalize.takeSessionLock`), under the lock `resolveSessionTargets` takes, BEFORE
+ * the close reads the spool union: after U6 the hook promotes nothing and writes no state file, so a replay is the only thing that does.
+ */
+function replayConfigOf(run) {
+    const { ctx } = run;
+    return { home: ctx.home, env: ctx.env, nodeVersion: ctx.nodeVersion, identity: identityDigest({ url: run.url, env: ctx.env }), url: run.url };
+}
+/** A replay that left a firing unconsumed: no close, so no seal over lines it still owes. A rejected credential is the run's `rejected`. */
+function replayStopped(step) {
+    return step.kind === "fatal" && step.why === "rejected" ? { kind: "rejected" } : { kind: "failed", reason: BACKFILL.replayStopped };
+}
 async function uploadOne(run, candidate) {
     const { ctx } = run;
     const found = statFile(candidate.path);
@@ -546,9 +559,11 @@ async function uploadOne(run, candidate) {
         // `turnEndCwd` is the folder the OFFER verified this session belongs to (the agent's own index, or the first `cwd` the transcript
         // records): the evidence that put it in this repo's offer, handed to the resolver so a transcript with no `cwd` of its own still
         // resolves. It cannot name a repo the offer did not (the candidate is this repo's) and it is no fallback identity.
-        const resolved = await resolveSessionTargets({ home: ctx.home, env: ctx.env, nowMs: ctx.now().getTime(), turnEndCwd: candidate.dir }, candidate.sessionId, candidate.path, { keys, slugOf: onceStrictRepoSlug(keys.worktree) }, releases);
+        const resolved = await resolveSessionTargets({ home: ctx.home, env: ctx.env, nowMs: ctx.now().getTime(), turnEndCwd: candidate.dir }, candidate.sessionId, candidate.path, { keys, slugOf: onceStrictRepoSlug(keys.worktree) }, releases, { replay: replayConfigOf(run) });
         if (resolved.kind === "busy")
             return { kind: "skipped", reason: BACKFILL.parentBusy };
+        if (resolved.kind === "replay-stopped")
+            return replayStopped(resolved.step);
         const heartbeat = resolved.heartbeat;
         // This repo's target: one of its work trees, or any work tree of the same git common dir (a session recorded in a LINKED work tree
         // belongs to the clone the offer was made for).
@@ -612,9 +627,11 @@ async function uploadParent(run, candidate) {
         return { kind: "skipped", reason: BACKFILL.turnedOff };
     const releases = [];
     try {
-        const resolved = await resolveSessionTargets({ home: ctx.home, env: ctx.env, nowMs: ctx.now().getTime(), turnEndCwd: null }, candidate.sessionId, candidate.path, null, releases);
+        const resolved = await resolveSessionTargets({ home: ctx.home, env: ctx.env, nowMs: ctx.now().getTime(), turnEndCwd: null }, candidate.sessionId, candidate.path, null, releases, { replay: replayConfigOf(run) });
         if (resolved.kind === "busy")
             return { kind: "skipped", reason: BACKFILL.parentBusy };
+        if (resolved.kind === "replay-stopped")
+            return replayStopped(resolved.step);
         const heartbeat = resolved.heartbeat;
         if (resolved.targets.length === 0)
             return { kind: "skipped", reason: BACKFILL.parentTouchedNothing };

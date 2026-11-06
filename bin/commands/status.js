@@ -38,6 +38,7 @@ import { emitJson } from "../json.js";
 import { readInferredSkipped } from "../inferred_tally.js";
 import { readPruneTally } from "../pending_prune.js";
 import { resolveProjectKeys } from "../project.js";
+import { uploaderJson, uploaderRows, uploaderView } from "../uploader_view.js";
 import { commitsWaitingForRepo, heldAtEndForRepo, inferredUnacknowledgedForRepo, lastReceiptForRepo, lastSendForRepo, leanHeldForRepo, leanSessionsForRepo, openTailForRepo, stuckForRepo, stoppedForRepo, stuckSpoolLinesForRepo, writtenOffForRepo, } from "../state.js";
 import { LABEL_GUTTER, WRAP_COLUMNS, glyph, labelled, paint, renderErrorBlock, tildePath, truncatePath, wrap, } from "../term.js";
 import { credentialProblem, credentialProblemBlock, rejectedCredentialBlock } from "./credential_problem.js";
@@ -180,6 +181,9 @@ export function status(ctx, argv = [], sync = { kind: "skipped" }) {
     if (lastSend !== null) {
         lines.push(labelled(ROW_INDENT, STATUS.lastSuccessLabel, STATUS.lastSuccessValue(relativeAge(lastSend.at, ctx.now().getTime()), lastSend.seq)));
     }
+    // U7 (plan §3.8): the background uploader, machine-wide, computed from firing logs against ledgers and the worker's lock, never from its own claim.
+    const upload = uploaderView(ctx.home, ctx.env, ctx.now().getTime());
+    lines.push(...uploaderRows(upload, ctx.now().getTime(), ROW_INDENT));
     lines.push(labelled(ROW_INDENT, STATUS.dashboardLabel, paint(ctx.colour, "accent", URLS.dashboard)));
     // F6: the account rows, after the repo's own rows, only when there is something to say.
     lines.push(...accountRowsFor(ctx, sync));
@@ -213,6 +217,9 @@ export function status(ctx, argv = [], sync = { kind: "skipped" }) {
             // A contract change, recorded in `json-read-verbs.test.ts`.
             org_pending: orgPending === null ? null : { at_ms: orgPending.at },
             last_send: lastSend === null ? null : { at_ms: lastSend.at, seq: lastSend.seq },
+            // U7 (plan §3.8). Always an object; `sessions_checked` is the denominator, so an empty scan cannot read as clean. ⛔ A contract change,
+            // recorded in `json-read-verbs.test.ts`.
+            uploader: uploaderJson(upload),
             dashboard: URLS.dashboard,
             // `CR-216/U3`. A SOURCE NAME, never the credential — `IngestCredential.source`
             // is documented safe to log for exactly this. `null` is "no credential",

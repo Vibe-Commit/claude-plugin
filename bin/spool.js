@@ -46,6 +46,7 @@ import { dirname, join } from "node:path";
 import { keepsPendingLine } from "./pending_bound.js";
 import { repoKeyNotePath, repoSessionsDir, sessionStatePath } from "./paths.js";
 import { writeFileAtomic } from "./atomic_write.js";
+import { liveAtOf } from "./firing.js";
 /**
  * How many SHAs one hook may put on the wire.
  *
@@ -166,29 +167,62 @@ export function readSpool(home, key) {
     return out;
 }
 /**
+ * ⛔ **THE ONE WALK BEHIND EVERY SPOOL DROP (U2, trap 8).** `count` is a number of WELL-FORMED lines: `readSpool` skips a line that does
+ * not parse and `capSpool` counts the rest. The drops used to apply that count to RAW non-empty lines, so one malformed line among
+ * the consumed ones shifted the cut by one and left a DELIVERED commit at the head, which went out again on a new capture:
+ * `capture_commits`' key is `(org_id, capture_id, commit_sha)` and the write is a plain insert, so that is a SECOND PERMANENT ROW.
+ * (Raw [A, torn, B, C] sent A, B, C with count 3; `slice(3)` left C. Measured on 0.10.0.)
+ *
+ * The walk goes through raw non-empty lines, consuming a malformed one for free (it was never counted and can never be sent) and
+ * stopping after the `count`-th well-formed one. `consumed` is everything up to and including it; `rest` is the remaining raw text,
+ * untouched. A malformed line AFTER the cut stays in `rest`: it belongs to the next drop's walk.
+ */
+function walkConsumed(raw, count, wellFormed) {
+    const lines = raw.split("\n").filter((l) => l.trim() !== "");
+    let seen = 0;
+    let cut = 0;
+    while (cut < lines.length && seen < count) {
+        if (wellFormed(lines[cut]))
+            seen += 1;
+        cut += 1;
+    }
+    return { consumed: lines.slice(0, cut), rest: lines.slice(cut) };
+}
+const isEntryLine = (line) => parseEntry(line) !== null;
+/** How many lines of `raw` are well-formed commit entries (the unit `count` is in). `cap` bounds the answer (a pending file is capped). */
+export function wellFormedCommitLines(raw, cap = Infinity) {
+    let n = 0;
+    for (const line of raw.split("\n"))
+        if (line.trim() !== "" && isEntryLine(line))
+            n += 1;
+    return Math.min(n, cap);
+}
+/**
  * Drop the first `count` entries — called ONLY after the server's 2xx.
  *
  * ⚠ **RE-READS BEFORE REWRITING, and that is not defensive tidiness.**
  * `post-commit` may have appended while the send was in flight. Slicing the
  * array we read BEFORE the send would rewrite the file without those lines and
  * lose them silently. Appends only ever go to the END, so the first `count`
- * lines are still the same ones we delivered, and dropping exactly that many is
- * correct against the current file rather than against a stale snapshot.
+ * well-formed lines are still the same ones we delivered, and dropping exactly
+ * that many is correct against the current file rather than against a stale snapshot.
  *
- * ⚠ **A residual race remains and is accepted:** a commit landing between this
- * re-read and the write is lost. The window is one `readFileSync` plus one
+ * ⚠ **A residual race remains and is accepted (D14):** a commit landing between this
+ * re-read and the end of the write is lost. The window is one `readFileSync` plus one
  * `writeFileSync` on a small file, the cost is one un-delivered commit row, and
  * closing it properly means a lock file on a path that must never block
  * (`post-commit` runs inside the user's `git commit`). Recorded rather than
- * hidden.
+ * hidden. The worker runs this mid-turn rather than at an idle Stop, so the window is
+ * hit more often than it was; the upgrade path if a lost commit is ever observed is
+ * one file per commit.
  */
 export function dropSpooled(home, key, count) {
     const path = spoolPath(home, key);
     if (path === null || count <= 0)
         return false;
     try {
-        const lines = readFileSync(path, "utf8").split("\n").filter((l) => l.trim() !== "");
-        writeFileSync(path, lines.slice(count).map((l) => `${l}\n`).join(""), { mode: 0o600 });
+        const { rest } = walkConsumed(readFileSync(path, "utf8"), count, isEntryLine);
+        writeFileSync(path, rest.map((l) => `${l}\n`).join(""), { mode: 0o600 });
         chmodSync(path, 0o600);
         return true;
     }
@@ -208,10 +242,10 @@ export function dropSpooled(home, key, count) {
  * BOUND one — and a bound sha resent into a sealed turn is a second, permanent
  * edge (`cr071:157`). Only the per-line decision is right.
  *
- * ⚠ THE SAME LINE ARITHMETIC AS `dropSpooled`, deliberately: it works on raw
- * non-empty lines, because `count` was computed from them via `capSpool`. A line
- * that does not parse, or carries a rung that never goes on the wire, is dropped
- * exactly as `dropSpooled` would drop it — the server cannot have named it.
+ * ⚠ THE SAME WALK AS `dropSpooled` (U2): `count` is a number of WELL-FORMED lines, as `capSpool` computes it, so the consumed region
+ * ends after the `count`-th well-formed line and a malformed line inside it is dropped with it. (This docblock used to say `count` was
+ * computed from raw lines. It was not.) A well-formed line that carries a rung that never goes on the wire is dropped exactly as
+ * `dropSpooled` would drop it — the server cannot have named it.
  *
  * ⚠ The residual race `dropSpooled` documents applies here unchanged.
  */
@@ -220,12 +254,12 @@ export function settleSpooled(home, key, count, keep) {
     if (path === null || count <= 0)
         return false;
     try {
-        const lines = readFileSync(path, "utf8").split("\n").filter((l) => l.trim() !== "");
-        const kept = lines.slice(0, count).filter((line) => {
+        const { consumed, rest } = walkConsumed(readFileSync(path, "utf8"), count, isEntryLine);
+        const kept = consumed.filter((line) => {
             const entry = parseEntry(line);
             return entry !== null && WIRE_RUNGS.includes(entry.attribution) && keep.has(entry.sha);
         });
-        writeFileSync(path, [...kept, ...lines.slice(count)].map((l) => `${l}\n`).join(""), { mode: 0o600 });
+        writeFileSync(path, [...kept, ...rest].map((l) => `${l}\n`).join(""), { mode: 0o600 });
         chmodSync(path, 0o600);
         return true;
     }
@@ -389,6 +423,11 @@ export function activeSessionFor(home, repoKey, envSessionId, nowMs = Date.now()
  * field is one number. `state.ts` owns the schema and its docblock; this is the single reader of it outside that module.
  */
 function readLiveAt(path) {
+    // U3: through the ONE liveness reader (`firing.ts`): the later of the state file's `liveAt` and the hook's own `.live` stamp, which sits
+    // beside it. A session whose hook has stamped but whose worker has not yet delivered anything is live all the same.
+    return liveAtOf(readStateLiveAt(path), path.replace(/\.json$/, ".live"));
+}
+function readStateLiveAt(path) {
     try {
         const v = JSON.parse(readFileSync(path, "utf8")).liveAt;
         return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
@@ -424,12 +463,20 @@ function liveSessions(home, repoKey, nowMs, windowMs) {
         return [];
     }
     const live = [];
+    // U3: a session is a state file (`<sid>.json`) OR a hook stamp (`<sid>.live`), listed once. A stamp with no state file is a session whose
+    // hook has run and whose worker has not yet delivered: on Codex and Cursor (no env session id) its commit must still find it live.
+    const stems = new Set();
     for (const entry of entries) {
-        // ⚠ State files only. `.spool.jsonl` and `.rewrites.jsonl` live here too and
-        // are not sessions — and neither ends with `.json`, which is the same
+        // ⚠ State files and `.live` stamps only. `.spool.jsonl` and `.rewrites.jsonl` live here too and
+        // are not sessions — and neither ends with `.json` or `.live`, which is the same
         // load-bearing spelling `spoolPath` documents.
-        if (!entry.endsWith(".json"))
-            continue;
+        if (entry.endsWith(".json"))
+            stems.add(entry.slice(0, -".json".length));
+        else if (entry.endsWith(".live"))
+            stems.add(entry.slice(0, -".live".length));
+    }
+    for (const stem of stems) {
+        const entry = `${stem}.json`;
         // ⛔ THE CONTENT CLOCK, NEVER THE FILE'S MTIME (VG review 2, D2). `SessionState.liveAt` is written only by a hook;
         // a `vibecommit finalize` of a long-dead session rewrites the file and moved the mtime, which made that session
         // "live" and let a plain-terminal commit be filed under it at an edge-minting rung. A file with no `liveAt`
@@ -437,7 +484,7 @@ function liveSessions(home, repoKey, nowMs, windowMs) {
         const touchedAt = readLiveAt(join(dir, entry));
         if (touchedAt === null || nowMs - touchedAt > windowMs)
             continue;
-        live.push({ sessionId: entry.slice(0, -".json".length), at: touchedAt });
+        live.push({ sessionId: stem, at: touchedAt });
     }
     // ⚠ Ties broken by name so the guess is at least DETERMINISTIC. Two state files
     // written in the same millisecond is ordinary on a coarse-grained filesystem,
@@ -591,14 +638,18 @@ export function readRewrites(home, key) {
     }
     return out;
 }
-/** Drop the first `count` pairs — called ONLY after the server's 2xx. */
+/**
+ * Drop the first `count` pairs — called ONLY after the server's 2xx. `count` is a number of WELL-FORMED pairs (`capSuccessors(readRewrites)`),
+ * so it walks like `dropSpooled` does (U2, trap 8): a malformed line among the consumed ones is passed over, never counted. A re-sent pair is
+ * harmless on the server (`commit_sha_successors` treats a duplicate as success) but the arithmetic was the same defect.
+ */
 export function dropRewrites(home, key, count) {
     const path = rewriteSpoolPath(home, key);
     if (path === null || count <= 0)
         return false;
     try {
-        const lines = readFileSync(path, "utf8").split("\n").filter((l) => l.trim() !== "");
-        writeFileSync(path, lines.slice(count).map((l) => `${l}\n`).join(""), { mode: 0o600 });
+        const { rest } = walkConsumed(readFileSync(path, "utf8"), count, (l) => parsePair(l) !== null);
+        writeFileSync(path, rest.map((l) => `${l}\n`).join(""), { mode: 0o600 });
         chmodSync(path, 0o600);
         return true;
     }
@@ -1356,8 +1407,14 @@ export function pendingSpoolPath(home, key) {
  * would promote into two spool entries and two permanent rows —
  * `capture_commits`' PK is `(org_id, capture_id, commit_sha)`, so two capture
  * ids are two legal rows for one commit.
+ *
+ * ⛔ **A REAL APPEND, NOT A READ-MODIFY-WRITE (U2, trap 6).** This used to read the file, add the entry and WRITE THE WHOLE FILE BACK.
+ * Trace: pending holds [B]; `post-commit` for D reads [B]; the worker promotes B and removes the file; `post-commit` writes [B, D]. The
+ * next firing promotes B AGAIN, and once the first B is delivered that is a second permanent row. Now it reads only to dedupe, then
+ * `appendFileSync`s one line: a promotion that emptied the file in between leaves D alone in a fresh file, and B is never resurrected.
+ * The cap (`MAX_PENDING_SHAS`) moved to `readPending` and to promotion's own rewrite, so an append never has to rewrite anything.
  */
-export function appendPending(home, key, entry) {
+export function appendPending(home, key, entry, seams = {}) {
     const path = pendingSpoolPath(home, key);
     if (path === null)
         return false;
@@ -1365,10 +1422,10 @@ export function appendPending(home, key, entry) {
         const existing = readPending(home, key);
         if (existing.some((e) => e.sha === entry.sha))
             return false;
-        const kept = [...existing, entry].slice(-MAX_PENDING_SHAS);
+        seams.afterDedupeRead?.();
         mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
         noteRepoKey(home, key.repoKey);
-        writeFileSync(path, kept.map((e) => `${JSON.stringify(e)}\n`).join(""), { mode: 0o600 });
+        appendFileSync(path, `${JSON.stringify(entry)}\n`, { mode: 0o600 });
         chmodSync(path, 0o600);
         return true;
     }
@@ -1376,7 +1433,7 @@ export function appendPending(home, key, entry) {
         return false;
     }
 }
-/** Every uncorroborated entry for this session, oldest first. */
+/** Every uncorroborated entry for this session, oldest first, at most the newest `MAX_PENDING_SHAS` (the cap lives HERE since `appendPending` no longer rewrites). */
 export function readPending(home, key) {
     const path = pendingSpoolPath(home, key);
     if (path === null)
@@ -1394,7 +1451,7 @@ export function readPending(home, key) {
         if (entry !== null)
             out.push(entry);
     }
-    return out;
+    return out.slice(-MAX_PENDING_SHAS);
 }
 /** Remove the pending file entirely. Used once its lines have been promoted. */
 export function clearPending(home, key) {
@@ -1453,22 +1510,106 @@ corroboration,
  * session's state file already existed (`stale-own`) or not (`first-turn`). A line observed before the turn start is DROPPED;
  * when no turn start is found a stale-own line is dropped and a first-turn line kept. See `pending_bound.ts`.
  */
-bound, mode) {
+bound, mode, 
+/**
+ * U2 — **THE MOMENT THE HOOK FIRED**, epoch ms. A worker replays a firing late; a commit observed AFTER the firing belongs to a later
+ * delivery, so a pending line with `observedAt > asOfMs` is neither promoted nor dropped: it stays in the file. Unset means "now" and
+ * every line is due, which is what the inline hook always meant. A line with NO `observedAt` (an older client) is always due.
+ */
+asOfMs = Number.POSITIVE_INFINITY) {
     void corroboration;
     const pending = readPending(home, key);
     if (pending.length === 0)
         return 0;
     let promoted = 0;
     for (const entry of pending) {
+        if (entry.observedAt !== undefined && entry.observedAt > asOfMs)
+            continue;
         if (!keepsPendingLine(entry, bound, mode))
             continue;
-        // The pending-only observation clock stays behind: a promoted line is an ordinary spool line.
-        const { observedAt: _observedAt, ...rest } = entry;
-        void _observedAt;
-        if (appendSpool(home, key, { ...rest, attribution: "env_session_id" }))
+        // U2: `observedAt` STAYS on the line. It is the clock the worker pins a delivery by (`observedAt <= firing.at`), and a promoted
+        // line is no exception: a commit made in turn 2 must not ride a delivery capped at turn 1 because it passed through pending.
+        if (insertSpooled(home, key, { ...entry, attribution: "env_session_id" }))
             promoted += 1;
     }
-    clearPending(home, key);
+    settlePending(home, key, asOfMs);
     return promoted;
+}
+/**
+ * U2 — put one promoted line into the spool BY `observedAt`, not at the end.
+ *
+ * The worker promotes late, so turn 2's commit C can already be in the spool when turn 1's commit B is promoted. Appending gives [C, B],
+ * the pin's prefix (`observedAt <= firing.at`) is empty, and B rides turn 2's delivery unheld. Inserted before the first line that is
+ * observed LATER, B is carried by turn 1's delivery. A line with no `observedAt` is neither newer nor older: it stays where it is. A
+ * malformed line is passed over and kept as raw text, and never counts as newer.
+ *
+ * Appends when nothing newer is there (the common case: one `appendFileSync`); rewrites the file, keeping every other line's raw text,
+ * only when something is. The rewrite shares `dropSpooled`'s accepted window (D14).
+ */
+function insertSpooled(home, key, entry) {
+    const path = spoolPath(home, key);
+    if (path === null)
+        return false;
+    try {
+        mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+        noteRepoKey(home, key.repoKey);
+        const line = JSON.stringify(entry);
+        const at = entry.observedAt;
+        let lines = [];
+        if (at !== undefined) {
+            try {
+                lines = readFileSync(path, "utf8").split("\n").filter((l) => l.trim() !== "");
+            }
+            catch {
+                lines = [];
+            }
+        }
+        const newer = at === undefined ? -1 : lines.findIndex((l) => {
+            const e = parseEntry(l);
+            return e !== null && e.observedAt !== undefined && e.observedAt > at;
+        });
+        if (newer === -1) {
+            appendFileSync(path, `${line}\n`, { mode: 0o600 });
+        }
+        else {
+            lines.splice(newer, 0, line);
+            writeFileSync(path, lines.map((l) => `${l}\n`).join(""), { mode: 0o600 });
+        }
+        chmodSync(path, 0o600);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+/**
+ * After a promotion pass: forget the pending lines that were settled (promoted or dropped), KEEP those observed after `asOfMs`.
+ * Re-reads the file so a line `post-commit` appended since the pass began is judged by its own clock, not lost; with nothing newer
+ * the file is removed, as `clearPending` always did. The kept lines are capped at `MAX_PENDING_SHAS`.
+ */
+function settlePending(home, key, asOfMs) {
+    const path = pendingSpoolPath(home, key);
+    if (path === null)
+        return;
+    if (asOfMs === Number.POSITIVE_INFINITY) {
+        clearPending(home, key);
+        return;
+    }
+    try {
+        const keep = readFileSync(path, "utf8")
+            .split("\n")
+            .filter((l) => {
+            const e = parseEntry(l);
+            return e !== null && e.observedAt !== undefined && e.observedAt > asOfMs;
+        })
+            .slice(-MAX_PENDING_SHAS);
+        if (keep.length === 0)
+            clearPending(home, key);
+        else
+            writeFileSync(path, keep.map((l) => `${l}\n`).join(""), { mode: 0o600 });
+    }
+    catch {
+        clearPending(home, key);
+    }
 }
 //# sourceMappingURL=spool.js.map

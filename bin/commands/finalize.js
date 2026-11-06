@@ -43,6 +43,9 @@ import { EXIT } from "../exit.js";
 import { headRef, onceRepoSlug, onceStrictRepoSlug } from "../git.js";
 import { confinementRoots, deliverSubagents, fileSize, readSpan, recordCutter, sendTimeoutMs, wait } from "../hooks/entry.js";
 import { STALE_MARGIN_MS, claimSessionWriter } from "../hooks/fire_lock.js";
+import { firingSessions, readFirings } from "../firing.js";
+import { identityDigest } from "../identity.js";
+import { REQUEST_TIMEOUT_MS, replayAllUnderLock } from "../replay.js";
 import { FOLDER_REPOSITORY_FORBIDDEN } from "../policy.js";
 import { LockLostError, dialectIsolates, isolationOf, pastCursorOf, resolveTargets, stopKeyOf, stopTarget } from "../session_targets.js";
 import { repoSessionsDir, sessionStatePath } from "../paths.js";
@@ -56,6 +59,8 @@ import { notAGitRepoBlock, writeFailure, writeLines } from "./context.js";
 import { credentialProblem } from "./credential_problem.js";
 /** A transcript modified this recently is a session still being written. */
 const STILL_WRITING_MS = 5_000;
+// U6b (found by U8's C26): the check reads a FRESH `ctx.now()`. It used the `nowMs` taken when the verb started, BEFORE the wait for the session's writer
+// lock, so after a 150 s wait behind a killed worker's lock a transcript minutes old was refused as 'changed a moment ago'.
 /** `--latest` considers sessions that delivered inside this window. */
 const LATEST_WINDOW_MS = 24 * 60 * 60 * 1000;
 /** One wall-clock budget for the whole verb: not a hook, so not the hook's few seconds. */
@@ -100,8 +105,14 @@ function parseArgs(argv) {
         return null; // exactly one of the two
     return { session, latest, force };
 }
-/** How long the verb waits for another writer of the same session (a hook firing) before it says so and stops. */
-const WRITER_WAIT_MS = 30_000;
+/**
+ * How long the verb waits for another writer of the same session before it says so and stops. The upload worker can hold a session for one
+ * IN-FLIGHT REQUEST (`REQUEST_TIMEOUT_MS`), and yields between deltas only by sleeping longer than the 20 ms poll, so the wait must outlast a
+ * request or `finalize` would give up on exactly the session the worker is busy with. (It was 30 s when the longest holder was a hook.)
+ */
+const WRITER_WAIT_MS = REQUEST_TIMEOUT_MS + 30_000;
+/** How often the verb re-stamps the session lock it holds, from a timer (F4): well inside `holderStaleMs()`. */
+export const LOCK_BEAT_MS = 15_000;
 /**
  * ⛔ HOW LONG THE VERB'S WRITER LOCK MAY SIT UNTOUCHED before another writer may take it from a holder presumed dead (C25).
  *
@@ -125,12 +136,15 @@ function holderStaleMs() {
  */
 const RESOLVE_ROUNDS_MAX = 100_000;
 /**
- * Take the session's one writer lock (O5) and resolve every target the session names, as a session that is OVER (`end` mode, the
- * only mode that may decide a folder target). The lock is released by the caller's `releases`, after the sends. Shared by
- * `finalize` and `backfill`: one resolver loop, so a session is judged the same whichever verb closes it.
- * `busy`: another writer held the session for the whole wait.
+ * U5b — TAKE THE SESSION'S ONE WRITER LOCK, THEN REPLAY ITS UNCONSUMED FIRINGS under it. Shared by `finalize` and `backfill`, and called BEFORE
+ * either reads the spool union or asks whether the session exists: after U6 the hook records a firing and writes nothing else, so a one-shot
+ * session's pending commit line is promoted, and its state file created, only by a replay. The release goes into `releases` either way.
+ *
+ * `busy`: another writer held the session for the whole wait. `replay-stopped`: a firing was left unconsumed (see `replayAllUnderLock`), and
+ * the caller must report it and send NO `final`. `replay` absent: nothing is replayed (no usable credential or ingest address yet; the caller
+ * answers that its own way).
  */
-export async function resolveSessionTargets(env, sessionId, transcriptPath, known, releases) {
+export async function takeSessionLock(env, sessionId, releases, replay) {
     const claim = await claimSessionWriter(env.home, sessionId, {
         staleAfterMs: holderStaleMs(),
         deadlineAtMs: Date.now() + WRITER_WAIT_MS,
@@ -138,8 +152,38 @@ export async function resolveSessionTargets(env, sessionId, transcriptPath, know
     });
     if (claim === null)
         return { kind: "busy" };
-    releases.push(() => claim.release());
-    const heartbeat = () => claim.refresh();
+    // ⛔ U6b (F4): A TIMER BEAT FOR THE WHOLE TIME THE VERB HOLDS THE LOCK. The replay's requests run up to `REQUEST_TIMEOUT_MS` (120 s) and
+    // `replayAllUnderLock` beats only between requests, while this lock's stale bound is `holderStaleMs()` (76 s): the worker could reclaim the session
+    // under a live holder and re-send the same span under a second seq. The beat is cleared with the release.
+    const beat = setInterval(() => claim.refresh(), LOCK_BEAT_MS);
+    beat.unref();
+    releases.push(() => {
+        clearInterval(beat);
+        claim.release();
+    });
+    if (replay !== undefined) {
+        const replayed = await replayAllUnderLock(replay, sessionId, claim);
+        if (replayed.kind === "stopped")
+            return replayed.step.kind === "lost" ? { kind: "busy" } : { kind: "replay-stopped", step: replayed.step };
+    }
+    return { kind: "held", held: { refresh: () => claim.refresh() } };
+}
+/**
+ * Take the session's one writer lock (O5) and resolve every target the session names, as a session that is OVER (`end` mode, the
+ * only mode that may decide a folder target). The lock is released by the caller's `releases`, after the sends. Shared by
+ * `finalize` and `backfill`: one resolver loop, so a session is judged the same whichever verb closes it.
+ * `busy`: another writer held the session for the whole wait.
+ */
+export async function resolveSessionTargets(env, sessionId, transcriptPath, known, releases, options = {}) {
+    let held = options.held;
+    if (held === undefined) {
+        const taken = await takeSessionLock(env, sessionId, releases, options.replay);
+        if (taken.kind !== "held")
+            return taken;
+        held = taken.held;
+    }
+    const lock = held;
+    const heartbeat = () => lock.refresh();
     const base = {
         home: env.home,
         env: env.env,
@@ -275,6 +319,16 @@ async function finalizeBody(ctx, argv, releases) {
     // C25: the heartbeat of the session lock `resolveSessionTargets` took, handed to every `closeSession`. Absent only when no resolver
     // ran (a plain in-repo close of a session picked by `--latest`), which holds no session lock to keep.
     let heartbeat;
+    // U5b: the session's lock when it was taken EARLY (before the state-file check, so a replay can create the state file). Every later
+    // `resolveSessionTargets` for the same session resolves under it instead of claiming a second time (a lock is not re-entrant).
+    let held;
+    /** What the session's recorded firings are replayed with; `undefined` when there is no usable credential or ingest address yet (the verb answers that its own way, below, with its own exit code). */
+    const replayConfig = () => {
+        const replayUrl = ingestUrl(ctx.env);
+        if (replayUrl === null || loadCredential({ env: ctx.env, home: ctx.home }).kind !== "ok")
+            return undefined;
+        return { home: ctx.home, env: ctx.env, nodeVersion: ctx.nodeVersion, identity: identityDigest({ url: replayUrl, env: ctx.env }), url: replayUrl };
+    };
     const prepareAnyFolder = async () => {
         if (args.session === null || !SESSION_ID.test(args.session))
             return { kind: "none" };
@@ -287,7 +341,7 @@ async function finalizeBody(ctx, argv, releases) {
         if (transcriptPath === null)
             return { kind: "none" };
         try {
-            if (!args.force && nowMs - statSync(transcriptPath).mtimeMs < STILL_WRITING_MS)
+            if (!args.force && ctx.now().getTime() - statSync(transcriptPath).mtimeMs < STILL_WRITING_MS)
                 return { kind: "still-writing", sessionId };
         }
         catch {
@@ -299,9 +353,15 @@ async function finalizeBody(ctx, argv, releases) {
         // ⛔ `turnEndCwd` is NULL (C18 #1): the CLI's cwd is where the person TYPED this, not where the session ended. Passing it made
         // `finalize --session S` run inside granted repo B create a B target for a session that never touched B. Which repos a session
         // belongs to comes from the session's own records only; the cwd repo's own close is the ledger-gated branch below.
-        const resolved = await resolveSessionTargets({ home: ctx.home, env: ctx.env, nowMs: ctx.now().getTime(), turnEndCwd: null }, sessionId, transcriptPath, null, releases);
+        const replay = replayConfig();
+        const resolved = await resolveSessionTargets({ home: ctx.home, env: ctx.env, nowMs: ctx.now().getTime(), turnEndCwd: null }, sessionId, transcriptPath, null, releases, {
+            ...(replay === undefined ? {} : { replay }),
+            ...(held === undefined ? {} : { held }),
+        });
         if (resolved.kind === "busy")
             return { kind: "busy" };
+        if (resolved.kind === "replay-stopped")
+            return { kind: "replay-stopped", step: resolved.step };
         heartbeat = resolved.heartbeat;
         if (resolved.targets.length === 0)
             return { kind: "none" };
@@ -318,11 +378,28 @@ async function finalizeBody(ctx, argv, releases) {
         }, ctx.colour));
         return EXIT.failure;
     };
+    /** U5b: a recorded firing could not be replayed, so NOTHING is sealed: the firings after it still owe their pending lines. */
+    const replayStoppedBlock = (step) => {
+        if (step.kind === "fatal" && step.why === "rejected") {
+            writeLines(ctx.stderr, renderErrorBlock({
+                kind: "bad",
+                code: "CREDENTIAL_REJECTED",
+                what: FINALIZE.credentialStopped,
+                why: [],
+                fixLabel: FINALIZE.credentialStoppedFix,
+                fixes: [authCommandFor(ctx.env, ctx.selfPath)],
+            }, ctx.colour));
+            return EXIT.failure;
+        }
+        return busyBlock();
+    };
     const refuseAnyFolder = (prepared) => {
         if (prepared.kind === "still-writing")
             return stillWriting(prepared.sessionId);
         if (prepared.kind === "busy")
             return busyBlock();
+        if (prepared.kind === "replay-stopped")
+            return replayStoppedBlock(prepared.step);
         return null;
     };
     let anyFolder = { kind: "none" };
@@ -424,6 +501,16 @@ async function finalizeBody(ctx, argv, releases) {
             }
             sessionId = recent[0].id;
         }
+        // ── U5b: THE SESSION'S RECORDED FIRINGS ARE REPLAYED FIRST, under its lock, before anything asks whether the session exists. After U6 the
+        //    hook writes no state file and promotes nothing, so a session the worker has not reached has neither, and `--session` would answer
+        //    FINALIZE_UNKNOWN_SESSION for it. A replay that stops early ends the verb here with no `final`. ──
+        const early = await takeSessionLock({ home: ctx.home }, sessionId, releases, replayConfig());
+        if (early.kind === "busy")
+            return busyBlock();
+        if (early.kind === "replay-stopped")
+            return replayStoppedBlock(early.step);
+        held = early.held;
+        heartbeat = held.refresh;
         // ── The session must be one THIS repo captured (it has a state file here) and its transcript must be findable inside the agent's own root. ──
         const state = sessionStatePath(ctx.home, { repoKey: projectKey, sessionId });
         if (state === null || !existsSync(state)) {
@@ -448,7 +535,7 @@ async function finalizeBody(ctx, argv, releases) {
             }
             transcriptPath = found;
             try {
-                if (!args.force && nowMs - statSync(transcriptPath).mtimeMs < STILL_WRITING_MS)
+                if (!args.force && ctx.now().getTime() - statSync(transcriptPath).mtimeMs < STILL_WRITING_MS)
                     return stillWriting(sessionId);
             }
             catch {
@@ -461,9 +548,11 @@ async function finalizeBody(ctx, argv, releases) {
             // The session's other repos (parent-folder turns touched them too): resolved by the one resolver, under the one session lock.
             // This repo's own ledger target is closed exactly as before; a resolved target for the same repo REPLACES it (the hook's own
             // ledger choice), and a resolver that finds nothing leaves exactly today's single target.
-            const resolved = await resolveSessionTargets({ home: ctx.home, env: ctx.env, nowMs: ctx.now().getTime(), turnEndCwd: null }, sessionId, transcriptPath, { keys, slugOf: onceStrictRepoSlug(keys.worktree) }, releases);
+            const resolved = await resolveSessionTargets({ home: ctx.home, env: ctx.env, nowMs: ctx.now().getTime(), turnEndCwd: null }, sessionId, transcriptPath, { keys, slugOf: onceStrictRepoSlug(keys.worktree) }, releases, { held });
             if (resolved.kind === "busy")
                 return busyBlock();
+            if (resolved.kind === "replay-stopped")
+                return replayStoppedBlock(resolved.step);
             heartbeat = resolved.heartbeat;
             const own = resolved.targets.find((target) => target.worktrees.includes(projectKey) || target.ledgerKey === projectKey);
             const manual = {
@@ -481,10 +570,10 @@ async function finalizeBody(ctx, argv, releases) {
         }
     }
     // ── Deliver: promote what was pending, then sub-agents FIRST, then the main stream with the assertion. ──
-    // ⛔ NO PENDING-LINE PROMOTION HERE, deliberately. Every hook fire of this session already ran it (`hooks/entry.ts`), and
-    // the session necessarily has a state file (required above), so a first-turn commit was promoted by the first
-    // `Stop` that wrote one. Promoting from this verb would add a second call site to a function whose only call site
-    // is a pinned property (`post-commit-spool.test.ts`, D208): a dead session must never reach it.
+    // ⛔ NO PENDING-LINE PROMOTION HERE, deliberately: promotion keeps ONE call site (`deliverTarget`; `post-commit-spool.test.ts` pins it by name, so this comment must not spell it), and this verb reaches it only
+    // through a REPLAY of the session's recorded firings (U5b, above). Before U6 every hook fire ran it inline and the session necessarily
+    // had a state file, so a first-turn commit was promoted by the first `Stop` that wrote one; after U6 the hook records a firing and the
+    // replay is what promotes. No firing means no promotion, so a dead session still never reaches it (`post-commit-spool.test.ts`, D208).
     const outcomes = [];
     // ⛔ LEAST RECENTLY SENT FIRST (C18 #8), as the hook orders its targets: resolver order is discovery order, and a session with many
     // targets would always serve the same first ones if the credential or the clock ran out part-way. Never-sent targets (0) go first.
@@ -852,32 +941,43 @@ export async function closeSession(input) {
         return { kind: "refused", delivery };
     return { kind: "unacknowledged", delivery };
 }
-/** Sessions of this repo whose state file was touched in the last 24 h, newest first. */
+/**
+ * Sessions of this repo that were touched in the last 24 h, newest first. "Touched" is a state file, the hook's `.live` stamp, or a recorded
+ * firing whose turn ended in this repo (U5b): after U6 a session the worker has not reached has no state file, and listing state files alone
+ * would let `--latest` seal an OLDER session while the newest was invisible, where today it refuses with "several recent".
+ */
 function recentSessions(home, repoKey, nowMs) {
+    const seen = new Map();
+    const note = (id, at) => {
+        if (nowMs - at <= LATEST_WINDOW_MS)
+            seen.set(id, Math.max(seen.get(id) ?? 0, at));
+    };
     const dir = repoSessionsDir(home, repoKey);
-    if (dir === null)
-        return [];
-    let entries;
+    let entries = [];
     try {
-        entries = readdirSync(dir);
+        if (dir !== null)
+            entries = readdirSync(dir);
     }
     catch {
-        return [];
+        entries = [];
     }
-    const out = [];
     for (const entry of entries) {
-        if (!entry.endsWith(".json"))
+        const stem = entry.endsWith(".json") ? entry.slice(0, -".json".length) : entry.endsWith(".live") ? entry.slice(0, -".live".length) : null;
+        if (stem === null || dir === null)
             continue;
         try {
-            const at = statSync(join(dir, entry)).mtimeMs;
-            if (nowMs - at <= LATEST_WINDOW_MS)
-                out.push({ id: entry.slice(0, -".json".length), at });
+            note(stem, statSync(join(dir, entry)).mtimeMs);
         }
         catch {
             /* a vanished file is not recent */
         }
     }
-    return out.sort((a, b) => b.at - a.at);
+    for (const stem of firingSessions(home)) {
+        const last = readFirings(home, stem, 0).firings.at(-1)?.firing;
+        if (last !== undefined && last.keys?.worktree === repoKey)
+            note(last.sid, last.at);
+    }
+    return [...seen].map(([id, at]) => ({ id, at })).sort((x, y) => y.at - x.at);
 }
 /** `<root>/<project dir>/<session>.jsonl` under any of the agents' transcript roots, confined as a hook's is. */
 function findTranscript(home, env, sessionId) {
