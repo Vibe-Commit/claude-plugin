@@ -143,6 +143,7 @@ async function deliverOne(cfg, read, heartbeat, isLastLine) {
         env: cfg.env,
         home: cfg.home,
         nodeVersion: cfg.nodeVersion,
+        ...(cfg.selfPath === undefined ? {} : { selfPath: cfg.selfPath }),
         agentId: f.agent,
         readStdin: () => Promise.resolve(""),
     };

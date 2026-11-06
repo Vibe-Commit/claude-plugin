@@ -352,9 +352,10 @@ export const STATUS = {
     /**
      * 0.7.0, `SessionStart` (T21). `npm i -g` alone never adds the event to an agent's config, so a 0.6.x machine is
      * missing it until `connect` runs. Only said on the npm channel: the plugin ships its own `hooks.json`, and its
-     * contract (no `SessionStart`, no git hooks) is unchanged.
+     * contract (no `SessionStart`, no git hooks) is unchanged. U10: without `SessionStart` a new granted clone still gets its commit hooks, from the
+     * background upload process the first time it delivers a session to that clone, so the line says "only after its first upload", not "will not".
      */
-    sessionStartMissing: (agents, connect) => `${agents} will not add commit hooks to a new clone: VibeCommit's SessionStart hook is not registered there. Run \`${connect}\` to register it.`,
+    sessionStartMissing: (agents, connect) => `${agents} will add commit hooks to a new clone only after its first upload: VibeCommit's SessionStart hook is not registered there. Run \`${connect}\` to register it.`,
     /** 0.7.0, D4 · A. A hook the user deleted stays deleted; `connect` is the watched way back. */
     commitHooksOff: (connect) => `Commit hooks are off in this repository: sessions are captured, commits are not linked to them. Run \`${connect}\` here to add them.`,
     commitHooksForeign: (connect) => `This clone has its own commit hook, so VibeCommit's is not installed here. Run \`${connect}\` here to chain it.`,
