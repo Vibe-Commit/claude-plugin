@@ -119,7 +119,7 @@ export async function drainIdleStep(cfg, state, nowMs = Date.now) {
         }
         // `agentId` is a placeholder: the drain also serves Codex and Cursor sessions, and delivery takes the dialect and the scrubber from the
         // transcript path, not from this field (the hook drain this replaces used whichever hook happened to be running).
-        const ctx = { env: cfg.env, home: cfg.home, nodeVersion: cfg.nodeVersion, agentId: "claude-code", readStdin: () => Promise.resolve("") };
+        const ctx = { env: cfg.env, home: cfg.home, nodeVersion: cfg.nodeVersion, ...(cfg.selfPath === undefined ? {} : { selfPath: cfg.selfPath }), agentId: "claude-code", readStdin: () => Promise.resolve("") };
         const size = fileSize(transcript);
         if (size === null) {
             // The transcript is gone: what is owed becomes a gap now (`writeOffOwed`), a write, so under the session's lock, never waited for.

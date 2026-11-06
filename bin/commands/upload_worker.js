@@ -100,6 +100,7 @@ export async function runUploadWorker(opts) {
         identity,
         url,
         requestTimeoutMs: opts.requestTimeoutMs ?? REQUEST_TIMEOUT_MS,
+        ...(opts.selfPath === undefined ? {} : { selfPath: opts.selfPath }),
     };
     const startedAt = now();
     let lastProgressAt = startedAt;
@@ -324,9 +325,9 @@ export async function runUploadWorker(opts) {
     }
 }
 /** The process entry for `__upload-worker`: real clock, real env. Never throws, never prints, always exits 0. */
-export async function runUploadWorkerMain(env, home) {
+export async function runUploadWorkerMain(env, home, selfPath = process.argv[1] ?? "") {
     try {
-        await runUploadWorker({ home, env, nodeVersion: process.versions.node });
+        await runUploadWorker({ home, env, nodeVersion: process.versions.node, selfPath });
     }
     catch {
         // A detached process has nobody to tell.

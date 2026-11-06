@@ -44,7 +44,7 @@ import { EXIT } from "../exit.js";
 import { headRef, onceRepoSlug } from "../git.js";
 import { redactSpan, rulesForTranscript } from "../redact.js";
 import { authCommandFor, connectCommandFor } from "../install.js";
-import { installOnce, sessionStartPayload } from "./session_start.js";
+import { installForWorkerTarget, installOnce, sessionStartPayload } from "./session_start.js";
 import { CAPTURE_NOT_APPROVED, credentialFingerprint, deliver, ingestUrl } from "../post.js";
 import { FOLDER_REPOSITORY_FORBIDDEN, markSkipped, replayDecision } from "../policy.js";
 import { dialectIsolates, evidenceSpecFor, findSubagentTranscripts, isolationOf, loadTargetRecord, pastCursorOf, redactionScopeFor, stopTarget, } from "../session_targets.js";
@@ -654,6 +654,9 @@ async function deliverTarget(opts) {
     if (heartbeat !== undefined && !heartbeat()) {
         return { target, delivery: { kind: "nothing-to-send", why: "lock-lost" }, subagents: { files: [], held: false, deliveries: [] }, stopped: false, reason: { kind: "lock-lost" } };
     }
+    // U10: the worker (the only caller that passes `selfPath`) gives this repo its git hooks before the first send, the same once-per-clone plain write
+    // the hook's own `installOnce` makes. A commit made before it is missed either way; the next one is seen.
+    installForWorkerTarget({ env: ctx.env, home: ctx.home, selfPath: ctx.selfPath ?? "" }, target);
     // The hook's clock, when it has one. The worker has none: `undefined` all the way down, and a fixed timeout in its place.
     const hookClock = pace.kind === "hook" ? pace : null;
     const deadlineAtMs = hookClock === null ? undefined : hookClock.settleStart + hookClock.sendBudget;

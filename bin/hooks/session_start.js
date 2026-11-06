@@ -152,6 +152,35 @@ export function installOnce(ctx, keys) {
     return { state: didWrite ? "hooks_added" : null, cloneKey: key };
 }
 /**
+ * THE WORKER'S INSTALL (U10). Every agent session on a machine that starts in a parent folder has a turn-end cwd that is not a work tree, so the hook's
+ * own `installOnce` (Cursor's first `Stop`, `SessionStart`) only ever sees a folder and no consented clone got its git hooks, and commit links stayed
+ * dead. The WORKER knows which consented repos it delivers to, so when it is about to deliver to a REPO target it asks for the same install.
+ *
+ * It is `installOnce`, called with the keys of that target's clone: one install record per clone, a plain write into EMPTY slots only (a hook the
+ * user deleted stays deleted, a foreign hook and a `core.hooksPath` redirect keep their outcomes), nothing for the plugin channel. The state it returns
+ * is dropped: the worker prints nothing, and state 6 stays OWED through the install record and its marker, for the next hook that can speak.
+ *
+ * Same admission as delivery (`isCaptureAllowed`, with the slug the resolver already settled). A folder target has no git. Never throws: delivery
+ * must not fail because a hook could not be written.
+ */
+export function installForWorkerTarget(ctx, target) {
+    try {
+        if (target.kind !== "repo" || ctx.selfPath === "")
+            return;
+        for (const dir of [...target.worktrees, target.ledgerKey]) {
+            const keys = resolveProjectKeys(dir);
+            if (keys === null)
+                continue;
+            if (isCaptureAllowed(ctx.home, keys, () => target.slug))
+                installOnce(ctx, keys);
+            return;
+        }
+    }
+    catch {
+        // Delivery goes on.
+    }
+}
+/**
  * The `SessionStart` hook body. Returns the stdout payload or null; never throws past the caller's catch, and
  * opens no transcript.
  *
