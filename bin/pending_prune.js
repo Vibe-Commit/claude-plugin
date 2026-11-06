@@ -15,8 +15,8 @@
  * ## The rule
  *  - TTL 7 days, STRICTLY older. A file is EXPIRED when its mtime AND the `observedAt` of every line are past it. A legacy
  *    0.4.0 line has no `observedAt`; the mtime ages it. ⛔ NEVER the line's `at` (the committer date — settable).
- *  - WHOLE FILES ONLY, and only `*.pending.jsonl`. Survivors are never rewritten (`appendPending` is an unlocked
- *    read-modify-write, so a rewrite could race it). `.spool.jsonl` (real, attributed commits), rewrites and state files are
+ *  - WHOLE FILES ONLY, and only `*.pending.jsonl`. Survivors are never rewritten (a rewrite could race the
+ *    appender; since U2 `appendPending` is a real append, but a prune that rewrote would still lose a line landing mid-write). `.spool.jsonl` (real, attributed commits), rewrites and state files are
  *    never touched.
  *  - At most 50 files per call. Called from the Stop and SessionEnd hooks only — not `post-commit` (it runs under git) and
  *    not `status` (readers stay read-only).

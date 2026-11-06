@@ -451,6 +451,19 @@ export function parseCredentialExpires(raw) {
         return null;
     return Number.isFinite(Date.parse(value)) ? value : null;
 }
+/**
+ * `Retry-After` → milliseconds, for the delta-seconds form ONLY: ASCII digits, nothing else. An HTTP-date, a negative number, a fraction, a sign or
+ * anything with a unit is `null`, and the caller falls back to its own backoff. Capped at one day so a hostile value cannot overflow a timer.
+ * NEVER THROWS.
+ */
+export function parseRetryAfterMs(raw) {
+    if (raw === null)
+        return null;
+    const value = raw.trim();
+    if (!/^\d{1,9}$/.test(value))
+        return null;
+    return Math.min(Number(value), 86_400) * 1000;
+}
 /** `X-Rewrites-Inferred-Stored` → a non-negative integer, or `null` for absent/malformed. NEVER THROWS. */
 function parseInferredStored(raw) {
     if (raw === null)
@@ -493,6 +506,7 @@ export async function send(url, headers, body, timeoutMs, options = {}) {
             inferredStored: parseInferredStored(res.headers.get("x-rewrites-inferred-stored")),
             credentialExpires: parseCredentialExpires(res.headers.get("x-credential-expires")),
             grantEpoch: parseGrantEpoch(res.headers.get("x-grant-epoch")),
+            retryAfterMs: parseRetryAfterMs(res.headers.get("retry-after")),
         };
     }
     catch {
@@ -610,6 +624,9 @@ frameBytes) {
  * persist `lean: true` going forward, which `current.lean` would not yet say.
  */
 function refuse(ctx, key, session, current, span, caps, disposition, lean) {
+    // U1: this writes, and may follow a request. A lost lock writes nothing.
+    if (ctx.beforeRequest !== undefined && !ctx.beforeRequest())
+        return { kind: "nothing-to-send", why: "lock-lost" };
     const next = disposition === "fatal"
         ? {
             ...withFileState(session, ctx.fileKey, { ...markHeld(current, span, ctx.nowMs, caps), lean }),
@@ -632,6 +649,8 @@ function refuse(ctx, key, session, current, span, caps, disposition, lean) {
  * in-process, within the same call.
  */
 function holdLean(ctx, key, session, current, span, caps) {
+    if (ctx.beforeRequest !== undefined && !ctx.beforeRequest())
+        return { kind: "nothing-to-send", why: "lock-lost" }; // U1: see `refuse`
     const next = withFileState(session, ctx.fileKey, { ...markHeld(current, span, ctx.nowMs, caps), lean: true });
     saveSessionState(ctx.home, key, next);
     return { kind: "attempted", disposition: "later", detail: null, finalAck: null, inferredStored: null, inferredSetAsidePairs: 0 };
@@ -669,7 +688,7 @@ async function deliverChunk(ctx, eof, readBody, cutter) {
     // written) and an unsafe session id refused ("never") before the per-request beat below, so a holder that stalled past its lock's
     // bound could otherwise write several skips with nobody checking it still owned the session. No request, no write.
     if (ctx.beforeRequest !== undefined && !ctx.beforeRequest())
-        return { kind: "nothing-to-send" };
+        return { kind: "nothing-to-send", why: "lock-lost" };
     const session = loadSessionState(ctx.home, key);
     if (isStopped(session, credentialFingerprint(ctx.credential)))
         return { kind: "stopped" };
@@ -697,14 +716,14 @@ async function deliverChunk(ctx, eof, readBody, cutter) {
         const plan = planChunk(cutter, span.from, span.to, limits.rawBytes);
         // An unterminated record longer than the limit, still at EOF: it may be growing. Leave it for the next event.
         if (plan.kind === "wait")
-            return { kind: "nothing-to-send" };
+            return { kind: "nothing-to-send", why: "unterminated" };
         if (plan.kind === "oversize")
             return recordTooLarge(ctx, key, session, current, { from: span.from, to: plan.to }, caps);
         span = { from: span.from, to: plan.to };
     }
     let body = readBody(span.from, span.to);
     if (body === null)
-        return { kind: "nothing-to-send" };
+        return { kind: "nothing-to-send", why: "read-failed" };
     if (cutter !== undefined) {
         while (body.length > limits.frameBytes) {
             const at = splitPoint(cutter, span.from, span.to);
@@ -713,21 +732,22 @@ async function deliverChunk(ctx, eof, readBody, cutter) {
             span = { from: span.from, to: at };
             body = readBody(span.from, span.to);
             if (body === null)
-                return { kind: "nothing-to-send" };
+                return { kind: "nothing-to-send", why: "read-failed" };
         }
     }
     // An empty span (a `final` with nothing new) is the last delta by definition.
     let isLast = cutter === undefined || span.to >= eof || span.to === span.from;
-    // `seq` is claimed BEFORE the attempt and persisted by the SWITCH below (every ordinary disposition —
-    // "ok"/"later"/"never"/"fatal" — builds `next` from `{ ...session, seq, … }`), so it is monotonic per
-    // session across retries once a request was actually classified. A seq reused after a failure would read
-    // server-side as a replay of a delta that is not the same bytes.
+    // `seq` is claimed BEFORE the attempt and PERSISTED BEFORE THE FIRST REQUEST (U1, below), so a process killed while the
+    // request is in flight cannot leave `session.seq` behind what the server holds. Persisting it only after the response (the
+    // SWITCH below still writes it again, with the outcome) was the hole: a kill mid-request left the old `seq` on disk, the next
+    // send reused it with a GROWN span, the server answered "replay" (a no-op 2xx) and the client advanced `sentOffset` past bytes
+    // the server never applied: silent loss. A hook killed by its agent had it; a long-lived worker's in-flight window makes it
+    // common. A seq reused after a failure would read server-side as a replay of a delta that is not the same bytes.
     //
-    // ⚠ `refuse()` and `holdLean()` below do NOT persist it — they build `next` from `session` alone, so a
-    // pre-send refusal or a hook's first hold leaves `session.seq` exactly where it was. That is harmless: a
-    // request classified `refuse`/`holdLean` never reached `send()` at all (a bad session id, an unsafe
-    // credential, or the first 431 a hook defers on), so the server never saw THIS seq either — reusing it on
-    // the next real attempt is not a replay of anything, because nothing was sent under it.
+    // ⚠ `refuse()`, `holdLean()` and `holdSpan()` below build `next` from `session` alone, so they write the OLD `seq` back over
+    // the ahead-of-send one. That is harmless: each runs after a request the server REFUSED before applying anything (a 431
+    // before the handler, a 413 before the body is read) or before any request at all (a bad session id, an unsafe credential),
+    // so the server never recorded THIS seq, and reusing it is not a replay of anything.
     //
     // Claimed ONCE even across a `finalize` lean retry below: both attempts, if there are two, carry the same
     // bytes at the same offset, so they are one logical delivery that happened to need its headers shed, not two.
@@ -758,7 +778,12 @@ async function deliverChunk(ctx, eof, readBody, cutter) {
     // which nobody can debug.
     let lean = current.lean;
     if (ctx.beforeRequest !== undefined && !ctx.beforeRequest())
-        return { kind: "nothing-to-send" };
+        return { kind: "nothing-to-send", why: "lock-lost" };
+    // ⛔ U1 (SC-2): WRITE `seq` AHEAD OF THE SEND, after the beat above so a lost lock writes nothing. Fail closed: if the state cannot
+    // be written, the request is not made, because a send whose `seq` is not on disk is the silent-loss shape. The 431 retry and
+    // every 413 half below reuse this `seq` (the server applied none of them), so once is enough.
+    if (!saveSessionState(ctx.home, key, { ...session, seq }))
+        return { kind: "nothing-to-send", why: "unwritable" };
     let attempt = await attemptSend(withinBudget(ctx), agent, seq, span, body, lean, isLast, limits.frameBytes);
     if (attempt.kind === "unsafe") {
         return refuse(ctx, key, session, current, span, caps, attempt.header === "authorization" ? "fatal" : "never", lean);
@@ -789,7 +814,7 @@ async function deliverChunk(ctx, eof, readBody, cutter) {
         // ⛔ A lock lost between the 431 and its retry stops here with NOTHING persisted: the first attempt recorded nothing either, so
         // the span is simply unsent and whoever holds the session now resends it.
         if (ctx.beforeRequest !== undefined && !ctx.beforeRequest())
-            return { kind: "nothing-to-send" };
+            return { kind: "nothing-to-send", why: "lock-lost" };
         attempt = await attemptSend(withinBudget(ctx), agent, seq, span, body, lean, isLast);
         if (attempt.kind === "unsafe") {
             // Unreachable in practice — every lean header is already proven safe, or
@@ -830,17 +855,27 @@ async function deliverChunk(ctx, eof, readBody, cutter) {
         isLast = false;
         const half = readBody(span.from, span.to);
         if (half === null)
-            return { kind: "nothing-to-send" };
+            return { kind: "nothing-to-send", why: "read-failed" };
         if (ctx.beforeRequest !== undefined && !ctx.beforeRequest())
-            return { kind: "nothing-to-send" };
+            return { kind: "nothing-to-send", why: "lock-lost" };
         attempt = await attemptSend(withinBudget(ctx), agent, seq, span, half, lean, false);
         if (attempt.kind === "unsafe") {
             return refuse(ctx, key, session, current, span, caps, attempt.header === "authorization" ? "fatal" : "never", lean);
         }
         outcome = attempt.outcome;
     }
+    // ⛔ U1 (SC-3): A BEAT BEFORE ANYTHING IS PERSISTED. The lock was last stamped before the request; after a laptop sleep another writer
+    // may have reclaimed it and written newer state, and the save (and the spool drops) below would overwrite it and rewind `seq`.
+    // A lost lock persists nothing: the response is dropped, the offset stays, and the new holder re-sends from where its state says
+    // (an idempotent re-send on the server, mcp #165). Hooks hold their lock for the whole call and set no beat.
+    if (ctx.beforeRequest !== undefined && !ctx.beforeRequest())
+        return { kind: "nothing-to-send", why: "lock-lost" };
     const disposition = classify(outcome);
-    let next = ctx.byHook ? { ...session, seq, liveAt: ctx.nowMs } : { ...session, seq };
+    let next = ctx.byHook
+        ? { ...session, seq, liveAt: ctx.nowMs }
+        : ctx.liveAtMs !== undefined
+            ? { ...session, seq, liveAt: Math.max(session.liveAt ?? 0, ctx.liveAtMs) }
+            : { ...session, seq };
     let inferredSetAsidePairs = 0;
     switch (disposition) {
         case "ok":
@@ -1046,6 +1081,7 @@ async function deliverChunk(ctx, eof, readBody, cutter) {
             ? { conversationId: outcome.conversationId }
             : {}),
         ...(outcome.kind === "unreachable" ? { unreachable: true } : {}),
+        ...(outcome.kind === "response" && disposition === "later" && typeof outcome.retryAfterMs === "number" ? { retryAfterMs: outcome.retryAfterMs } : {}),
         // PR 4a: a 413 that no split could shrink was skipped by the `never` arm above; say so, so the caller can count it.
         ...(splitTooLarge && disposition === "never" ? { recordsTooLarge: 1 } : {}),
     };
@@ -1061,9 +1097,11 @@ function recordTooLarge(ctx, key, session, current, span, caps) {
 }
 /**
  * PR 4a — out of hook budget in the middle of a 413 split: hold the span the failed request covered, as a `later` does. The
- * `seq` is not persisted for the same reason the split reuses it: the 413 was refused before the server applied it.
+ * The old `seq` is written back for the same reason the split reuses it: the 413 was refused before the server applied it.
  */
 function holdSpan(ctx, key, session, current, span, caps, lean) {
+    if (ctx.beforeRequest !== undefined && !ctx.beforeRequest())
+        return { kind: "nothing-to-send", why: "lock-lost" }; // U1: see `refuse`
     saveSessionState(ctx.home, key, withFileState(session, ctx.fileKey, { ...markHeld(current, span, ctx.nowMs, caps), lean }));
     return { kind: "attempted", disposition: "later", detail: null, finalAck: null, inferredStored: null, inferredSetAsidePairs: 0 };
 }
@@ -1130,7 +1168,7 @@ export async function deliver(ctx, eof, readBody, cutter) {
         catch {
             // The cutter reads the file and a read can fail. That must read as "could not tell where the record ends", never as
             // "it does not end" (which would skip a record). Nothing was persisted for this delta, so the next event retries it.
-            delivery = { kind: "nothing-to-send" };
+            delivery = { kind: "nothing-to-send", why: "read-failed" };
         }
         if (delivery.kind !== "attempted")
             return last === null ? delivery : carry(last);
@@ -1154,7 +1192,7 @@ export async function deliver(ctx, eof, readBody, cutter) {
         const tailSkipped = delivery.recordsTooLarge !== undefined && after >= eof && ctx.final === true;
         if (after >= eof && !tailSkipped)
             return carry(delivery);
-        if (budgetLeftMs(ctx) < MIN_NEXT_DELTA_BUDGET_MS)
+        if (ctx.oneDelta === true || budgetLeftMs(ctx) < MIN_NEXT_DELTA_BUDGET_MS)
             return carry(delivery, true);
         last = delivery;
         chunkCtx = {

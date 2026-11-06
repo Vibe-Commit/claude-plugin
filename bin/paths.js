@@ -234,6 +234,37 @@ export function sessionsRoot(home) {
 export function sessionTargetsPath(home, sessionId) {
     return join(targetsDir(home), `${sanitise(sessionId)}.targets`);
 }
+/**
+ * U3 — a session's FIRING LOG: one line per hook that ended a turn, appended by the hook and replayed by the upload worker
+ * (`firing.ts`). Beside the session's target record, never under a repo digest: a firing belongs to the SESSION, and the repos it
+ * touches are named inside the line. `.firings.jsonl` is not `.json`, for the reason the whole directory is (`targetsDir`).
+ */
+export function sessionFiringsPath(home, sessionId) {
+    return join(targetsDir(home), `${sanitise(sessionId)}.firings.jsonl`);
+}
+/** U3 — the worker's progress through `sessionFiringsPath`, written only under the session's writer lock. */
+export function sessionFiringsCursorPath(home, sessionId) {
+    return join(targetsDir(home), `${sanitise(sessionId)}.firings.cursor`);
+}
+/** U5 — the machine-wide upload worker's lock for ONE identity (`identity.ts`). Beside the session records; neither a `.targets` nor a `.json`; the status file is `.status` for the same reason. */
+export function uploaderLockPath(home, identity) {
+    return join(targetsDir(home), `uploader.${identity.slice(0, 32)}.lock`);
+}
+/** U5 — what the worker reports about itself, for `status` and the hook's notices: counts and classes, never a body, a path or a credential. */
+export function uploaderStatusPath(home, identity) {
+    return join(targetsDir(home), `uploader.${identity.slice(0, 32)}.status`);
+}
+/**
+ * U3 — `<repo digest>/<session>.live`: the HOOK-only liveness stamp (`firing.ts`). Beside the session's state file, with an extension
+ * that is neither `.json` nor `.jsonl`, so no scan of state files (`lastSendForRepo`, `stuckForRepo`) takes it for a session.
+ * Null on no repo, for the reason `sessionStatePath` is.
+ */
+export function sessionLivePath(home, key) {
+    const dir = repoSessionsDir(home, key.repoKey);
+    if (dir === null)
+        return null;
+    return join(dir, `${sanitise(key.sessionId)}.live`);
+}
 /** Which work tree a state digest names — written by `spool.ts` when a commit is spooled. Null for no repo key. */
 export function repoKeyNotePath(home, repoKey) {
     if (repoKey === "")

@@ -33,33 +33,36 @@
  * own red-proof in `test/credential.test.ts`. Do not read one as evidence for
  * the other.
  */
-import { closeSync, existsSync, openSync, readSync, rmSync, statSync, utimesSync, writeSync, } from "node:fs";
+import { closeSync, existsSync, openSync, readSync, statSync, writeSync, } from "node:fs";
+import { spawn } from "node:child_process";
 import { basename, dirname } from "node:path";
 import { zstdCompressSync } from "node:zlib";
 import { grantsUnreadable, hasAnyConsent, isCaptureAllowed, isLocalSlug, normalizeSlug } from "../consent.js";
-import { endingSoon, noteCredentialExpiry } from "../credential_meta.js";
+import { endingSoon, metaFor } from "../credential_meta.js";
 import { loadCredential } from "../credential.js";
 import { EXIT } from "../exit.js";
-import { headRef, onceRepoSlug, onceStrictRepoSlug } from "../git.js";
+import { headRef, onceRepoSlug } from "../git.js";
 import { redactSpan, rulesForTranscript } from "../redact.js";
 import { authCommandFor, connectCommandFor } from "../install.js";
 import { installOnce, sessionStartPayload } from "./session_start.js";
-import { credentialFingerprint, deliver, ingestUrl } from "../post.js";
-import { FOLDER_REPOSITORY_FORBIDDEN, markSkipped } from "../policy.js";
-import { dialectIsolates, evidenceSpecFor, findSubagentTranscripts, isolationOf, listTargetRecords, pastCursorOf, redactionScopeFor, resolveTargets, stopKeyOf, stopTarget, } from "../session_targets.js";
+import { CAPTURE_NOT_APPROVED, credentialFingerprint, deliver, ingestUrl } from "../post.js";
+import { FOLDER_REPOSITORY_FORBIDDEN, markSkipped, replayDecision } from "../policy.js";
+import { dialectIsolates, evidenceSpecFor, findSubagentTranscripts, isolationOf, loadTargetRecord, pastCursorOf, redactionScopeFor, stopTarget, } from "../session_targets.js";
 import { readSpoolUnion } from "../spool_union.js";
-import { fileState, loadSessionState, pruneDeliveredEndHold, saveSessionState, withFileState } from "../state.js";
-import { SESSION_END_EVENT, settleDelayMs, settledSize, } from "./session_end.js";
+import { fileState, loadSessionState, saveSessionState, withFileState } from "../state.js";
 import { admitsTranscript, agentForTranscript, canonicalHookEvent, dialectFor, } from "../agents/registry.js";
-import { claimFiring, claimSessionWriter, fireLockPath, SESSION_SCOPE, STALE_MARGIN_MS } from "./fire_lock.js";
-import { announcedSubagentFileKey, subagentFileKey, } from "../paths.js";
+import { FIRING_VERSION, MAX_FIRING_SUB_FILES, recordFiring, liveAtOf, liveStampKeys, stampLive } from "../firing.js";
+import { identityDigest } from "../identity.js";
+import { readUploaderStatus } from "../uploader_status.js";
+import { uploaderAlive } from "./fire_lock.js";
+import { announcedSubagentFileKey, sessionFileStem, sessionLivePath, sessionStatePath, subagentFileKey, } from "../paths.js";
 import { resolveProjectKeys } from "../project.js";
 export { confinementRoots } from "../project.js";
 import { startSpawnBudget } from "../spawn_budget.js";
 import { turnStart } from "../pending_bound.js";
 import { recordInferredSkipped } from "../inferred_tally.js";
 import { pruneOrphanPending } from "../pending_prune.js";
-import { pendingModeFor, promotePending, pruneExpiredInferred, readPending } from "../spool.js";
+import { SESSION_LIVE_WINDOW_MS, pendingModeFor, promotePending, pruneExpiredInferred, readPending } from "../spool.js";
 import { meetsNodeFloor } from "../runtime.js";
 import { renderNotice } from "../system_message.js";
 /**
@@ -128,107 +131,6 @@ const MIN_SUBAGENT_BUDGET_MS = 400;
  * and a session that spawned 27 delegated agents will fire far more than four.
  */
 const MAX_SUBAGENT_FILES = 8;
-/**
- * What `stampGaps` gets to keep, carved OUT of the send budget on `SessionEnd`
- * — `CR-182`.
- *
- * ## The defect, and why it is "starved" rather than "never runs"
- *
- * `stampGaps` is called AFTER the send loop, and the watchdog fires at
- * `budgetMs` regardless. The loop's own arithmetic does leave it something: each
- * attempt takes 0.6 of what REMAINS, so the last one starts with at least
- * `MIN_SUBAGENT_BUDGET_MS` and returns with 0.4 of that — 160 ms — still on the
- * clock. But that 160 ms is measured from `startedAt`, which is the settle, and
- * **the watchdog is measured from `runHook`**. Everything before the settle —
- * the stdin read, the consent gate's `git rev-parse`, the credential load — is
- * time the loop never sees and the watchdog already spent. `CR-126` measured a
- * comparable pre-entry interval at p99 392 ms idle and 184 ms under load, so the
- * 160 ms cushion is routinely already gone.
- *
- * MEASURED against the unmodified client (12 delegated files, hung ingest
- * server, `SessionEnd`): idle, every run stamped. Under CPU saturation, a
- * 2200 ms budget produced **one state cell and zero gaps** — the loop's last
- * send overshot and the process was cut off before it could record anything.
- * That is D56 §D8's quietly-short record, which is the one outcome this client
- * may not produce.
- *
- * ## Why 150 ms, and why a fixed number is honest here
- *
- * `stampGaps` is pure synchronous fs — one `loadSessionState` + `saveSessionState`
- * pair per undelivered stream, bounded by `MAX_SUBAGENT_FILES + 1` (9) — with no
- * network, no spawn and no timer in it. So unlike a send, its cost does not
- * depend on anything outside this process, and a fixed reserve is a real bound
- * rather than a guess dressed as one. 150 ms is ~17 ms per stream at the cap on
- * a machine where the whole 9-file loop measures under 5 ms, i.e. an order of
- * magnitude of margin over the effect — the same ratio `SESSION_END_SETTLE_DELAY_MS`
- * is set at, and small enough that it costs the send 90 ms of 2850 on the
- * default budget.
- *
- * ## ⛔ THE RESERVE WAS NOT ACTUALLY RESERVED UNTIL `CR-195/U2` — the two clocks
- * started at different instants
- *
- * Everything above this paragraph diagnosed the defect correctly and then
- * subtracted the reserve from the WRONG ORIGIN. `budgetMs - 150` is a bound on
- * the loop's own clock, which starts at `settleStart`; the watchdog's clock
- * starts in `runHook`, before stdin is read. So the loop was permitted to spend
- * until `budgetMs` *measured from the settle* — already past the watchdog's
- * deadline by exactly the pre-entry interval this docblock names — and the
- * watchdog then fired MID-SEND. `stampGaps` runs after the loop, so it did not
- * run at all, and the held spans stayed held.
- *
- * ⛔ **That is the G6 flake, and it was a real product defect rather than a
- * timing-sensitive assertion.** `test/session-end-gaps.test.ts` caught it as
- * `held: [[0, 39]]` where a stamped gap belonged: on `SessionEnd` — which has no
- * next invocation — a hole that is held rather than stamped is the final turn
- * recorded as delivered-so-far instead of as short. `sendBudgetMs` now takes the
- * elapsed time since `runHook` armed the watchdog and charges it, so the reserve
- * is measured against the deadline that can actually end the process.
- *
- * ⚠ **Since `CR-228` the reserve pays for a HOLD record too.** A held stream is
- * no longer stamped, but `SessionState.endHold` is written for it — and a hook
- * cut off before that write leaves the bytes held with nothing saying the
- * session ended owing them, which `status` cannot see. Same reserve, same cost.
- *
- * ⚠ **Still a mitigation, not a guarantee.** Enough scheduler pressure defeats
- * any fixed reserve, exactly as it defeats the watchdog itself — a timer cannot
- * fire while the event loop is blocked. What changed is that the reserve now
- * survives the ordinary case it was written for; before, the ordinary case is
- * precisely what consumed it.
- *
- * ⛔ Zero on every other event: `stampGaps` runs on `SessionEnd` alone, so
- * reserving elsewhere would shrink `Stop`'s send for a stamp that never happens.
- */
-const GAP_STAMP_RESERVE_MS = 150;
-/**
- * The budget the SENDS may spend — the whole budget, less the stamp's share.
- *
- * A function, and exported, for the reason `sendTimeoutMs` is: the carve-out is
- * the thing this task changes, and a wall-clock test cannot pin it. Every
- * discriminator that distinguishes reserve from no-reserve through a real
- * process turned out to slide with per-send overhead — a 149 ms window that
- * moves by 25 ms for every 10 ms of connect-and-compress cost — so pinning it
- * there would be tuning a constant to one machine. Here it is arithmetic.
- *
- * ⛔ `budgetMs` itself still governs the SETTLE and the WATCHDOG. Only the sends
- * are carved.
- */
-/**
- * ⛔ **TAKES THE RESOLVED EVENT, NEVER THE RAW `hook_event_name` (`CR-195`).**
- *
- * It used to take a `string`, and that is precisely how Cursor's `sessionEnd`
- * bought a full-budget send with no reserve: the comparison was against
- * `"SessionEnd"`, so an unrecognised spelling was `false` rather than an error.
- * `HookEventName | null` makes the resolution a thing the CALLER must already
- * have done — `null` is the honest "none of the three", and an unresolved wire
- * string is no longer expressible here at all.
- */
-export function sendBudgetMs(budgetMs, event, sinceHookStartMs = 0) {
-    const reserve = event === SESSION_END_EVENT ? GAP_STAMP_RESERVE_MS : 0;
-    // ⛔ FLOORED AT ZERO. A negative would reach `sendTimeoutMs`, whose own
-    // `Math.max(0, budgetMs - consumedMs)` turns a negative budget into a POSITIVE
-    // remaining — a blown clock reading as fresh time.
-    return Math.max(0, budgetMs - sinceHookStartMs - reserve);
-}
 /**
  * Parse hook stdin. Claude Code supplies `{ session_id, transcript_path, cwd,
  * hook_event_name }` on stdin — NOT in the environment.
@@ -302,14 +204,6 @@ export function silenceStderr() {
  * truncated write is the silent-unconfigured failure DX3 exists to kill.
  */
 function finish(payload) {
-    // ⛔ RELEASED HERE, AND HERE IS THE ONLY PLACE THAT COVERS EVERY EXIT
-    // (`CR-195`/U4a). A `try/finally` around `hookBody` would look tidier and
-    // would leak the lock on the one path that matters most: the WATCHDOG calls
-    // this function directly, and the signal handlers do too, so neither unwinds
-    // `hookBody` at all. A lock leaked there survives until it goes stale, and
-    // until then it suppresses the next firing of that event — turning a guard
-    // against duplicates into a guard against captures.
-    releaseFiring();
     if (payload !== null) {
         try {
             writeSync(1, `${payload}\n`);
@@ -319,29 +213,6 @@ function finish(payload) {
         }
     }
     process.exit(EXIT.ok);
-}
-/**
- * The firing this process claimed, if it claimed one.
- *
- * ⚠ **Module state, deliberately, and it is the narrow case that justifies it.**
- * This process handles exactly ONE hook invocation and then exits; `finish` is
- * its single exit point and is reached from paths that never return through
- * `hookBody`. Threading a claim out to those paths is not possible — the
- * watchdog holds no reference to the body's locals.
- */
-const heldClaims = [];
-/** Idempotent, and never throws: the hook contract forbids saying anything. Releases EVERY lock this process holds. */
-function releaseFiring() {
-    const claims = heldClaims.splice(0, heldClaims.length);
-    for (const claim of claims) {
-        try {
-            claim.release();
-        }
-        catch {
-            // A lock we could not release goes stale on its own; the bound is derived
-            // from the budget precisely so a lost release costs one invocation, once.
-        }
-    }
 }
 /**
  * Install every contract guard, then run the body.
@@ -524,199 +395,216 @@ async function hookBody(ctx, budgetMs, hookStartedAt) {
     // `/cso` finding 2: a rejected override is a silent no-send, not a fallback to the default.
     if (url === null)
         return null;
-    // `SessionEnd` SETTLES FIRST (D57 §DX7): every other event has a next invocation to pick up a lagging write; this one does
-    // not. Resolved through the dialect (`CR-195`, D205): Cursor sends `sessionEnd`.
-    const isSessionEnd = event === SESSION_END_EVENT;
-    // --- TWO LOCKS, and they are different questions (O5). ---
+    // --- U6: THE HOOK RECORDS A FIRING AND RETURNS (plan §3.1). It never waits for the network again. ---
     //
-    // 1. `claimFiring`: "is this exact firing already running?" ONE FIRING, ONE PROCESS (`CR-195`/U4a): claimed BEFORE the settle
-    //    so a duplicate costs nothing; keyed on the canonical event; the loser BOWS OUT. It lives beside the turn-end repo's state
-    //    exactly as before, or beside the turn-end folder when the turn ended outside any work tree. ⚠ `claimFiring` returns
-    //    `null` for two reasons (held by another, or no lock path at all) and only the first may bow out: an unlockable firing
-    //    FAILS OPEN, because bowing out of every invocation would be a total silent outage.
-    // 2. `claimSessionWriter`: "is another writer touching THIS SESSION right now?": ONE LOCK PER `sessionId`, whatever repo each
-    //    writer stands in, serialising the target record, every ledger and every spool against Stop, PreCompact, SessionEnd,
-    //    `finalize` and `backfill`. A different event WAITS inside this hook's own budget and gives up with `null` (its bytes ride
-    //    the next firing or the idle drain), never holding the watchdog hostage.
-    const fireKey = {
-        repoKey: SESSION_SCOPE,
-        sessionId: input.sessionId,
-        event: event ?? input.eventName,
-    };
-    const lockable = fireLockPath(ctx.home, fireKey) !== null;
-    const firing = claimFiring(ctx.home, fireKey, budgetMs);
-    if (firing === null && lockable) {
-        // Another process holds this exact firing. ⛔ Silent and exit 0: a `systemMessage` here would put a line in the user's turn
-        // for a duplicate they did not cause. `finish` releases nothing because we hold nothing.
-        return null;
+    // What used to happen here (claim the firing, wait for the session's writer lock, settle, resolve targets, promote, read the spool, deliver, stamp
+    // gaps, drain idle sessions) is the upload worker's now, replayed from the line this appends (`replay.ts`, `drain.ts`). The motivating incident: the
+    // hook's 3 s attempt timeout abandoned requests the server then applied, which forked versions and starved the VM.
+    //
+    // ⛔ The hook holds NO lock. Duplicate firings (Cursor fires one event twice) are two lines, and the second is a no-op by `replayDecision`.
+    const load = loadCredential({ env: ctx.env, home: ctx.home });
+    if (load.kind !== "ok") {
+        // Absent or unusable: write nothing and spawn nothing. The notice's old condition was `resolution.targets.length > 0`, which the hook no longer
+        // computes; it is now "the turn-end repo is allowed, or the session's own record already names a target". A parent-folder session with no record
+        // stays silent on its first turn, which is the quiet direction.
+        const named = turnEndAllowed || (loadTargetRecord(ctx.home, input.sessionId)?.targets.length ?? 0) > 0;
+        return named ? notice("not_connected") : null;
     }
-    if (firing !== null)
-        heldClaims.push(firing);
-    const writer = await claimSessionWriter(ctx.home, input.sessionId, {
-        staleAfterMs: budgetMs + STALE_MARGIN_MS,
-        deadlineAtMs: hookStartedAt + Math.floor(budgetMs * WRITER_WAIT_FRACTION),
-        wait,
-    });
-    if (writer === null)
-        return null;
-    heldClaims.push(writer);
-    const settleFor = isSessionEnd ? settleDelayMs(ctx.env, budgetMs) : 0;
-    // `CR-182`. Carved OUT of the budget, never added on top. ⛔ AND THE PRE-ENTRY COST IS CHARGED HERE (`CR-195/U2`, the G6
-    // defect): the stdin read, the gate's spawn, the credential load AND NOW the writer-lock wait all happened between the
-    // watchdog starting and this line, and the reserve must be measured against the clock that can actually end the process.
-    const settleStart = Date.now();
-    const sendBudget = sendBudgetMs(budgetMs, event, settleStart - hookStartedAt);
-    const eof = settleFor > 0
-        ? await settledSize(() => fileSize(input.transcriptPath), wait, settleFor)
-        : fileSize(input.transcriptPath);
+    const eof = fileSize(input.transcriptPath);
     if (eof === null)
         return null;
-    // MEASURED, not assumed to be `settleFor`: the wait can overshoot under load, and the budget cares about the time spent.
-    const consumedMs = settleFor > 0 ? Date.now() - settleStart : 0;
-    const resolution = resolveTargets({
-        home: ctx.home,
-        env: ctx.env,
-        sessionId: input.sessionId,
-        transcriptPath: input.transcriptPath,
-        turnEndCwd: input.cwd,
-        mode: isSessionEnd ? "end" : "turn",
-        nowMs: Date.now(),
-        // ⛔ The RESOLVER gets a STRICT thunk (C17 #13b): `slugOf` above falls back to `local:<hash>` on a timeout, and what the resolver is given
-        // becomes the target's sticky identity. The consent gate keeps `slugOf`.
-        ...(keys !== null && slugOf !== null ? { known: { keys, slugOf: onceStrictRepoSlug(keys.worktree) } } : {}),
+    const identity = identityDigest({ url, env: ctx.env });
+    // Liveness (plan §3.5): READ BEFORE STAMPING, so the worker can judge `pendingModeFor` as the hook saw it; then stamp `.live`, hook-only.
+    const record = loadTargetRecord(ctx.home, input.sessionId);
+    const stampKeys = liveStampKeys({
+        isolates: dialectIsolates(ctx.home, ctx.env, input.transcriptPath),
+        turnEnd: turnEndAllowed && keys !== null ? keys.worktree : null,
+        recordLedgerKeys: record === null ? [] : record.targets.map((target) => target.ledgerKey),
     });
-    if (resolution.targets.length === 0) {
-        // Nothing granted was named (R8 · D11 · B): the hook stays SILENT, as it always was for an unconsented repo. A repo or
-        // folder the session named that nobody decided about is recorded BY NAME for `vibecommit status` to list.
-        //
-        // But D22 says ANY later firing drains idle sessions, and a session that names nothing granted (common in a parent folder)
-        // is exactly the firing that has the whole deadline spare. So: load the credential SILENTLY (no notice, ever: this session
-        // has nothing to say), and if it is usable, spend the leftover on others' owed bytes.
-        const quiet = loadCredential({ env: ctx.env, home: ctx.home });
-        if (quiet.kind === "ok") {
-            try {
-                await drainIdleSessions({
-                    ctx,
-                    url,
-                    credential: quiet.credential,
-                    currentSessionId: input.sessionId,
-                    settleStart,
-                    sendBudget,
-                    staleAfterMs: budgetMs + STALE_MARGIN_MS,
-                });
-            }
-            catch {
-                // A hook cannot report an error.
-            }
+    const prior = {};
+    for (const key of stampKeys) {
+        const before = priorLivenessOf(ctx.home, { repoKey: key, sessionId: input.sessionId });
+        if (before !== undefined)
+            prior[key] = before;
+    }
+    const firedAt = Date.now();
+    // `slug` only when step 3 got a REAL one, never the `local:` fallback: what the worker passes the resolver becomes a target's sticky identity.
+    const turnEndSlug = keys !== null && slugOf !== null ? slugOf() : null;
+    const firing = {
+        v: FIRING_VERSION,
+        at: firedAt,
+        sid: input.sessionId,
+        event: input.eventName,
+        eof,
+        transcript: input.transcriptPath,
+        cwd: input.cwd,
+        ...(keys === null ? {} : { keys: { worktree: keys.worktree, consent: keys.consent } }),
+        ...(turnEndSlug === null || isLocalSlug(turnEndSlug) ? {} : { slug: turnEndSlug }),
+        agent: ctx.agentId,
+        id: identity,
+        prior,
+        ...(input.agentTranscriptPath === undefined ? {} : { announced: input.agentTranscriptPath }),
+        ...subSizesOf(ctx, input),
+    };
+    recordFiring(ctx.home, input.sessionId, firing);
+    // Appended FIRST, stamped second, lock read third: the worker releases THEN looks at the queue, so one side always sees the other.
+    for (const key of stampKeys)
+        stampLive(ctx.home, { repoKey: key, sessionId: input.sessionId }, firedAt);
+    // --- NOTICES come from the worker's status file (plan §3.7): the hook cannot see this firing's outcome, only earlier ones. ---
+    const status = readUploaderStatus(ctx.home, identity);
+    const payload = (() => {
+        // `fatal`: a hook that stays silent about a revoked credential captures nothing forever. QUIET DURING ROTATION (`11A`): only about the credential this
+        // hook is about to use; if `auth` has replaced the one the worker was rejected with, there is nothing to tell the user.
+        if (status?.rejected !== undefined && status.rejected.fingerprint === credentialFingerprint(load.credential)) {
+            return notice("credential_revoked", null, load.credential);
+        }
+        // `CR-234d` (12A): the worker remembered where the credential stands in the SIDECAR; from 14 days before the end, say so once per machine per day.
+        // It outranks the positive message: that one repeats daily, this one is the only way a person learns capture will stop.
+        const endsAt = endingSoon(metaFor(ctx.home, credentialFingerprint(load.credential)), firedAt);
+        if (endsAt !== null) {
+            const ending = notice("credential_ending", null, load.credential, endsAt);
+            if (ending !== null)
+                return ending;
+        }
+        if (firstStop?.state != null) {
+            const install = notice(firstStop.state, null, undefined, undefined, firstStop.cloneKey);
+            if (install !== null)
+                return install;
+        }
+        // `capture_confirmed`: one turn later, and only on a hook of the session the outcome NAMES, still claimed once per (repo, day). The copy says
+        // "captured this session", so showing it in another session, possibly in a declined repo, would be false and would use up the claim.
+        const stem = sessionFileStem(input.sessionId);
+        if (turnEndAllowed && keys !== null && status !== null && status.outcomes.some((o) => o.session === stem && o.class === "done:delivered")) {
+            return notice("capture_confirmed", keys.worktree);
         }
         return null;
+    })();
+    // Spawn the worker if none is alive for this identity. A failed spawn is silent and leaves the firing for the next hook.
+    if (!uploaderAlive(ctx.home, identity))
+        spawnWorker(ctx);
+    return payload;
+}
+/**
+ * U6b (F5, C33) — each sub-agent file's size NOW, for `Firing.sub`: what the worker may send of it when it replays this firing. The same two
+ * discoveries `deliverSubagents` makes (the dialect's glob and the announced path), so a stream the delivery would send has a ceiling here. Empty
+ * map when there are none (a file that appears later is the NEXT firing's). `{}` (no key) when the list is too long to record: uncapped, as before.
+ * Never throws: a hook must not.
+ */
+function subSizesOf(ctx, input) {
+    try {
+        const sub = {};
+        for (const file of [...findSubagentFiles(ctx, input.transcriptPath), ...announcedSubagentFiles(ctx, input)])
+            sub[file.fileKey] = file.size;
+        return Object.keys(sub).length > MAX_FIRING_SUB_FILES ? {} : { sub };
     }
-    const load = loadCredential({ env: ctx.env, home: ctx.home });
-    switch (load.kind) {
-        case "absent":
-            return notice("not_connected");
-        case "wrong-class":
-        case "insecure-file":
-        case "unreadable":
-            // Interactive verbs print four different fixes for these (§13.6). A hook has one channel and a one-line budget, so they
-            // collapse to the state whose fix, `vibecommit connect`, is the same for all four.
-            return notice("not_connected");
-        case "ok":
-            break;
+    catch {
+        return {};
     }
-    // --- ONE SESSION, N TARGETS, ONE DEADLINE (A2). ---
-    // Least-recently-sent first, so a target with a 20 MB backlog cannot starve the others forever: it spends the firing, its
-    // `lastSentAt` moves, and the NEXT firing serves the one that waited. Each target's own sends still honour the shared
-    // deadline (`deadlineAtMs`), so the whole firing stays inside the one budget.
+}
+/**
+ * U6 — the liveness the hook read BEFORE it stamped (plan §3.4, P2 point 4), in `Firing.prior`'s three states: a number (the later of the state
+ * file's `liveAt` and the `.live` stamp), `null` (a state file exists with NO `liveAt`: what `finalize` and `backfill` leave), or `undefined` (no
+ * state file at all, which reads as `first-turn`). A plain number-or-omitted map would read a resumed session as `first-turn`.
+ */
+function priorLivenessOf(home, key) {
+    const statePath = sessionStatePath(home, key);
+    if (statePath === null)
+        return undefined;
+    const stamped = liveAtOf(null, sessionLivePath(home, key));
+    if (!existsSync(statePath))
+        return stamped ?? undefined;
+    return liveAtOf(loadSessionState(home, key).liveAt, sessionLivePath(home, key));
+}
+/**
+ * U6 — spawn the detached worker (plan §3.9): `stdio: "ignore"` so the hook's pipes are not held open, `cwd: home` so it pins no worktree or temp dir, the
+ * hook's own environment so `VIBECOMMIT_TOKEN` and the ingest override reach it. Node's documented background pattern. `selfPath` is `process.argv[1]`,
+ * so both channels (npm and the plugin's vendored bin) respawn themselves. Never throws, never waits.
+ */
+function spawnWorker(ctx) {
+    const self = ctx.selfPath;
+    if (self === undefined || self === "")
+        return;
+    try {
+        const child = spawn(process.execPath, [self, "__upload-worker"], { detached: true, stdio: "ignore", windowsHide: true, cwd: ctx.home, env: ctx.env });
+        child.on("error", () => {
+            // A worker that could not start leaves the firing for the next hook.
+        });
+        child.unref();
+    }
+    catch {
+        // Silent, per the hook contract.
+    }
+}
+/** Pure. The reason for one target from its delivery and where its main ledger stands against the `eof` it was asked to reach. */
+export function targetReason(delivery, sentOffset, eof, stopped) {
+    if (stopped)
+        return { kind: "held", why: "folder-forbidden" };
+    switch (delivery.kind) {
+        case "stopped":
+            return { kind: "held", why: "stopped" };
+        case "no-repo":
+            return { kind: "never" };
+        case "nothing-to-send":
+            if (delivery.why === "lock-lost")
+                return { kind: "lock-lost" };
+            if (delivery.why === "read-failed" || delivery.why === "unwritable")
+                return { kind: "not-progressed", why: delivery.why };
+            if (delivery.why === "unterminated")
+                return { kind: "held", why: "unterminated" };
+            return sentOffset >= eof ? { kind: "caught-up" } : { kind: "not-progressed", why: "read-failed" };
+        case "attempted":
+            switch (delivery.disposition) {
+                case "fatal":
+                    return { kind: "fatal" };
+                case "never":
+                    return { kind: "never" };
+                case "later":
+                    return delivery.detail?.code === CAPTURE_NOT_APPROVED ? { kind: "held", why: "capture-not-approved" } : { kind: "later" };
+                case "ok":
+                    return sentOffset >= eof ? { kind: "caught-up" } : { kind: "more-owed" };
+            }
+    }
+}
+/**
+ * U4 — DELIVER ONE FIRING TO ITS RESOLVED TARGETS. The loop `hookBody` always ran inline, callable by the upload worker with a replay's
+ * as-of inputs and no wall clock. Behaviour for the inline hook is unchanged: `pace.kind === "hook"` and no `asOf` is the old code.
+ *
+ * Order and fairness are as before: least-recently-sent target first, so a 20 MB backlog on one cannot starve the rest.
+ */
+export async function deliverFiring(opts) {
+    const { ctx, input, resolution, pace } = opts;
     const ordered = leastRecentlySentFirst(ctx.home, input.sessionId, resolution.targets);
     // ⛔ D95 STAYS, exactly as written, for the one case R14 protects: a session whose turns end in ONE granted work tree and
     // which names nothing else granted. Every other session (several targets, a target found only by evidence, a folder target)
     // has later firings that can finish it, so a shortfall at SessionEnd is OWED there, not written off (R19 · D22).
     const writeOffAtSessionEnd = ordered.length === 1 && ordered[0].kind === "repo" && resolution.turnEndSlug === normalizeSlug(ordered[0].slug);
-    const deadline = settleStart + sendBudget;
+    const deadline = pace.kind === "hook" ? pace.settleStart + pace.sendBudget : Infinity;
     const results = [];
     for (const target of ordered) {
         const result = await deliverTarget({
             ctx,
             input,
-            url,
-            credential: load.credential,
+            url: opts.url,
+            credential: opts.credential,
             target,
-            eof,
-            event,
-            isSessionEnd,
-            settleStart,
-            sendBudget,
-            consumedMs: results.length === 0 ? consumedMs : Date.now() - settleStart,
+            eof: opts.eof,
+            event: opts.event,
+            isSessionEnd: opts.isSessionEnd,
+            pace: pace.kind === "hook" ? { ...pace, consumedMs: results.length === 0 ? pace.consumedMs : Date.now() - pace.settleStart } : pace,
             // A target reached with the deadline already spent sends nothing this firing but is still STAMPED at SessionEnd.
             skipSend: results.length > 0 && Date.now() >= deadline,
             owedAtSessionEnd: !writeOffAtSessionEnd,
             scanned: scannedOffsets(resolution.record.scan),
             record: resolution.record,
+            ...(opts.asOf === undefined ? {} : { asOf: opts.asOf }),
+            ...(opts.heartbeat === undefined ? {} : { heartbeat: opts.heartbeat }),
         });
         results.push(result);
+        if (result.reason.kind === "lock-lost")
+            break;
     }
-    // The three classes are decided in `policy.ts` and applied in `post.ts`. Two of the four outcomes reach a human.
-    //
-    // `fatal`: a hook that stays silent about a revoked credential captures nothing forever. `later` and `never` say nothing: a
-    // hook has one line per session and spending it on a condition that resolves itself next turn is the tool noise D57 §DX3
-    // exists to avoid. `ok`: the fourth state (`CR-023d`), and its `(repo, day)` claim is what keeps it to once.
-    //
-    // With N targets the answer is ONE: any `fatal` wins (it is credential-wide by definition), else the first target that
-    // delivered speaks. A per-target stop (C3) is never `fatal` and is never a notice: `status` names it.
-    const fatal = results.find((r) => r.stopped === false && r.delivery.kind === "attempted" && r.delivery.disposition === "fatal");
-    const payload = (() => {
-        if (fatal !== undefined && fatal.delivery.kind === "attempted") {
-            // ⛔ QUIET DURING ROTATION (`11A`). This hook loaded its credential before an `auth` replaced the file; its 401 is about a
-            // credential that is already gone. If what is on disk NOW is a different credential, there is nothing to tell the user.
-            const current = loadCredential({ env: ctx.env, home: ctx.home });
-            if (current.kind === "ok" && credentialFingerprint(current.credential) !== credentialFingerprint(load.credential)) {
-                return null;
-            }
-            return notice("credential_revoked", null, load.credential);
-        }
-        const ok = results.find((r) => r.delivery.kind === "attempted" && r.delivery.disposition === "ok");
-        if (ok === undefined || ok.delivery.kind !== "attempted")
-            return null;
-        // `CR-234d` (12A): a 2xx carries where the credential stands (`X-Credential-Expires`). Remember it in the SIDECAR (never in
-        // `credentials.json`, which a hook must not rewrite, R10) and, from 14 days before the end, say so once per machine per day.
-        // It outranks the positive message: that one repeats daily, this one is the only way a person learns capture will stop.
-        if (ok.delivery.credentialExpires != null) {
-            const meta = noteCredentialExpiry(ctx.home, ctx.env, credentialFingerprint(load.credential), ok.delivery.credentialExpires, new Date());
-            const endsAt = endingSoon(meta, Date.now());
-            if (endsAt !== null) {
-                const ending = notice("credential_ending", null, load.credential, endsAt);
-                if (ending !== null)
-                    return ending;
-            }
-        }
-        return ((firstStop?.state == null ? null : notice(firstStop.state, null, undefined, undefined, firstStop.cloneKey)) ??
-            notice("capture_confirmed", ok.target.ledgerKey));
-    })();
-    // The leftover of the one deadline goes to sessions that have had no firing for 10 minutes (R19 · D22): never throws.
-    try {
-        await drainIdleSessions({
-            ctx,
-            url,
-            credential: load.credential,
-            currentSessionId: input.sessionId,
-            settleStart,
-            sendBudget,
-            staleAfterMs: budgetMs + STALE_MARGIN_MS,
-        });
-    }
-    catch {
-        // A hook cannot report an error, and a drain that failed leaves every session exactly as it was.
-    }
-    return payload;
+    return results;
 }
-/**
- * How much of the hook's budget a firing may spend WAITING for another writer of the same session before it gives up. Most of it (0.8): a different event is serialised behind the holder, and the holder's own send can run to its timeout before it lets go, so a shorter
- * window would give up on exactly the overlapping Stop/SessionEnd case (`session-end-gaps` U4a). The
- * rest must still cover the settle, the send and (`SessionEnd`) the gap stamp. A waiter that gives up loses nothing: its bytes
- * ride the next firing, or the idle drain.
- */
-const WRITER_WAIT_FRACTION = 0.8;
 /**
  * Targets in the order they are served: the one that sent LEAST recently first (A2). `lastSentAt` is the latest successful send
  * across the target's ledger's streams, 0 for "never", so a target that has never been served goes first and a target that just
@@ -733,6 +621,23 @@ function leastRecentlySentFirst(home, sessionId, targets) {
         .map((entry) => entry.target);
 }
 /**
+ * U4 — `pendingModeFor`, answered from `firing.prior` (plan §3.4, P2 point 4). `prior` keeps `pendingModeFor`'s three outcomes:
+ *  - a NUMBER is the stamp the hook read before it stamped: live within the window of `firing.at` is `first-turn`, older is `stale-own`;
+ *  - an explicit `null` is a state file with NO `liveAt` (what `finalize` and `backfill` leave): `stale-own`;
+ *  - an ABSENT key is no state file at hook time: `first-turn`. A key the hook did not record at all (a second work tree, a parent-folder
+ *    repo on its first firing) falls back to `pendingModeFor` judged at `firing.at`, never `Date.now()`, which is safe because stamps arrive in
+ *    firing order.
+ * A plain number-or-omitted map would read a resumed session as `first-turn` and keep a lingering-id line.
+ */
+export function modeFromPrior(home, key, asOf) {
+    const recorded = asOf.prior[key.repoKey];
+    if (recorded === null)
+        return "stale-own";
+    if (recorded !== undefined)
+        return asOf.at - recorded <= SESSION_LIVE_WINDOW_MS ? "first-turn" : "stale-own";
+    return pendingModeFor(home, key, asOf.at);
+}
+/**
  * Deliver ONE target of ONE session: what `hookBody` used to do inline for its single repo, now per target.
  *
  *   promote and prune the target's pending commits, read its spool UNION, deliver `main`, then its sub-agents, then (on
@@ -744,17 +649,41 @@ function leastRecentlySentFirst(home, sessionId, targets) {
  * stream's offset can rewind the other's.
  */
 async function deliverTarget(opts) {
-    const { ctx, input, url, credential, target, event, isSessionEnd, settleStart, sendBudget, consumedMs } = opts;
+    const { ctx, input, url, credential, target, event, isSessionEnd, pace, asOf, heartbeat } = opts;
+    // U5: a holder that lost its lock writes nothing, not even a promotion.
+    if (heartbeat !== undefined && !heartbeat()) {
+        return { target, delivery: { kind: "nothing-to-send", why: "lock-lost" }, subagents: { files: [], held: false, deliveries: [] }, stopped: false, reason: { kind: "lock-lost" } };
+    }
+    // The hook's clock, when it has one. The worker has none: `undefined` all the way down, and a fixed timeout in its place.
+    const hookClock = pace.kind === "hook" ? pace : null;
+    const deadlineAtMs = hookClock === null ? undefined : hookClock.settleStart + hookClock.sendBudget;
+    const requestTimeoutMs = hookClock === null ? pace.timeoutMs : sendTimeoutMs(hookClock.sendBudget, hookClock.consumedMs);
     // ⛔ A FOLDER stream delivers only up to what the resolver has SCANNED (P1, A-T3 requirement b): bytes appended between the scan
     // and this read were never checked for repo evidence, and a repo they name would end the folder rule. A repo target has no such
     // limit: its bytes are its own whatever else the session named.
     // C42: a REPO copy of a dialect that isolates records may deliver past the scan cursor. Every per-record decision there is exact (the record's own
     // cwd, the path rule, the always-withheld types); the two facts the checkpoint cannot hold are learned IN-SPAN, in order (`pastCursorOf`).
     const folderCap = target.kind === "folder" ? (opts.scanned ?? {}) : undefined;
-    const eof = folderCap === undefined ? opts.eof : Math.min(opts.eof, folderCap.main ?? 0);
+    let eof = folderCap === undefined ? opts.eof : Math.min(opts.eof, folderCap.main ?? 0);
+    // ⛔ U4, TRAP 1 — A REPLAYED FIRING NEVER GOES TO `nextSpan` WITH AN `eof` BEHIND `sentOffset`: that reads as "the file was replaced" and
+    // resyncs the whole session from byte 0. Compare with the file's REAL size first (`replayDecision`): a rotation delivers to the real size,
+    // an already-delivered firing (a duplicate, or one older than a `finalize`) is a no-op.
+    let replayNoop = false;
+    if (asOf !== undefined) {
+        const real = fileSize(input.transcriptPath);
+        if (real === null) {
+            return { target, delivery: { kind: "nothing-to-send", why: "read-failed" }, subagents: { files: [], held: false, deliveries: [] }, stopped: false, reason: { kind: "not-progressed", why: "read-failed" } };
+        }
+        const sent = fileState(loadSessionState(ctx.home, { repoKey: target.ledgerKey, sessionId: input.sessionId }), "main").sentOffset;
+        const decision = replayDecision(sent, eof, real);
+        if (decision.kind === "noop")
+            replayNoop = true;
+        else
+            eof = decision.eof;
+    }
     const baseIsolation = isolationOf(target, opts.record);
     const isolation = opts.record !== undefined && opts.scanned !== undefined && dialectIsolates(ctx.home, ctx.env, input.transcriptPath)
-        ? { ...baseIsolation, past: pastCursorOf(baseIsolation, opts.scanned, { deadlineAtMs: settleStart + sendBudget }) }
+        ? { ...baseIsolation, past: pastCursorOf(baseIsolation, opts.scanned, deadlineAtMs === undefined ? {} : { deadlineAtMs }) }
         : baseIsolation;
     const sessionId = input.sessionId;
     const ledgerKey = target.ledgerKey;
@@ -767,9 +696,15 @@ async function deliverTarget(opts) {
     // return value is NOT discarded, it feeds the durable `set_aside` tally.
     for (const projectKey of sourceKeys) {
         const spoolKey = { repoKey: projectKey, sessionId: input.sessionId };
-        const pendingMode = pendingModeFor(ctx.home, spoolKey);
-        const bound = promotionBound(ctx.home, spoolKey, input.transcriptPath, Date.now());
-        promotePending(ctx.home, spoolKey, "this-session-is-running", bound, pendingMode);
+        // U4: a NO-OP firing (already delivered, or a duplicate) promotes nothing: its pending lines are judged by the firing that carries them.
+        if (!replayNoop) {
+            // A replay judges the session's liveness as the HOOK saw it before it stamped (`firing.prior`), not by the state file the worker
+            // may have since written: stamping first would flip `stale-own` to `first-turn` and keep a lingering-id line (P2 point 4).
+            const pendingMode = asOf === undefined ? pendingModeFor(ctx.home, spoolKey) : modeFromPrior(ctx.home, spoolKey, asOf);
+            // The skew guard stays on `Date.now()`: on `firing.at`, a prompt written after the firing would read as `future` and keep any line.
+            const bound = promotionBound(ctx.home, spoolKey, input.transcriptPath, Date.now());
+            promotePending(ctx.home, spoolKey, "this-session-is-running", bound, pendingMode, asOf?.at);
+        }
         if (event === "Stop" || isSessionEnd) {
             pruneOrphanPending(ctx.home, projectKey, Date.now());
             const prunedInferred = pruneExpiredInferred(ctx.home, projectKey, Date.now());
@@ -783,11 +718,12 @@ async function deliverTarget(opts) {
     if (!opts.skipSend) {
         // ⛔ THE UNION, acknowledged per source (O7): commits, rewrites and inferred squashes of every work tree of this repo for this
         // session. A single-worktree target reads exactly the three calls the hook always made.
-        const union = readSpoolUnion(ctx.home, sessionId, ledgerKey, target.worktrees);
+        // U4: a replay carries only the commits that existed when its hook fired (the pin). A no-op firing carries none.
+        const union = readSpoolUnion(ctx.home, sessionId, ledgerKey, target.worktrees, asOf?.at);
         // ⛔ THE ONE NEW SPAWN `CR-170` ADDED, for REF MOVES, not commits: a direct look at `HEAD` is the only record of a `pull`,
         // `checkout` or `reset --hard`. Null on an empty repository. A FOLDER has no HEAD: no spawn.
         const head = target.kind === "repo" ? headRef(ledgerKey) : null;
-        delivery = await deliver({
+        delivery = replayNoop ? { kind: "nothing-to-send" } : await deliver({
             home: ctx.home,
             env: ctx.env,
             url,
@@ -799,11 +735,16 @@ async function deliverTarget(opts) {
             // ⛔ THE PATH, so `deliver()` can derive `X-Agent` from the root that contains it (`CR-204`, D177 §7).
             transcriptPath: input.transcriptPath,
             // ⛔ `sendBudget`, not `budgetMs`: the main send is the single largest consumer on this path (`CR-182`).
-            timeoutMs: sendTimeoutMs(sendBudget, consumedMs),
-            // PR 4a: WHEN THE SENDS MUST STOP. Shared by every target of the firing, so the rest waits for the next event.
-            deadlineAtMs: settleStart + sendBudget,
+            timeoutMs: requestTimeoutMs,
+            // PR 4a: WHEN THE SENDS MUST STOP. Shared by every target of the firing, so the rest waits for the next event. U4: the worker has none.
+            ...(deadlineAtMs === undefined ? {} : { deadlineAtMs }),
             nowMs: Date.now(),
-            byHook: true,
+            ...(heartbeat === undefined ? {} : { beforeRequest: heartbeat }),
+            // U5: the worker sends one delta and comes back (fairness and pacing); a hook loops to its budget.
+            ...(hookClock === null ? { oneDelta: true } : {}),
+            // U4: a replay is not a hook. It never stamps "now"; it stamps the moment its hook fired (`liveAtMs`, merged by `max`).
+            byHook: asOf === undefined && hookClock !== null,
+            ...(asOf === undefined ? {} : { liveAtMs: asOf.at }),
             // ⛔ THE MAIN DELIVERY ONLY. Sub-agent deliveries leave all three unset: each is its own `capture_id`, and
             // `capture_commits`' PK is `(org_id, capture_id, commit_sha)`, so attaching these to all of them would admit several
             // legal, permanent rows for one commit (D154).
@@ -825,7 +766,7 @@ async function deliverTarget(opts) {
         // a per-target stop so the next firing does not ask again. Never credential-wide, never `fatal`.
         if (delivery.kind === "attempted" && delivery.detail?.code === FOLDER_REPOSITORY_FORBIDDEN) {
             stopTarget(ctx.home, sessionId, target, FOLDER_REPOSITORY_FORBIDDEN, Date.now());
-            return { target, delivery, subagents, stopped: true };
+            return { target, delivery, subagents, stopped: true, reason: targetReason(delivery, 0, eof, true) };
         }
         // --- DELEGATED WORK. `CR-124`, D76. ---
         // Claude Code writes sub-agent transcripts to `<session>/subagents/`, which `transcript_path` never names: ~16% of
@@ -838,10 +779,16 @@ async function deliverTarget(opts) {
             projectKey: ledgerKey,
             redactionRoots: target.redactionRoots,
             repoSlug: target.slug,
-            startedAt: settleStart,
-            sendBudget,
-            byHook: true,
+            startedAt: hookClock?.settleStart ?? Date.now(),
+            sendBudget: hookClock?.sendBudget ?? 0,
+            byHook: asOf === undefined && hookClock !== null,
+            ...(asOf === undefined ? {} : { liveAtMs: asOf.at }),
+            ...(heartbeat === undefined ? {} : { heartbeat }),
+            ...(hookClock === null ? { unboundedTimeoutMs: requestTimeoutMs } : {}),
+            // F2d: one request at a time per machine. The main delta just went; the first sub-agent request waits the floor.
+            ...(hookClock === null && delivery.kind === "attempted" ? { pauseFirstMs: UNBOUNDED_PACE_FLOOR_MS } : {}),
             ...(folderCap === undefined ? {} : { sizeCap: folderCap }),
+            ...(asOf?.subCap === undefined ? {} : { firingCap: asOf.subCap }),
             isolation,
         });
     }
@@ -853,28 +800,51 @@ async function deliverTarget(opts) {
     // nothing to return. ⛔ And `CR-228` (`TODOS[142]`): it writes off only what nothing explains. `held` is whether ANY delivery
     // of this target ended `later`/`fatal`, or was refused by a standing stop. R19 · D22 adds the other case that is HELD, not
     // written off: `owedAtSessionEnd`, a session other than the one-target in-repo case, whose later firings can finish it.
+    //
+    // ⛔ U5, D6 — THE WORKER HAS NO BUDGET TO RUN OUT, so it never writes off what is merely BEHIND:
+    //  - a step that sent one delta and has more owed (`more`) stamps NOTHING: the next step continues, and stamping here would `markSkipped` the rest
+    //    of a transcript over the delta cap while the server was answering (found by cell R18: the first step reported `done` with 2 MiB written off);
+    //  - the final step records what is still behind as a HOLD (`endHold`), never as a gap: behind with an answering server just keeps sending, and
+    //    what the server refused (`never`), an oversize record, a deleted transcript and the backlog caps stamp their gaps where they happen.
     if (isSessionEnd) {
-        stampGaps(ctx, input, ledgerKey, [{ fileKey: "main", size: eof }, ...subagents.files], endedHeld(delivery) || subagents.held || opts.owedAtSessionEnd, Date.now());
+        const moreOwed = hookClock === null && [delivery, ...subagents.deliveries].some((d) => d.kind === "attempted" && d.more === true);
+        if (!moreOwed) {
+            stampGaps(ctx, input, ledgerKey, [{ fileKey: "main", size: eof }, ...subagents.files], endedHeld(delivery) || subagents.held || opts.owedAtSessionEnd || hookClock === null, Date.now(), asOf?.at);
+        }
     }
-    return { target, delivery, subagents, stopped };
+    return {
+        target,
+        delivery,
+        subagents,
+        stopped,
+        reason: targetReason(delivery, fileState(loadSessionState(ctx.home, { repoKey: ledgerKey, sessionId }), "main").sentOffset, eof, stopped),
+    };
 }
 /** The resolver's scanned offset per stream, for the folder cap. */
 function scannedOffsets(scan) {
     return Object.fromEntries(Object.entries(scan).map(([fileKey, cursor]) => [fileKey, cursor.offset]));
 }
+/**
+ * U6b (F2d): THE WORKER'S PACE BETWEEN REQUESTS (D9): sleep `max(250 ms, the request's own elapsed)`, capped at 30 s. It lives here, beside the delivery loops
+ * that must honour it, because ONE worker step can put several requests on the wire (the main delta, then one per sub-agent file) and pacing only
+ * after the whole step let a fast server take thirteen of them back to back.
+ */
+export const UNBOUNDED_PACE_FLOOR_MS = 250;
+export const UNBOUNDED_PACE_CAP_MS = 30_000;
+export function unboundedPaceMs(elapsedMs) {
+    return Math.min(UNBOUNDED_PACE_CAP_MS, Math.max(UNBOUNDED_PACE_FLOOR_MS, elapsedMs));
+}
 /** A session with no firing of its own for this long is IDLE: another session's firing may finish its owed bytes (R19 · D22). */
-const DRAIN_IDLE_MS = 10 * 60_000;
+export const DRAIN_IDLE_MS = 10 * 60_000;
 /** Session records one firing looks at. Examined ones move to the back of the line (their mtime moves), so none starves. */
-const DRAIN_EXAMINE_MAX = 40;
+export const DRAIN_EXAMINE_MAX = 40;
 /** A record whose transcript is gone and that owes nothing is forgotten after this long. */
-const DRAIN_FORGET_MS = 30 * 24 * 3600_000;
-/** Do not START another session with less than this left of the shared deadline: its first request could not finish. */
-const DRAIN_MIN_LEFT_MS = 250;
+export const DRAIN_FORGET_MS = 30 * 24 * 3600_000;
 /**
  * An owed target whose transcript is GONE (Claude Code deletes transcripts ~30 days on) can never be sent: its hold becomes the
  * honest gap now (R19 · D22), and the hold is cleared. Whatever was already delivered is untouched.
  */
-function writeOffOwed(home, record, nowMs) {
+export function writeOffOwed(home, record, nowMs) {
     for (const target of record.targets) {
         const key = { repoKey: target.ledgerKey, sessionId: record.sessionId };
         let session = loadSessionState(home, key);
@@ -887,172 +857,6 @@ function writeOffOwed(home, record, nowMs) {
         }
         saveSessionState(home, key, { ...session, endHold: null, liveAt: session.liveAt });
         void nowMs;
-    }
-}
-/**
- * ⛔ THE IDLE-SESSION DRAIN (R19 · D22 · A). What finishes a session's unsent bytes after its LAST hook.
- *
- * Each hook run can send a few megabytes, and a session whose last hook ran with bytes still behind (a multi-repo session at
- * `SessionEnd`, a repo found late in a long one) has no next hook of its own. So any later `Stop`, `PreCompact` or `SessionEnd`
- * on this machine, AFTER its own session's targets and inside the SAME one deadline, finishes sessions that have had no firing
- * for 10 minutes: oldest first, each under THAT session's writer lock (never waited for: a busy session is skipped), consent
- * re-checked by the resolver, and its discovery continued (≤8 MiB and ≤8 roots per firing, R16), which can add repo targets.
- *
- *   - A session is RETIRED from the drain once its discovery is settled and nothing is behind: it costs a stat and moves to the
- *     back of the line. Discovery stopping never stops a repo target delivering owed bytes.
- *   - A folder decision is exactly R18's (`unknown` stays unknown here; backfill offers it); only an ALREADY-sticky folder target
- *     delivers, and only up to what was scanned.
- *   - An owed target whose transcript is gone becomes a gap then (`writeOffOwed`).
- *
- * ⛔ It spends only the LEFTOVER of the one deadline (`settleStart + sendBudget`): the deliveries below honour the same
- * `deadlineAtMs`, and no new session starts with under `DRAIN_MIN_LEFT_MS` left. Never throws: a hook cannot say anything.
- */
-async function drainIdleSessions(opts) {
-    const { ctx, url, credential, settleStart, sendBudget } = opts;
-    const deadline = settleStart + sendBudget;
-    const candidates = listTargetRecords(ctx.home)
-        .filter(({ record }) => record.sessionId !== opts.currentSessionId)
-        .sort((a, b) => a.mtimeMs - b.mtimeMs)
-        .slice(0, DRAIN_EXAMINE_MAX);
-    for (const { path, record } of candidates) {
-        if (deadline - Date.now() < DRAIN_MIN_LEFT_MS)
-            return;
-        const now = Date.now();
-        if (now - record.firedAt < DRAIN_IDLE_MS)
-            continue;
-        // ⛔ A record the drain cannot act on (no transcript path, a transcript gone, a path confinement refuses) must still MOVE to the
-        // back of the line (C18 #7): the candidates are the oldest records by mtime, and forty of these at the front would otherwise be
-        // re-examined first on every firing and starve a live owed session behind them.
-        const rotate = () => {
-            try {
-                utimesSync(path, new Date(), new Date());
-            }
-            catch {
-                // Ordering only.
-            }
-        };
-        if (record.transcriptPath === null) {
-            rotate();
-            continue;
-        }
-        const transcript = record.transcriptPath;
-        // ⛔ C28: A SESSION OF A DIALECT THAT CANNOT ISOLATE IS NEVER OWED (Cursor; Codex until its own isolation is built). It delivers only
-        // the repo each turn ends in, on that turn's own firing; there is no later firing to finish for it and no discovery to continue, so
-        // the drain neither delivers nor writes off for it. It still moves to the back of the line, and the record is forgotten on the
-        // usual schedule (a session that has not fired for that long is over).
-        if (!dialectIsolates(ctx.home, ctx.env, transcript)) {
-            if (now - record.firedAt > DRAIN_FORGET_MS) {
-                try {
-                    rmSync(path);
-                }
-                catch {
-                    // A record we could not delete is just examined again.
-                }
-            }
-            else {
-                rotate();
-            }
-            continue;
-        }
-        // ⛔ CONFINEMENT, AGAIN (`/cso` finding 1): this path was read from a state file, not handed over by a gated hook input, and it
-        // reaches a read whose result is UPLOADED. A path admitted weeks ago can since have become a symlink out of the agent roots,
-        // and the record is only as trustworthy as the state directory. A file that is not there is not read, so it needs no gate
-        // (the write-off below touches no bytes).
-        if (existsSync(transcript) && !admitsTranscript(ctx.home, ctx.env, transcript)) {
-            rotate();
-            continue;
-        }
-        const size = fileSize(transcript);
-        if (size === null) {
-            // ⛔ THE WRITE-OFF IS A WRITE TO THE SESSION'S LEDGERS, so it takes the session's one writer lock like every other writer
-            // (C18 #6), never waiting: a session a delivery holds right now is skipped and examined on a later firing.
-            const writeOff = await claimSessionWriter(ctx.home, record.sessionId, { staleAfterMs: opts.staleAfterMs, deadlineAtMs: 0, wait });
-            if (writeOff === null) {
-                rotate();
-                continue;
-            }
-            try {
-                writeOffOwed(ctx.home, record, now);
-            }
-            finally {
-                writeOff.release();
-            }
-            if (now - record.firedAt > DRAIN_FORGET_MS) {
-                try {
-                    rmSync(path);
-                }
-                catch {
-                    // A record we could not delete is just examined again.
-                }
-            }
-            else {
-                rotate();
-            }
-            continue;
-        }
-        const live = record.targets.filter((target) => record.stopped[stopKeyOf(target)] === undefined);
-        const subFiles = findSubagentFiles(ctx, transcript);
-        const behind = live.some((target) => {
-            const state = loadSessionState(ctx.home, { repoKey: target.ledgerKey, sessionId: record.sessionId });
-            return (state.endHold !== null ||
-                fileState(state, "main").sentOffset < size ||
-                subFiles.some((file) => fileState(state, file.fileKey).sentOffset < file.size));
-        });
-        if (!behind && record.settled) {
-            // Retired: nothing to send and nothing left to discover. Move it to the back of the line.
-            try {
-                utimesSync(path, new Date(), new Date());
-            }
-            catch {
-                // Ordering only.
-            }
-            continue;
-        }
-        const claim = await claimSessionWriter(ctx.home, record.sessionId, { staleAfterMs: opts.staleAfterMs, deadlineAtMs: 0, wait });
-        // ⛔ C29 (iii): a writer is on it right now: not ours to wait for, but it MOVES to the back of the line like every other record the
-        // drain cannot act on (C18 #7). Left in place, forty busy records at the front would be re-examined first on every firing.
-        if (claim === null) {
-            rotate();
-            continue;
-        }
-        try {
-            const resolution = resolveTargets({
-                home: ctx.home,
-                env: ctx.env,
-                sessionId: record.sessionId,
-                transcriptPath: transcript,
-                turnEndCwd: null,
-                mode: "turn",
-                nowMs: Date.now(),
-                drain: true,
-            });
-            const input = { sessionId: record.sessionId, transcriptPath: transcript, cwd: "", eventName: "Stop" };
-            for (const target of leastRecentlySentFirst(ctx.home, record.sessionId, resolution.targets)) {
-                if (deadline - Date.now() < DRAIN_MIN_LEFT_MS)
-                    break;
-                await deliverTarget({
-                    ctx,
-                    input,
-                    url,
-                    credential,
-                    target,
-                    eof: size,
-                    event: null,
-                    isSessionEnd: false,
-                    settleStart,
-                    sendBudget,
-                    consumedMs: Date.now() - settleStart,
-                    skipSend: false,
-                    owedAtSessionEnd: false,
-                    scanned: scannedOffsets(resolution.record.scan),
-                    record: resolution.record,
-                });
-                pruneDeliveredEndHold(ctx.home, { repoKey: target.ledgerKey, sessionId: record.sessionId });
-            }
-        }
-        finally {
-            claim.release();
-        }
     }
 }
 /**
@@ -1104,7 +908,13 @@ export async function deliverSubagents(opts) {
         ...announcedSubagentFiles(ctx, input),
     ];
     const cap = opts.sizeCap;
-    const files = cap === undefined ? discovered : discovered.map((f) => ({ ...f, size: Math.min(f.size, cap[f.fileKey] ?? 0) }));
+    const fireCap = opts.firingCap;
+    const files = cap === undefined && fireCap === undefined
+        ? discovered
+        : discovered.map((f) => ({
+            ...f,
+            size: Math.min(f.size, cap === undefined ? f.size : (cap[f.fileKey] ?? 0), fireCap === undefined ? f.size : (fireCap[f.fileKey] ?? 0)),
+        }));
     if (files.length === 0)
         return { files, held: false, deliveries: [] };
     // ⚠ SKIP WHAT HAS NOTHING PENDING, BEFORE THE CAP APPLIES — and this is not an
@@ -1125,9 +935,13 @@ export async function deliverSubagents(opts) {
         return { files, held: false, deliveries: [] };
     let held = false;
     const deliveries = [];
-    for (const file of pending.slice(0, MAX_SUBAGENT_FILES)) {
+    let pauseNextMs = opts.unboundedTimeoutMs === undefined ? null : (opts.pauseFirstMs ?? null);
+    for (const file of opts.unboundedTimeoutMs === undefined ? pending.slice(0, MAX_SUBAGENT_FILES) : pending) {
+        if (pauseNextMs !== null)
+            await wait(pauseNextMs);
+        const requestStartedAt = Date.now();
         const consumedMs = Date.now() - startedAt;
-        if (sendBudget - consumedMs < MIN_SUBAGENT_BUDGET_MS)
+        if (opts.unboundedTimeoutMs === undefined && sendBudget - consumedMs < MIN_SUBAGENT_BUDGET_MS)
             break;
         if (opts.heartbeat !== undefined && !opts.heartbeat())
             break;
@@ -1145,12 +959,14 @@ export async function deliverSubagents(opts) {
             // that contains IT is what names its producer.
             transcriptPath: file.path,
             // The remainder, MEASURED. This is what keeps N files inside one budget.
-            timeoutMs: sendTimeoutMs(sendBudget, consumedMs),
+            timeoutMs: opts.unboundedTimeoutMs ?? sendTimeoutMs(sendBudget, consumedMs),
             // PR 4a: the same origin `consumedMs` is measured from (`startedAt` is the main delivery's `settleStart`).
-            deadlineAtMs: startedAt + sendBudget,
+            ...(opts.unboundedTimeoutMs === undefined ? { deadlineAtMs: startedAt + sendBudget } : {}),
             nowMs: Date.now(),
             byHook,
+            ...(opts.liveAtMs === undefined ? {} : { liveAtMs: opts.liveAtMs }),
             ...(opts.heartbeat === undefined ? {} : { beforeRequest: opts.heartbeat }),
+            ...(opts.unboundedTimeoutMs === undefined ? {} : { oneDelta: true }),
         }, file.size, 
         // The SAME reader as the main transcript, so `CR-024d`'s redaction and
         // `/cso` finding 1's confinement both apply. A delegated agent reading a
@@ -1159,6 +975,7 @@ export async function deliverSubagents(opts) {
         deliveries.push(delivery);
         if (endedHeld(delivery))
             held = true;
+        pauseNextMs = opts.unboundedTimeoutMs !== undefined && delivery.kind === "attempted" ? unboundedPaceMs(Date.now() - requestStartedAt) : null;
     }
     return { files, held, deliveries };
 }
@@ -1236,8 +1053,17 @@ function endedHeld(delivery) {
  */
 function stampGaps(ctx, input, projectKey, files, 
 /** A delivery in THIS invocation ended held — see `endedHeld`. */
-heldThisInvocation, nowMs) {
+heldThisInvocation, nowMs, 
+/**
+ * ⛔ U6b (F1): the time a REPLAY is for (`firing.at`). A worker replays a SessionEnd hours late after an outage or a backlog, and `Date.now()` there
+ * stamped an ended session LIVE now (`liveAt`) and ended now (`endedAt`), so a human's commit (no env session id) became `sole_live_session` for
+ * a session that ended hours ago, and every `later` retry re-stamped it. A replay stamps the hook's time: `endedAt = at`, `liveAt = max(stored, at)`.
+ * Absent for an inline caller, which IS now.
+ */
+replayAt) {
     const key = { repoKey: projectKey, sessionId: input.sessionId };
+    const at = replayAt ?? nowMs;
+    const liveAtOf = (stored) => (replayAt === undefined ? nowMs : Math.max(stored ?? 0, replayAt));
     const owed = {};
     // Re-read per file rather than once: each `deliver()` above saved, so a
     // snapshot taken before the loop would stamp gaps over work that succeeded.
@@ -1256,19 +1082,19 @@ heldThisInvocation, nowMs) {
             continue;
         }
         // D95's case, unchanged: the server was answering and the BUDGET ran out.
-        saveSessionState(ctx.home, key, { ...withFileState(session, file.fileKey, markSkipped(current, current.sentOffset, file.size)), liveAt: nowMs });
+        saveSessionState(ctx.home, key, { ...withFileState(session, file.fileKey, markSkipped(current, current.sentOffset, file.size)), liveAt: liveAtOf(session.liveAt) });
     }
     // The positive record. Written when there is a hold to state OR an old one to
     // clear — a `SessionEnd` that owes nothing must not leave a previous one's
     // claim standing, and one that never held anything need not touch the file.
     const session = loadSessionState(ctx.home, key);
-    const endHold = Object.keys(owed).length > 0 ? { at: nowMs, eof: owed } : null;
+    const endHold = Object.keys(owed).length > 0 ? { at, eof: owed } : null;
     // ⭐ `TODOS[146]`: also record THAT the session ended, so `status` can tell a turn that is open because the
     // session is live from one that is open because it is over. Only for a session that has done something
     // (`seq > 0`): a SessionEnd for a session that never delivered must not mint a state file, which would
     // make it "live" to the attribution ladder.
     if (endHold !== null || session.endHold !== null || session.seq > 0) {
-        saveSessionState(ctx.home, key, { ...session, endHold, endedAt: nowMs, liveAt: nowMs });
+        saveSessionState(ctx.home, key, { ...session, endHold, endedAt: at, liveAt: liveAtOf(session.liveAt) });
     }
 }
 /**
@@ -1290,7 +1116,7 @@ heldThisInvocation, nowMs) {
  * A missing or unreadable directory is simply "no sub-agents" — silent, per the
  * hook contract.
  */
-function findSubagentFiles(ctx, transcriptPath) {
+export function findSubagentFiles(ctx, transcriptPath) {
     // ⛔ THE ONE COPY lives in `session_targets.ts` (`findSubagentTranscripts`), shared with the evidence reader so discovery and
     // delivery can never disagree about which files are a session's. Every rule above this line (the dialect's mechanism, the root
     // that selects it, `agent-*.jsonl` and never `agent-*`, confinement of every entry) is enforced there.

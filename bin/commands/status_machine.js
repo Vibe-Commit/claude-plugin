@@ -25,6 +25,7 @@ import { machineCapture, machineSummary, refusedFoldersNow, undecidedNow } from 
 import { isLocalSlug, normalizeSlug, ownerOfSlug } from "../consent.js";
 import { listOrgPending } from "../org_pending.js";
 import { lastSendOnMachine } from "../state.js";
+import { uploaderJson, uploaderRows, uploaderView } from "../uploader_view.js";
 import { LABEL_GUTTER, WRAP_COLUMNS, glyph, labelled, paint, tildePath, truncatePath, wrap } from "../term.js";
 import { writeFailure, writeLines } from "./context.js";
 import { readAccountView } from "../grants_verb.js";
@@ -152,6 +153,7 @@ export function machineStatus(ctx, argv, sync = { kind: "skipped" }) {
     const load = loadCredential({ env: ctx.env, home: ctx.home });
     const last = lastSendOnMachine(ctx.home);
     const nowMs = ctx.now().getTime();
+    const upload = uploaderView(ctx.home, ctx.env, nowMs);
     if (argv.includes("--json")) {
         if (load.kind !== "ok" && load.kind !== "absent") {
             writeFailure(ctx, credentialProblemBlock(load, authCommandFor(ctx.env, ctx.selfPath)), "status");
@@ -174,6 +176,8 @@ export function machineStatus(ctx, argv, sync = { kind: "skipped" }) {
             // named). A machine key for the release paragraph; it does not change the exit code.
             org_pending: waiting,
             grants_unreadable: capture.kind === "unreadable",
+            // U7 (plan §3.8): the background uploader. ⛔ A contract change, recorded in `json-read-verbs.test.ts`.
+            uploader: uploaderJson(upload),
             // Slice 2 (S4): the last synced account state (`null` before the first sync); what it grants that this machine has not
             // named (an owner as `owner/`); the changes queued for it; and how many of those the server refused in this run.
             account: view === null || view.account === null
@@ -226,6 +230,7 @@ export function machineStatus(ctx, argv, sync = { kind: "skipped" }) {
         lines.push(...accountRows(ctx, view));
     if (last !== null)
         lines.push(labelled(ROW_INDENT, STATUS.lastSuccessLabel, relativeAge(last.at, nowMs)));
+    lines.push(...uploaderRows(upload, nowMs, ROW_INDENT));
     lines.push(labelled(ROW_INDENT, STATUS.dashboardLabel, paint(ctx.colour, "accent", URLS.dashboard)));
     // Codex runs no user-level hook until the user trusts it. Said, never detected (VQ + Alexander, 2026-10-24).
     if (capture.kind === "on")

@@ -126,9 +126,13 @@ export function observe(ctx) {
         // process that has exited and the mtimes have all moved on — the rung
         // could not be re-derived from anything then, only re-guessed.
         attribution: active.attribution,
-        // `TODOS[176]` — the pending sidecar only: OUR wall clock at observation, the clock the promotion bound compares
-        // with the start of the turn being delivered (the first unsent prompt-like transcript record). Not the committer time above, which is settable.
-        ...(active.attribution === "env_session_uncorroborated" ? { observedAt: Date.now() } : {}),
+        // `TODOS[176]` — OUR wall clock at observation, the clock the promotion bound compares with the start of the turn being
+        // delivered (the first unsent prompt-like transcript record). Not the committer time above, which is settable.
+        //
+        // U2: on EVERY line now, not the pending sidecar only. The upload worker replays a firing as of the moment its hook ran, and
+        // the commits that delivery may carry are exactly those observed at or before it (`observedAt <= firing.at`): a commit made in
+        // the next turn must ride the next delivery. A line without it (an older client) counts as old and is carried at once.
+        observedAt: ctx.nowMs ?? Date.now(),
     });
     // ⭐ `TODOS[177]` — A SQUASH BY `reset --soft` FIRES NO `post-rewrite`, so the pairs are INFERRED here, from the reflog + ancestry +
     // tree + patch-id (see `inferred_squash.ts`; all five conditions or nothing). They go to the session's INFERRED spool — a file of their

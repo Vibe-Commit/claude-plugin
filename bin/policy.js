@@ -231,6 +231,13 @@ export function pendingBytes(state) {
         return 0;
     return state.backlog[state.backlog.length - 1].to - state.backlog[0].from;
 }
+export function replayDecision(sentOffset, firingEof, realSize) {
+    if (realSize < sentOffset)
+        return { kind: "deliver", eof: realSize };
+    if (firingEof <= sentOffset)
+        return { kind: "noop" };
+    return { kind: "deliver", eof: Math.min(firingEof, realSize) };
+}
 /**
  * The span the next attempt should carry: everything from the offset to `eof`.
  *

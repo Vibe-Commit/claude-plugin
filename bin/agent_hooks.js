@@ -244,7 +244,7 @@ binaryExists = () => true) {
  *   2. **Its command is ours** — see `commandIsOurs`.
  *
  * ⚠ **THE FAILURE DIRECTION IS DELIBERATE.** A false "not ours" costs one
- * duplicate entry, which `claimFiring` (`CR-195`/U4a) already turns into a
+ * duplicate entry, which the worker's no-op replay of a duplicate firing (U6) already turns into a
  * single capture. A false "ours" overwrites a user's hook — the one outcome this
  * module exists to make impossible. Every doubt resolves to "not ours".
  */
@@ -318,7 +318,7 @@ export function hasRegistration(raw, shape, registration, binaryExists = existsS
  * dir) is exactly that: Gate A repointed a machine's working capture at a
  * directory about to be deleted, after which every hook fails quietly and
  * capture stops. Without this arm the same run appends a second entry and the
- * working one keeps firing (`claimFiring` makes it one capture). So: a moved
+ * working one keeps firing (a duplicate firing replays as a no-op, so it is one capture). So: a moved
  * path is claimed only when the binary it names is GONE — the reinstall this
  * arm exists for (an uninstalled prefix, a removed nvm version) — and a live
  * one is left alone. ⚠ Cost, accepted: two live installs leave two entries

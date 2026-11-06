@@ -233,6 +233,38 @@ export const STATUS = {
      * changed them to match the screen rather than changing the screen.
      */
     repoLabel: "repo",
+    /**
+     * U7 (plan §3.8): the background uploader's row, machine-wide, under `last sent`. COMPUTED from the firing logs against the ledgers and from the
+     * worker's lock, never from the worker's own say-so, so a dead worker with bytes behind is "not running", never "up to date".
+     */
+    uploadLabel: "upload",
+    uploadValue: (view) => {
+        const size = view.bytes < 1024 ? `${view.bytes} ${view.bytes === 1 ? "byte" : "bytes"}` : view.bytes < 1048576 ? `${(view.bytes / 1024).toFixed(1)} KiB` : `${(view.bytes / 1048576).toFixed(1)} MiB`;
+        // "Behind" is RECORDED turns not yet sent (firings the hooks wrote that no worker has consumed): not the idle-drain backlog of sessions with no
+        // unconsumed firing, which this row does not count, and it includes firings of another server or credential.
+        const behind = `${view.sessions} ${view.sessions === 1 ? "session" : "sessions"} with unsent turns, ${size}`;
+        const ack = view.ackAge === null ? "nothing acknowledged yet" : `last acknowledged ${view.ackAge}`;
+        const why = view.problem === "no_answer"
+            ? "the server did not answer"
+            : view.problem === "credential"
+                ? "the server did not accept this machine's credential"
+                : view.problem === "error"
+                    ? "it stopped on an error"
+                    : null;
+        const attempt = view.attemptAge === null || why === null ? null : `last attempt ${view.attemptAge}: ${why}`;
+        switch (view.state) {
+            case "up_to_date":
+                return view.ackAge === null ? "up to date" : `up to date · ${ack}`;
+            case "sending":
+                return `sending · ${behind} · ${ack}`;
+            case "waiting_to_retry":
+                return `waiting to retry · ${behind} · ${attempt ?? ack}`;
+            case "not_running":
+                return `not running · ${behind} · ${attempt ?? ack}`;
+        }
+    },
+    /** The line under a "not running" row. */
+    uploadNotRunning: "It retries on your next agent turn.",
     /** 0.7.0, D6 · 2A: why this repo is on. One row under `repo`, only inside a repo that is on. */
     basisLabel: "basis",
     basisOwner: (owner) => `owner grant ${owner}/`,
@@ -522,18 +554,17 @@ export const CONNECT = {
     /**
      * ⚠ THE NUMBER AND ITS QUALIFIER ARE ONE UNIT.
      *
-     * **12 is `CR-042`'s counted figure** (merged, `6d8ec68`), taken rather than
-     * recounted: the patterns live in `vibecommit-mcp/src/scrubber/patterns.ts`,
-     * which is closed source and another chain's repo. `CR-042` exists precisely
-     * because the draft said 10 — a number is a claim, and this one is counted
-     * from code.
+     * **13 is the server's counted figure since mcp #174** (a PEM `private_key` pattern joined the twelve `CR-042` counted, merged `6d8ec68`,
+     * so the earlier text said 12). Taken rather than recounted: the patterns live in `vibecommit-mcp/src/scrubber/patterns.ts`, which is closed
+     * source and another chain's repo. `CR-042` exists precisely because the draft said 10 — a number is a claim, and this one is counted from
+     * code. Alexander's OK for the change: 2026-11-06 04:35Z (relayed by P1); the web copy (`disclosure.ts`, digest-pinned) changes in lockstep.
      *
      * The qualifier is as load-bearing as the number. Without *"it is a pattern
      * list, not a general secret detector"* and *"a secret it has no pattern for
      * is uploaded"*, the count reads as PROTECTION — which is the reassurance D65
      * §DR7 bans, arriving as arithmetic instead of as an adjective.
      */
-    consentScrubber: "A scrubber removes 12 known secret formats (AWS keys, GitHub tokens, and similar). It is a pattern list, not a general secret detector: a secret it has no pattern for is uploaded. Command output is not path-filtered.",
+    consentScrubber: "A scrubber removes 13 known secret formats (AWS keys, GitHub tokens, and similar). It is a pattern list, not a general secret detector: a secret it has no pattern for is uploaded. Command output is not path-filtered.",
     /**
      * ⛔ **THE SECOND DATA CLASS, AND THE DISCLOSURE DID NOT MENTION IT AT ALL —
      * `T15`, `D190`.**
@@ -559,7 +590,7 @@ export const CONNECT = {
      * rightly: `post_commit.ts` gathered the list and it stayed in the spool. From 0.10.0 `capSpool` also returns `files` and the
      * delta that carries `x-commits` carries the list too, for a GRANTED REPOSITORY only (never a folder). The paths are git's own
      * (`git diff-tree -z --name-only`), unchanged, and the transcript scrubber does not run on them, which the sentence says
-     * because "a scrubber removes 12 known secret formats" two paragraphs up would otherwise read as covering them. **Not
+     * because "a scrubber removes 13 known secret formats" two paragraphs up would otherwise read as covering them. **Not
      * describing the paths as uploaded would now be the FALSE DISCLOSURE, which is as much a claims defect as describing what
      * does not leave.** The committer DATE still stays local.
      *
@@ -1066,6 +1097,8 @@ export const BACKFILL = {
     parentLabel: "outside a repository",
     parentTouchedNothing: "touched nothing you chose",
     parentBusy: "another process was writing it",
+    /** U5b: an earlier turn of the session was recorded but could not be sent yet, so the session is not closed over it. */
+    replayStopped: "an earlier turn could not be sent yet",
     parentFolderRefused: "the folder's repository belongs to someone else",
     /** Skip reasons. */
     overSize: "over 50 MiB",

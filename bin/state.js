@@ -35,12 +35,14 @@
  * resync — so this is left unlocked rather than paying for a lockfile on the
  * hook's wall-clock budget.
  */
-import { chmodSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { writeFileAtomic } from "./atomic_write.js";
+import { liveAtOf } from "./firing.js";
 import { pendingFileExpired } from "./pending_prune.js";
 import { repoSessionsDir, sessionStatePath, stateDir } from "./paths.js";
 import { EMPTY_FILE_STATE } from "./policy.js";
-import { SESSION_LIVE_WINDOW_MS, WIRE_RUNGS, noteRepoKey, readInferred, readRewrites, readSpool } from "./spool.js";
+import { MAX_PENDING_SHAS, SESSION_LIVE_WINDOW_MS, WIRE_RUNGS, noteRepoKey, readInferred, readRewrites, readSpool, wellFormedCommitLines } from "./spool.js";
 export const EMPTY_SESSION_STATE = {
     seq: 0,
     stop: null,
@@ -283,12 +285,12 @@ function oldestUnclaimedAt(fs, claimedEof) {
  * function. Returns which BUCKET (not a bare boolean) so a caller naming commits inside the
  * `liveStuck`/`heldIdle` sentence never attributes the same session's lines to both.
  */
-function classifyMainStuck(session, nowMs, windowMs) {
+function classifyMainStuck(session, nowMs, windowMs, liveAt = session.liveAt) {
     const fs = fileState(session, "main");
     const claimedEof = session.endHold?.eof.main;
     if (unclaimedPendingBytes(fs, claimedEof) === 0)
         return null;
-    const live = session.liveAt !== null && nowMs - session.liveAt <= windowMs;
+    const live = liveAt !== null && nowMs - liveAt <= windowMs;
     if (!live)
         return "idle"; // no age bound — no hook is coming soon to retry.
     const oldest = oldestUnclaimedAt(fs, claimedEof);
@@ -331,7 +333,8 @@ export function stuckForRepo(home, repoKey, nowMs = Date.now(), windowMs = SESSI
             continue;
         const sessionId = entry.slice(0, -".json".length);
         const session = readStateAt(join(dir, entry));
-        const live = session.liveAt !== null && nowMs - session.liveAt <= windowMs;
+        const liveAt = liveAtOf(session.liveAt, join(dir, `${sessionId}.live`)); // U3: the one liveness reader
+        const live = liveAt !== null && nowMs - liveAt <= windowMs;
         let sessionBytes = 0;
         let oldestAcrossFiles = null;
         for (const [fileKey, fs] of Object.entries(session.files)) {
@@ -404,9 +407,9 @@ function commitLinesFor(dir, stem, nowMs) {
             // `TODOS[175]`: an EXPIRED pending file (older than 7 days, nobody can claim it) is not "waiting"; spool lines always are.
             if (suffix === ".pending.jsonl" && pendingFileExpired(join(dir, `${stem}${suffix}`), nowMs))
                 continue;
-            n += readFileSync(join(dir, `${stem}${suffix}`), "utf8")
-                .split("\n")
-                .filter((l) => l.trim() !== "").length;
+            // U2: WELL-FORMED lines, the unit a drop's `count` is in, and a pending file is capped as `readPending` caps it. A lone torn line
+            // is not "a commit waiting".
+            n += wellFormedCommitLines(readFileSync(join(dir, `${stem}${suffix}`), "utf8"), suffix === ".pending.jsonl" ? MAX_PENDING_SHAS : Infinity);
         }
         catch {
             /* no file: nothing waiting */
@@ -483,7 +486,7 @@ export function commitsWaitingForRepo(home, repoKey, nowMs = Date.now()) {
         try {
             if (entry.endsWith(".pending.jsonl") && pendingFileExpired(join(dir, entry), nowMs))
                 continue; // `TODOS[175]`
-            n += readFileSync(join(dir, entry), "utf8").split("\n").filter((l) => l.trim() !== "").length;
+            n += wellFormedCommitLines(readFileSync(join(dir, entry), "utf8"), entry.endsWith(".pending.jsonl") ? MAX_PENDING_SHAS : Infinity); // U2: well-formed, capped as `readPending` caps
         }
         catch {
             /* a vanished file holds nothing */
@@ -532,13 +535,14 @@ export function stuckSpoolLinesForRepo(home, repoKey, nowMs = Date.now(), window
         const session = readStateAt(join(dir, `${stem}.json`));
         if (entry.endsWith(".spool.jsonl") && fileState(session, "main").lean)
             continue;
-        const cls = classifyMainStuck(session, nowMs, windowMs);
+        // U3: liveness is the later of the state file's `liveAt` and the hook's `.live` stamp (`firing.ts`'s one reader).
+        const cls = classifyMainStuck(session, nowMs, windowMs, liveAtOf(session.liveAt, join(dir, `${stem}.live`)));
         if (cls === null)
             continue;
         try {
             if (entry.endsWith(".pending.jsonl") && pendingFileExpired(join(dir, entry), nowMs))
                 continue;
-            const lines = readFileSync(join(dir, entry), "utf8").split("\n").filter((l) => l.trim() !== "").length;
+            const lines = wellFormedCommitLines(readFileSync(join(dir, entry), "utf8"), entry.endsWith(".pending.jsonl") ? MAX_PENDING_SHAS : Infinity); // U2: the same count as `commitsWaitingForRepo`, which this must stay a subset of
             if (cls === "live")
                 liveCommits += lines;
             else
@@ -710,9 +714,12 @@ export function saveSessionState(home, key, next) {
         return false;
     try {
         mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-        writeFileSync(path, `${JSON.stringify(next)}\n`, { mode: 0o600 });
-        // `writeFileSync`'s `mode` is ignored when the file already exists.
-        chmodSync(path, 0o600);
+        // ⛔ ATOMIC (U1): a temp file in the SAME directory, then `rename`. This file is rewritten at least TWICE per request now (`seq`
+        // ahead of the send, then the outcome), and a process killed inside an in-place `writeFileSync` leaves a truncated or empty
+        // file, which `readStateAt` reads as the EMPTY state: `seq` 1 at offset 0, a resync of the whole session. Rename leaves the
+        // old file or the new one, never half. The temp name ends `.tmp`, so no `*.json` reader (`lastReceiptForRepo`, the liveness
+        // scan) takes a leftover for a session.
+        writeFileAtomic(path, `${JSON.stringify(next)}\n`, 0o600);
         // A ledger now exists for this digest: leave the note that maps it back to a work tree, so a later firing that finds this
         // session's ledger by digest alone (any-folder capture, R5) can name the repo it belongs to. One stat when it is there.
         noteRepoKey(home, key.repoKey);

@@ -106,7 +106,7 @@ export function scanTranscriptKeys(path, from, to, spec, options = {}) {
         const stat = fstatSync(fd);
         if (!stat.isFile())
             return { kind: "unreadable" };
-        const size = stat.size;
+        const size = options.maxEnd === undefined ? stat.size : Math.min(stat.size, Math.max(0, options.maxEnd));
         const needles = needlesOf(spec, options.first === true);
         const seen = new Set();
         const hits = [];
@@ -2197,7 +2197,12 @@ export function resolveTargets(ctx) {
             throw new LockLostError();
         const prior = scan[stream.fileKey];
         const from = prior === undefined ? 0 : prior.offset;
+        // U4: a replay of an OLDER firing finds the main stream already scanned past its `eof`. Nothing to read, and not a replaced file.
+        const limit = stream.fileKey === "main" ? ctx.scanLimit : undefined;
+        if (limit !== undefined && prior !== undefined && prior.offset >= limit)
+            continue;
         const result = scanTranscriptKeys(stream.path, from, from + window, spec, {
+            ...(limit === undefined ? {} : { maxEnd: limit }),
             includeUnterminatedTail: finalTail,
             maxLineBytes: ctx.seams?.maxLineBytes,
             maxDistinctHits: ctx.seams?.maxDistinctHits,
