@@ -11,6 +11,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import { claudeConfigPath, claudeSettingsPath, isInside, isTranscriptFile, transcriptRoot, } from "../paths.js";
 import { readEntries, sessionFile, subdirectories } from "./session_listing.js";
+import { SEAL_GROWTH_MAX_BYTES } from "./types.js";
 /**
  * The client-side backstop, per event.
  *
@@ -210,6 +211,36 @@ function recordedProjectPaths(home, env) {
     }
 }
 /**
+ * Last-turn seal (D2 · D7 · SC-2 · C3): allow a seal only when what arrived after the `SessionEnd` hook is trailing METADATA. Measured on 2.1.318: a
+ * 581-byte `cost-state` lands after the hook on `/clear`; a resume's first conversational record is a prompt. So: at most `SEAL_GROWTH_MAX_BYTES`, every
+ * line complete (ends in a newline) and valid JSON with a string `type`, and no record whose `type` is `user` or `assistant`. A malformed line, a
+ * record with no clear type, an empty line and a partial last line all mean NO seal; zero growth is the common case and allows it.
+ */
+function claudeGrowthAllowsSeal(growth) {
+    if (growth.length === 0)
+        return true;
+    if (growth.length > SEAL_GROWTH_MAX_BYTES)
+        return false;
+    const text = growth.toString("utf8");
+    if (!text.endsWith("\n"))
+        return false;
+    for (const line of text.slice(0, -1).split("\n")) {
+        let record;
+        try {
+            record = JSON.parse(line);
+        }
+        catch {
+            return false;
+        }
+        if (typeof record !== "object" || record === null || Array.isArray(record))
+            return false;
+        const type = record.type;
+        if (typeof type !== "string" || type === "user" || type === "assistant")
+            return false;
+    }
+    return true;
+}
+/**
  * Claude Code's sessions, by folder — `D11 · A`, `scan`.
  *
  * `<root>/<encoded path>/<session-id>.jsonl`. Only the files DIRECTLY in a
@@ -312,6 +343,7 @@ export const CLAUDE_CODE = {
     // "Multi-repo" is `Target.multi`: the session named a work tree other than the target's (see `resolveTargets`). A record that carries a folder is
     // decided by that folder (R17). What stays is stated in the README.
     isolatesContentRecords: true,
+    growthAllowsSeal: claudeGrowthAllowsSeal,
     sessionIdFromEnv: claudeSessionIdFromEnv,
     sessionSource: claudeSessionSource,
     locateCurrentTranscript,

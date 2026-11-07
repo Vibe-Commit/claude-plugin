@@ -78,4 +78,6 @@ export const UNKNOWN_AGENT_ID = "unknown";
  *   SessionStart   SessionStart   SessionStart   sessionStart    NEVER
  */
 export const HOOK_EVENTS = ["Stop", "PreCompact", "SessionEnd", "SessionStart"];
+/** The most growth after a `SessionEnd` hook that `growthAllowsSeal` may allow. More than this is a conversation, not a trailing metadata record. */
+export const SEAL_GROWTH_MAX_BYTES = 4096;
 //# sourceMappingURL=types.js.map

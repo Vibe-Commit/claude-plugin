@@ -329,4 +329,9 @@ export function enforceCaps(state, nowMs, caps) {
     }
     return { sentOffset, backlog, gapBytes, gapCount, lastSentAt: state.lastSentAt, lean: state.lean };
 }
+/**
+ * A session with no firing of its own for this long is IDLE: another session's firing may finish its owed bytes (R19 · D22), the drain may seal an ended one
+ * (R8), and `status` does not raise an alarm about a session that ended more recently than this (C2). It lives here, a leaf, because `state.ts` reads it too.
+ */
+export const DRAIN_IDLE_MS = 10 * 60_000;
 //# sourceMappingURL=policy.js.map

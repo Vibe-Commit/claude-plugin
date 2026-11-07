@@ -26,17 +26,19 @@
  * ## ⛔ A drain delivery is not a hook's: it stamps NO liveness (`byHook: false`, no `liveAtMs`). The old hook drain stamped "now" on
  * every idle session it touched, which kept a finished session live for a window it did not earn; that was a defect and is not carried.
  */
-import { existsSync, rmSync, utimesSync } from "node:fs";
-import { admitsTranscript } from "./agents/registry.js";
+import { existsSync, rmSync, statSync, utimesSync } from "node:fs";
+import { admitsTranscript, canonicalHookEvent, dialectFor } from "./agents/registry.js";
 import { loadCredential } from "./credential.js";
 import { forgetFirings, readCursor, readFirings } from "./firing.js";
 import { CAPTURE_NOT_APPROVED } from "./post.js";
-import { DRAIN_EXAMINE_MAX, DRAIN_FORGET_MS, DRAIN_IDLE_MS, deliverFiring, fileSize, findSubagentFiles, wait, writeOffOwed, } from "./hooks/entry.js";
+import { DRAIN_EXAMINE_MAX, DRAIN_FORGET_MS, deliverFiring, fileSize, findSubagentFiles, wait, writeOffOwed, } from "./hooks/entry.js";
 import { claimSessionWriter } from "./hooks/fire_lock.js";
+import { DRAIN_IDLE_MS } from "./policy.js";
+import { SESSION_END_EVENT } from "./hooks/session_end.js";
 import { sessionFileStem } from "./paths.js";
-import { REQUEST_TIMEOUT_MS, SESSION_BEAT_MS, SESSION_LOCK_STALE_MS } from "./replay.js";
+import { REQUEST_TIMEOUT_MS, SESSION_BEAT_MS, SESSION_LOCK_STALE_MS, closeForSeal, sealGuardAllows, sealOutcome } from "./replay.js";
 import { dialectIsolates, listTargetRecords, resolveTargets, stopKeyOf, LockLostError } from "./session_targets.js";
-import { fileState, loadSessionState, pruneDeliveredEndHold } from "./state.js";
+import { fileState, loadSessionState, pruneDeliveredEndHold, sealIsCurrent } from "./state.js";
 /** Bytes the drain may send in one worker's life (plan §3.9). */
 export const DRAIN_CAP_BYTES = 64 * 1024 * 1024;
 /** Total bytes acknowledged across a session's ledgers: the measure of what a step moved. */
@@ -63,6 +65,35 @@ function ours(cfg, sessionId) {
         return last.id === cfg.identity;
     const token = cfg.env.VIBECOMMIT_TOKEN?.trim() ?? "";
     return token === "";
+}
+/**
+ * R8 · THE DRAIN SEAL'S PRECONDITIONS. A session the worker's own seal missed: it ended (the LAST firing is a `SessionEnd`, so no resume is known to the log),
+ * every live target is not yet sealed by the `state.ts` comparison (no receipt at or after the last delivery), the transcript has been quiet for
+ * `DRAIN_IDLE_MS`, and the TRANSCRIPT's dialect says what grew since that firing is not a conversation (`growthAllowsSeal`). A session whose last firing is a
+ * `Stop` is NOT sealed here, however long it has been idle: that is the rejected "idle seal" (D2), which would split the turn of a live session that wakes.
+ * Pure but for reads. `null` when any condition fails: the drain does what it always did.
+ */
+function sealCandidate(cfg, record, transcript, size, live, nowMs) {
+    const last = readFirings(cfg.home, sessionFileStem(record.sessionId), 0).firings.at(-1)?.firing;
+    if (last === undefined || last.id !== cfg.identity || last.transcript !== transcript)
+        return null;
+    if (canonicalHookEvent(dialectFor(last.agent), last.event) !== SESSION_END_EVENT)
+        return null;
+    let modifiedAt;
+    try {
+        modifiedAt = statSync(transcript).mtimeMs;
+    }
+    catch {
+        return null;
+    }
+    if (nowMs - modifiedAt < DRAIN_IDLE_MS)
+        return null;
+    const owed = live.some((target) => !sealIsCurrent(loadSessionState(cfg.home, { repoKey: target.ledgerKey, sessionId: record.sessionId })));
+    if (!owed)
+        return null;
+    if (!sealGuardAllows(cfg, transcript, last.eof, size))
+        return null;
+    return { at: last.at, agent: last.agent };
 }
 export async function drainIdleStep(cfg, state, nowMs = Date.now) {
     if (state.bytes >= DRAIN_CAP_BYTES)
@@ -145,7 +176,9 @@ export async function drainIdleStep(cfg, state, nowMs = Date.now) {
                 fileState(ledger, "main").sentOffset < size ||
                 subFiles.some((file) => fileState(ledger, file.fileKey).sentOffset < file.size));
         });
-        if (!behind && record.settled) {
+        // R8: an ended session the worker's seal missed is sealed here, even when nothing is behind.
+        const sealing = sealCandidate(cfg, record, transcript, size, live, now);
+        if (!behind && record.settled && sealing === null) {
             rotate();
             continue;
         }
@@ -189,6 +222,57 @@ export async function drainIdleStep(cfg, state, nowMs = Date.now) {
             const input = { sessionId: record.sessionId, transcriptPath: transcript, cwd: "", eventName: "Stop" };
             const subs = findSubagentFiles(ctx, transcript);
             const before = sentBytes(cfg, resolution.targets, record.sessionId, subs);
+            if (sealing !== null) {
+                // `closeSession(seal)` IN PLACE OF `deliverFiring`: the `final` rides the delivery that clears any debt (bytes behind, a repo approved after the session
+                // ended, a `never` or thrown skip), sub-agent streams first, the commits pinned to the end firing's time. The resolver ran first, so a withdrawn grant
+                // made no request. A step is one session; the rest of the line waits for the next step.
+                let unacknowledged = false;
+                let requested = false;
+                for (const target of resolution.targets) {
+                    const closed = await closeForSeal({
+                        cfg,
+                        target,
+                        resolution,
+                        sessionId: record.sessionId,
+                        transcript,
+                        size,
+                        at: sealing.at,
+                        cwd: "",
+                        agent: sealing.agent,
+                        credential: load.credential,
+                        allowNeverCaptured: true,
+                        heartbeat,
+                    });
+                    if (closed.kind === "unacknowledged") {
+                        unacknowledged = true;
+                        requested = true;
+                        continue;
+                    }
+                    const o = sealOutcome(closed);
+                    if (o === null)
+                        continue;
+                    if (o.kind === "sealed") {
+                        requested = true;
+                        continue;
+                    }
+                    if (o.kind === "fatal")
+                        return { kind: "fatal", elapsedMs: nowMs() - startedAt };
+                    if (o.kind === "lost")
+                        break;
+                    // later, or a read/write failure: to the back of the line, retried on the worker's backoff.
+                    rotate();
+                    return { kind: "later", session: record.sessionId, elapsedMs: nowMs() - startedAt, ...(o.kind === "later" && o.retryAfterMs !== undefined ? { retryAfterMs: o.retryAfterMs } : {}) };
+                }
+                const movedBySeal = Math.max(0, sentBytes(cfg, resolution.targets, record.sessionId, subs) - before);
+                state.bytes += movedBySeal;
+                // A15: always to the back. A server that does not acknowledge leaves the condition true for ever; the worker backs the drain off, so it does not spin.
+                rotate();
+                if (unacknowledged)
+                    return { kind: "held", session: record.sessionId, elapsedMs: nowMs() - startedAt };
+                if (requested)
+                    return { kind: "delivered", bytes: movedBySeal, elapsedMs: nowMs() - startedAt };
+                continue;
+            }
             const results = await deliverFiring({
                 ctx,
                 input,
@@ -199,6 +283,8 @@ export async function drainIdleStep(cfg, state, nowMs = Date.now) {
                 event: null,
                 isSessionEnd: false,
                 pace: { kind: "unbounded", timeoutMs: cfg.requestTimeoutMs ?? REQUEST_TIMEOUT_MS },
+                // R9: a drain delivery leaves the end mark standing: it proves nothing about whether the session ended, and `status` must keep naming one the seal could not close.
+                keepEndMark: true,
                 heartbeat,
             });
             for (const target of resolution.targets)

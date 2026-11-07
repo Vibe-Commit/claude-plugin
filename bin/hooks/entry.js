@@ -644,6 +644,7 @@ export async function deliverFiring(opts) {
             scanned: scannedOffsets(resolution.record.scan),
             record: resolution.record,
             ...(opts.asOf === undefined ? {} : { asOf: opts.asOf }),
+            ...(opts.keepEndMark === true ? { keepEndMark: true } : {}),
             ...(opts.heartbeat === undefined ? {} : { heartbeat: opts.heartbeat }),
         });
         results.push(result);
@@ -795,6 +796,7 @@ async function deliverTarget(opts) {
             // U4: a replay is not a hook. It never stamps "now"; it stamps the moment its hook fired (`liveAtMs`, merged by `max`).
             byHook: asOf === undefined && hookClock !== null,
             ...(asOf === undefined ? {} : { liveAtMs: asOf.at }),
+            ...(opts.keepEndMark === true ? { keepEndMark: true } : {}),
             // ⛔ THE MAIN DELIVERY ONLY. Sub-agent deliveries leave all three unset: each is its own `capture_id`, and
             // `capture_commits`' PK is `(org_id, capture_id, commit_sha)`, so attaching these to all of them would admit several
             // legal, permanent rows for one commit (D154).
@@ -871,7 +873,7 @@ async function deliverTarget(opts) {
     };
 }
 /** The resolver's scanned offset per stream, for the folder cap. */
-function scannedOffsets(scan) {
+export function scannedOffsets(scan) {
     return Object.fromEntries(Object.entries(scan).map(([fileKey, cursor]) => [fileKey, cursor.offset]));
 }
 /**
@@ -884,8 +886,6 @@ export const UNBOUNDED_PACE_CAP_MS = 30_000;
 export function unboundedPaceMs(elapsedMs) {
     return Math.min(UNBOUNDED_PACE_CAP_MS, Math.max(UNBOUNDED_PACE_FLOOR_MS, elapsedMs));
 }
-/** A session with no firing of its own for this long is IDLE: another session's firing may finish its owed bytes (R19 · D22). */
-export const DRAIN_IDLE_MS = 10 * 60_000;
 /** Session records one firing looks at. Examined ones move to the back of the line (their mtime moves), so none starves. */
 export const DRAIN_EXAMINE_MAX = 40;
 /** A record whose transcript is gone and that owes nothing is forgotten after this long. */
