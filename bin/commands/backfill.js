@@ -45,13 +45,14 @@ import { CAPTURE_NOT_APPROVED, ingestUrl } from "../post.js";
 import { resolveProjectKeys } from "../project.js";
 import { TOP_LEVEL_CWD_ONLY, findSubagentTranscriptsChecked, groupKey, loadTargetRecord, scanTranscriptKeys, stopKeyOf, stopTarget } from "../session_targets.js";
 import { SESSION_LIVE_WINDOW_MS } from "../spool.js";
-import { fileState, loadSessionState } from "../state.js";
+import { fileState, loadSessionState, sealIsCurrent } from "../state.js";
 import { glyph, paint, renderErrorBlock, tildePath, truncateMiddle, truncatePath, wrap, WRAP_COLUMNS } from "../term.js";
 import { writeLines } from "./context.js";
 import { credentialProblem } from "./credential_problem.js";
 import { authCommandFor, channelCommand, connectCommandFor } from "../install.js";
 import { identityDigest } from "../identity.js";
-import { closeSession, closeSpecOf, ingestUrlUnavailableBlock, resolveSessionTargets } from "./finalize.js";
+import { closeSession, closeSpecOf } from "../close_session.js";
+import { ingestUrlUnavailableBlock, resolveSessionTargets } from "./finalize.js";
 import { scanMachine } from "./scan.js";
 import { renderVerbHelp } from "../verb_help.js";
 /** A transcript larger than this on disk is not offered (the 50 MiB policy cap). Sub-agent streams are not capped. */
@@ -262,7 +263,7 @@ function parentDone(home, env, sessionId, transcriptPath, size, quiet) {
         // ⛔ C35 (v): A QUIET SESSION IS NOT DONE UNTIL IT IS SEALED. An upload made while the transcript was recent or running leaves the target
         // unfinalized; once the file has been quiet for the live window `uploadParent` would seal it, so the session must be offered again
         // for that. (A session still running is not asked to seal: `quiet` is false.)
-        return state.endHold === null && streamsSentTo(state, size, subs, undefined) && (state.finalized !== null || !quiet);
+        return state.endHold === null && streamsSentTo(state, size, subs, undefined) && (sealIsCurrent(state) || !quiet);
     };
     const owed = new Set();
     for (const info of Object.values(record.roots)) {
@@ -652,7 +653,7 @@ async function uploadParent(run, candidate) {
             if (!subListing.listFailed &&
                 ledger.endHold === null &&
                 streamsSentTo(ledger, toEof, subListing.found, spec.sizeCap) &&
-                (ledger.finalized !== null || !sealing)) {
+                (sealIsCurrent(ledger) || !sealing)) {
                 results.push({ kind: "uploaded" });
                 continue;
             }

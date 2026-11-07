@@ -267,7 +267,8 @@ function isCodexInstructionRecord(record) {
     const p = payload;
     if (record.type === "response_item") {
         // The WHOLE role:user and role:developer streams, not a prefix match: it is the injected superset (`# AGENTS.md instructions for ...`,
-        // `<user_action>` synthetics), and a prefix breaks when the wording changes. The human prompt is `event_msg/user_message`.
+        // `<user_action>` synthetics), and a prefix breaks when the wording changes. The human prompt is NOT here: it is `event_msg/user_message` on a legacy
+        // thread and `event_msg/item_completed` with `item.type` `UserMessage` on a paginated one (Codex 0.144 and later); this function never matches either.
         if (p.type === "message")
             return p.role === "user" || p.role === "developer";
         return p.type === "additional_tools";
@@ -282,7 +283,8 @@ const CODEX_CLI_RULES = {
     // C40 (2): Codex injects the user's instruction files and its own prompts into the record stream, and none of those records names a path
     // for the path rule to judge. Measured on one machine (367 rollouts): the GLOBAL ~/.codex/AGENTS.md text is in all 161 `world_state`
     // records (`state.agents_md.text`) and in the `response_item/message` role:user injections. Nothing reads them: the human prompt comes
-    // from `event_msg/user_message`, and the server's reader skips the model-input mirror. So they are withheld in EVERY copy, by TYPE, and
+    // from `event_msg/user_message` (legacy threads) or `event_msg/item_completed` `UserMessage` (paginated ones), and the server's reader skips the
+    // model-input mirror. So they are withheld in EVERY copy, by TYPE, and
     // the next instruction field Codex adds is not a leak. Assistant prose (`event_msg/agent_message`, role:assistant) is NOT here.
     alwaysWithheld: (record) => (isCodexInstructionRecord(record) ? "strict" : null),
     withheldKeys: (key) => key === "base_instructions" || key.endsWith("developer_instructions"),

@@ -23,16 +23,20 @@
  * ## ⛔ Paths and numbers only. A firing holds no credential and no transcript text; the credential is loaded here, each round, from the
  * file or the inherited environment (`loadCredential`), so `vibecommit auth` takes effect at once and the worker keeps no copy.
  */
+import { closeSession, closeSpecOf } from "./close_session.js";
 import { loadCredential } from "./credential.js";
 import { noteCredentialExpiry } from "./credential_meta.js";
 import { advanced, readCursor, readFirings, shouldSkip, stampLive, threw, writeCursor, } from "./firing.js";
-import { admitsTranscript, canonicalHookEvent, dialectFor } from "./agents/registry.js";
-import { DEFAULT_HOOK_BUDGET_MS, deliverFiring, fileSize, turnEndCwd, wait, } from "./hooks/entry.js";
+import { admitsTranscript, agentForTranscript, canonicalHookEvent, dialectFor } from "./agents/registry.js";
+import { SEAL_GROWTH_MAX_BYTES } from "./agents/types.js";
+import { DEFAULT_HOOK_BUDGET_MS, deliverFiring, fileSize, scannedOffsets, turnEndCwd, wait, } from "./hooks/entry.js";
 import { claimSessionWriter } from "./hooks/fire_lock.js";
+import { closeSync, openSync, readSync } from "node:fs";
 import { SESSION_END_EVENT, settleDelayMs, settledSize } from "./hooks/session_end.js";
 import { CAPTURE_NOT_APPROVED, credentialFingerprint } from "./post.js";
 import { sessionFileStem } from "./paths.js";
 import { LockLostError, resolveTargets } from "./session_targets.js";
+import { fileState, loadSessionState } from "./state.js";
 import { gitToplevel } from "./project.js";
 /** The request timeout of the worker (plan §3.12): finite, longer than the slowest request observed (44 s), shorter than undici's own. */
 export const REQUEST_TIMEOUT_MS = 120_000;
@@ -66,14 +70,14 @@ export async function replayStep(cfg, stem) {
     const beat = setInterval(() => lock.refresh(), SESSION_BEAT_MS);
     beat.unref();
     try {
-        return await stepUnderLock(cfg, stem, lock);
+        return await stepUnderLock(cfg, stem, lock, true);
     }
     finally {
         clearInterval(beat);
         lock.release();
     }
 }
-async function stepUnderLock(cfg, stem, lock) {
+async function stepUnderLock(cfg, stem, lock, sealAtEnd) {
     const startedAt = Date.now();
     const elapsed = () => Date.now() - startedAt;
     // Read again UNDER the lock: the cursor is only ever written by a holder of it, so this is the truth.
@@ -104,7 +108,7 @@ async function stepUnderLock(cfg, stem, lock) {
     }
     let outcome;
     try {
-        outcome = await deliverOne(cfg, first, () => lock.refresh(), read.firings.length === 1);
+        outcome = await deliverOne(cfg, first, () => lock.refresh(), read.firings.length === 1, sealAtEnd ? stem : null);
     }
     catch (error) {
         if (error instanceof LockLostError)
@@ -134,7 +138,7 @@ async function stepUnderLock(cfg, stem, lock) {
             return { kind: "threw", class: outcome.class, elapsedMs: elapsed() };
     }
 }
-async function deliverOne(cfg, read, heartbeat, isLastLine) {
+async function deliverOne(cfg, read, heartbeat, isLastLine, sealStem) {
     const f = read.firing;
     // ⛔ RE-CONFINED on every replay, as the idle drain re-confines a path read from state: a firing is a file on disk, and the transcript it
     // names may have been replaced since the hook wrote it.
@@ -226,8 +230,190 @@ async function deliverOne(cfg, read, heartbeat, isLastLine) {
     noteExpiry(cfg, fingerprint, results);
     const folded = foldResults(results);
     const withNote = (o) => (rootsNote !== undefined && o.kind === "done" ? { ...o, roots: rootsNote } : o);
+    // ⛔ THE SEAL PHASE (last-turn seal plan, D2): a settled last-line SessionEnd says THIS process wrote its last record, so the worker asks the server to
+    // file the last turn. Inside this function, BEFORE the cursor moves (A1): a failed seal must not consume the SessionEnd line. Only the worker's own step
+    // (`sealStem`); `finalize` and `backfill` replay through the same step with no seal, because they close the session themselves (A12).
+    if (folded.kind === "done" && sealStem !== null && settle && (folded.class === "delivered" || folded.class === "noop")) {
+        const sealed = await sealPhase({ cfg, stem: sealStem, read, results, resolution, credential: load.credential, cwd: turnEnd, heartbeat });
+        if (sealed !== null)
+            return withNote(sealed);
+    }
     // The fingerprint (a hash, never the credential) lets the next hook say "revoked" only about the credential it is about to use.
     return folded.kind === "fatal" && folded.why === "rejected" ? { ...folded, fingerprint } : withNote(folded);
+}
+/**
+ * The bytes that arrived after the hook: `(from, size]`, at most `SEAL_GROWTH_MAX_BYTES + 1` of them (more than the limit is all a dialect needs to say no).
+ * `null` is "could not tell" (the file shrank, a short read, an error): the guard treats it as no seal.
+ */
+function readGrowth(path, from, size) {
+    if (size < from)
+        return null;
+    if (size === from)
+        return Buffer.alloc(0);
+    const want = Math.min(size - from, SEAL_GROWTH_MAX_BYTES + 1);
+    let fd = null;
+    try {
+        fd = openSync(path, "r");
+        const buf = Buffer.alloc(want);
+        let got = 0;
+        while (got < want) {
+            const n = readSync(fd, buf, got, want - got, from + got);
+            if (n <= 0)
+                break;
+            got += n;
+        }
+        return got === want ? buf : null;
+    }
+    catch {
+        return null;
+    }
+    finally {
+        if (fd !== null) {
+            try {
+                closeSync(fd);
+            }
+            catch {
+                /* a read-only descriptor */
+            }
+        }
+    }
+}
+/** How one target's close came out, in the step's terms (OV5). `null`: this target is done with nothing to report. */
+export function sealOutcome(closed) {
+    switch (closed.kind) {
+        case "sealed":
+        case "already":
+        // An older server acknowledges nothing: the bytes are delivered, the session is NOT closed. The cursor moves; `endedAt` stays and `status` lists it.
+        case "unacknowledged":
+            return { kind: "sealed" };
+        case "lock-lost":
+            return { kind: "lost" };
+        case "refused":
+            return { kind: "later", ...(closed.delivery.kind === "attempted" && closed.delivery.retryAfterMs !== undefined ? { retryAfterMs: closed.delivery.retryAfterMs } : {}) };
+        case "subagents-held": {
+            const d = closed.delivery;
+            if (d.kind === "stopped" || (d.kind === "attempted" && d.disposition === "fatal"))
+                return { kind: "fatal", why: "rejected" };
+            // A sub-agent stream the server has not APPROVED is a recorded hold, not a failure to back off from (as `foldResults` reads it): retrying it for ever would
+            // keep the SessionEnd line, and every firing behind it, from being consumed. No seal now; the drain seals it once the hold clears.
+            if (d.kind === "attempted" && d.disposition === "later" && d.detail?.code === CAPTURE_NOT_APPROVED)
+                return null;
+            return { kind: "later", ...(d.kind === "attempted" && d.retryAfterMs !== undefined ? { retryAfterMs: d.retryAfterMs } : {}) };
+        }
+        case "not-delivered": {
+            const d = closed.delivery;
+            if (d.kind === "attempted") {
+                if (d.disposition === "later")
+                    return d.detail?.code === CAPTURE_NOT_APPROVED ? null : { kind: "later", ...(d.retryAfterMs === undefined ? {} : { retryAfterMs: d.retryAfterMs }) };
+                if (d.disposition === "fatal")
+                    return { kind: "fatal", why: "rejected" };
+                return null;
+            }
+            if (d.kind === "nothing-to-send" && (d.why === "read-failed" || d.why === "unwritable"))
+                return { kind: "threw", class: `seal:${d.why}` };
+            if (d.kind === "nothing-to-send" && d.why === "lock-lost")
+                return { kind: "lost" };
+            return null;
+        }
+        // `stopped` (a rejected credential held this target), `never-captured`: the seal is not ours to make.
+        default:
+            return null;
+    }
+}
+/**
+ * The seal guard shared by the worker's seal and the drain's: the TRANSCRIPT's dialect (A8, never the firing's agent) judges the bytes that arrived since
+ * the hook (`from` = the firing's `eof`). Every failure to tell is `false`: no seal, today's behaviour.
+ */
+export function sealGuardAllows(cfg, transcript, from, size) {
+    const growth = readGrowth(transcript, from, size);
+    return growth !== null && dialectFor(agentForTranscript(cfg.home, cfg.env, transcript)).growthAllowsSeal(growth);
+}
+/**
+ * ONE target's seal: `closeSession` with `seal`, the commit pin at the firing's time (SC-4), the worker's fixed timeout (A14), sub-agents completed first
+ * (A13) and the worker's variants of the spool rules (OV8). Shared by the worker's seal phase and the drain's seal (R8). `eof` is the file's size for a
+ * repo target; a FOLDER target stops at what the resolver scanned and never goes below `sentOffset`, because `nextSpan` reads an `eof` behind `sentOffset`
+ * as a replaced file (OV4).
+ */
+export async function closeForSeal(args) {
+    const { cfg, target, resolution } = args;
+    const scan = scannedOffsets(resolution.record.scan);
+    const spec = closeSpecOf(target, scan, { record: resolution.record, capRepos: false });
+    const sentOffset = fileState(loadSessionState(cfg.home, { repoKey: target.ledgerKey, sessionId: args.sessionId }), "main").sentOffset;
+    const eof = spec.sizeCap === undefined ? args.size : Math.max(sentOffset, Math.min(args.size, spec.sizeCap.main ?? 0));
+    const transcriptAgent = agentForTranscript(cfg.home, cfg.env, args.transcript);
+    return closeSession({
+        home: cfg.home,
+        env: cfg.env,
+        nodeVersion: cfg.nodeVersion,
+        agentId: transcriptAgent === "unknown" ? args.agent : transcriptAgent,
+        cwd: args.cwd,
+        url: cfg.url,
+        credential: args.credential,
+        projectKey: spec.projectKey,
+        redactionRoots: spec.redactionRoots,
+        repoSlug: spec.repoSlug,
+        sessionId: args.sessionId,
+        transcriptPath: args.transcript,
+        eof,
+        seal: true,
+        allowNeverCaptured: args.allowNeverCaptured,
+        completeSubagents: true,
+        worktrees: spec.worktrees,
+        ...(spec.sizeCap === undefined ? {} : { sizeCap: spec.sizeCap }),
+        ...(spec.isolation === undefined ? {} : { isolation: spec.isolation }),
+        asOfAt: args.at,
+        requestTimeoutMs: cfg.requestTimeoutMs ?? REQUEST_TIMEOUT_MS,
+        byWorker: true,
+        heartbeat: args.heartbeat,
+    });
+}
+/**
+ * THE SEAL, per target (plan item 2). The caller has delivered the firing and the fold says done. For each target whose main bytes are caught up:
+ *   a. the file's size S; b. the log has no later line (a later line is a resume or a double firing: no seal here); c. the dialect (from the TRANSCRIPT's
+ *   path, A8) says the growth `(firing.eof, S]` is not a conversation; d. `closeForSeal`.
+ * Every guard failure is `null` (no seal; today's behaviour). Returns `null` when nothing was asked of the server, so the caller keeps the fold.
+ */
+async function sealPhase(args) {
+    const { cfg, stem, read, results, resolution, credential, cwd, heartbeat } = args;
+    const f = read.firing;
+    const caughtUp = results.filter((r) => r.reason.kind === "caught-up");
+    if (caughtUp.length === 0)
+        return null;
+    const size = fileSize(f.transcript);
+    if (size === null)
+        return null;
+    const later = readFirings(cfg.home, stem, read.end);
+    if (later.firings.length > 0 || later.blockedByNewer)
+        return null;
+    if (!sealGuardAllows(cfg, f.transcript, f.eof, size))
+        return null;
+    let requested = false;
+    for (const { target } of caughtUp) {
+        const closed = await closeForSeal({
+            cfg,
+            target,
+            resolution,
+            sessionId: f.sid,
+            transcript: f.transcript,
+            size,
+            at: f.at,
+            cwd,
+            agent: f.agent,
+            credential,
+            allowNeverCaptured: false,
+            heartbeat,
+        });
+        const step = sealOutcome(closed);
+        if (step === null)
+            continue;
+        if (step.kind === "sealed") {
+            requested = true;
+            continue;
+        }
+        return step;
+    }
+    // An acknowledged seal put a request on the wire: it is reported as delivered with `requested`, so the worker paces it even after a `noop`.
+    return requested ? { kind: "done", class: "delivered", requested: true } : null;
 }
 /**
  * `credential_ending` (plan §3.7): a 2xx carries where the credential stands (`X-Credential-Expires`). The worker remembers it in the SIDECAR (never
@@ -304,7 +490,7 @@ const MAX_REPLAY_STEPS = 100_000;
 export async function replayAllUnderLock(cfg, sessionId, held) {
     const stem = sessionFileStem(sessionId);
     for (let steps = 0; steps < MAX_REPLAY_STEPS; steps += 1) {
-        const step = await stepUnderLock(cfg, stem, held);
+        const step = await stepUnderLock(cfg, stem, held, false);
         switch (step.kind) {
             case "idle":
             case "foreign":

@@ -41,7 +41,7 @@ import { writeFileAtomic } from "./atomic_write.js";
 import { liveAtOf } from "./firing.js";
 import { pendingFileExpired } from "./pending_prune.js";
 import { repoSessionsDir, sessionStatePath, stateDir } from "./paths.js";
-import { EMPTY_FILE_STATE } from "./policy.js";
+import { DRAIN_IDLE_MS, EMPTY_FILE_STATE } from "./policy.js";
 import { MAX_PENDING_SHAS, SESSION_LIVE_WINDOW_MS, WIRE_RUNGS, noteRepoKey, readInferred, readRewrites, readSpool, wellFormedCommitLines } from "./spool.js";
 export const EMPTY_SESSION_STATE = {
     seq: 0,
@@ -418,13 +418,23 @@ function commitLinesFor(dir, stem, nowMs) {
     return n;
 }
 /**
+ * Is the session's seal CURRENT: `finalized` set, and not older than the last receipt? A resume after a seal delivers again (a newer receipt) and leaves
+ * `finalized` behind, so "finalized is not null" reads a stale seal as done (OV6). One definition, read by `status` (`openTailForRepo`) and by `backfill`.
+ */
+export function sealIsCurrent(session) {
+    return session.finalized !== null && (session.lastReceipt === null || session.finalized.at >= session.lastReceipt.at);
+}
+/**
  * Sessions of this repo that ended with the last turn still open AND a loss to name — `TODOS[145]`.
  *
- * ⛔ **THE SERVER SEALS A TURN ONLY WHEN A FOLLOWING PROMPT ARRIVES**, so EVERY session ends with its last
- * turn open; raising that on every session would be noise and would teach the user to ignore the line.
+ * ⛔ **THE SERVER SEALS A TURN WHEN A FOLLOWING PROMPT ARRIVES OR THE SESSION IS DECLARED OVER.** The upload worker declares it
+ * at a `SessionEnd` it has delivered, and its idle drain declares it for one it missed, so what is listed here is the rest: a session
+ * killed outright, one the growth guard refused, one sent to a server that does not confirm, or one the drain has not yet reached.
+ * A session that ended less than `DRAIN_IDLE_MS` ago is not listed (C2): the drain has not had its chance, and raising it would be a
+ * false alarm. A drain delivery leaves the end mark standing (R9), so a session the seal cannot close stays listed.
  * The loss is real in two cases, and only those are named: the session NEVER sealed anything (a one-shot
  * run — none of it is recorded), or it ended with commits still waiting for a turn to close. A session
- * the caller already finalized, or whose newest delivery sealed something, is not listed. A header the
+ * whose seal is current (`sealIsCurrent`), or whose newest delivery sealed something, is not listed. A header the
  * server did not send (`sealed: null`, an older server) is unknown, and unknown is not reported.
  */
 export function openTailForRepo(home, repoKey, nowMs = Date.now()) {
@@ -448,7 +458,11 @@ export function openTailForRepo(home, repoKey, nowMs = Date.now()) {
         const r = session.lastReceipt;
         if (session.endedAt === null || r === null || r.sealed !== false)
             continue;
-        if (session.finalized !== null && session.finalized.at >= r.at)
+        if (sealIsCurrent(session))
+            continue;
+        // C2: the worker's drain seals a session that ended and has been quiet for `DRAIN_IDLE_MS`; until it has had that long, a session still waiting for
+        // its turn is not a loss to raise.
+        if (nowMs - session.endedAt < DRAIN_IDLE_MS)
             continue;
         if (r.everSealed && commitLinesFor(dir, stem, nowMs) === 0)
             continue;

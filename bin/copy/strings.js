@@ -381,9 +381,10 @@ export const STATUS = {
         `${sessions === 1 ? "1 session that has" : `${sessions} sessions that have`} ended ` +
         "could not be sent and have not been sent since.",
     /**
-     * `TODOS[145]`/`[146]` — a session that ENDED while its last turn was still open. The server seals a
-     * turn only when a following prompt arrives, so nothing will ever seal this one and the commits made in
-     * it cannot be recorded. States the consequence and the command; promises nothing about the commits.
+     * `TODOS[145]`/`[146]` — a session that ENDED while its last turn was still open, and that the background process's seal did not close (it was killed
+     * outright, the guard refused, the server did not confirm, or the idle pass has not reached it; a session that ended less than ten minutes ago is not
+     * listed). Nothing else will seal it until a prompt arrives, so the commits made in it cannot be recorded. States the consequence and the command;
+     * promises nothing about the commits.
      */
     openTail: (sessions, finalizeLatest) => `${sessions === 1 ? "1 session has" : `${sessions} sessions have`} ended with the last turn still ` +
         `open, so commits made in that turn are not recorded. Run \`${finalizeLatest}\` to close it.`,
@@ -1954,9 +1955,8 @@ export const ABSENCE = {
 /**
  * `vibecommit finalize` (`TODOS[146]`, VD decision 5).
  *
- * ⛔ The turn extractor seals a turn only when a following prompt opens the next one, so a session
- * that is never followed by another prompt (a one-shot `claude -p`, the last turn of any session that
- * is not resumed) seals nothing and binds no commit. This verb is the CALLER saying the session is
+ * ⛔ The turn extractor seals a turn when a following prompt opens the next one or the session is declared over. The upload worker declares it
+ * for a session whose end hook fired; a session killed outright, or one it could not seal, is closed by this verb: the CALLER saying the session is
  * over. The copy states what happened and what did not, and claims nothing about commits it cannot
  * know were bound: `closed` says the last turn is recorded, not that any commit matched it.
  */

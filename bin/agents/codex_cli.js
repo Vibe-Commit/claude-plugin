@@ -321,6 +321,8 @@ export const CODEX_CLI = {
     // table) and, past the scan cursor, from the delivery's own bytes. A record that ran in another work tree is withheld from this repo's copy; one whose
     // folder cannot be told is withheld in a multi-repo copy and kept in a single-repo one (a single-repo Codex session stays as 0.8.0 sends it).
     isolatesContentRecords: true,
+    // Last-turn seal (R2 · D9-A): UNMEASURED live. Any byte after the hook blocks the seal (a "leave the task running" exit can keep writing); only zero growth seals.
+    growthAllowsSeal: (growth) => growth.length === 0,
     // ⛔ **UNMEASURED.** `null` here does NOT mean "Codex CLI has no session id in
     // its environment" — it means nobody has run the measurement `M1` ran for
     // Claude Code (agent commit, human commit, worktree commit) against Codex, so

@@ -900,7 +900,12 @@ async function deliverChunk(ctx, eof, readBody, cutter) {
                     // ⛔ A DELIVERY THAT ASKED FOR FINALITY AND WAS NOT TOLD IT GOT IT LEAVES THE END MARK STANDING (VG review
                     // 2, A2). Against a server that ignores `X-Session-Final` this ok-delivery used to clear `endedAt` for
                     // every caller, so `status` said "ok Capture is on" about a session whose last turn was still open.
-                    endedAt: ctx.final === true && outcome.finalAck !== "sealed" && outcome.finalAck !== "already" ? session.endedAt : null,
+                    //
+                    // R9: AND A DRAIN DELIVERY LEAVES THE MARK ALONE (`keepEndMark`). `drain.ts` already says a drain delivery proves nothing about liveness; it proves
+                    // nothing about whether the session ended either. Without this, a session the guard will never let the worker seal (Codex growth, over 4 KiB after
+                    // the end) has its bytes sent by the drain, its mark cleared, and `status` goes quiet about a last turn that is still open. A turn's own delivery, a
+                    // seal and `finalize` still clear it.
+                    endedAt: ctx.keepEndMark === true || (ctx.final === true && outcome.finalAck !== "sealed" && outcome.finalAck !== "already") ? session.endedAt : null,
                 };
                 // ⭐ `TODOS[146]` — the server ACKNOWLEDGED the caller's assertion. `null` (an older server that
                 // ignored the header) and `refused` record nothing: "asked" is not "done".
