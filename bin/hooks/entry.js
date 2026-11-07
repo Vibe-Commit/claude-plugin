@@ -35,7 +35,7 @@
  */
 import { closeSync, existsSync, openSync, readSync, statSync, writeSync, } from "node:fs";
 import { spawn } from "node:child_process";
-import { basename, dirname } from "node:path";
+import { basename, dirname, isAbsolute } from "node:path";
 import { zstdCompressSync } from "node:zlib";
 import { grantsUnreadable, hasAnyConsent, isCaptureAllowed, isLocalSlug, normalizeSlug } from "../consent.js";
 import { endingSoon, metaFor } from "../credential_meta.js";
@@ -51,12 +51,12 @@ import { dialectIsolates, evidenceSpecFor, findSubagentTranscripts, isolationOf,
 import { readSpoolUnion } from "../spool_union.js";
 import { fileState, loadSessionState, saveSessionState, withFileState } from "../state.js";
 import { admitsTranscript, agentForTranscript, canonicalHookEvent, dialectFor, } from "../agents/registry.js";
-import { FIRING_VERSION, MAX_FIRING_SUB_FILES, recordFiring, liveAtOf, liveStampKeys, stampLive } from "../firing.js";
+import { FIRING_VERSION, MAX_FIRING_SUB_FILES, capRoots, recordFiring, liveAtOf, liveStampKeys, stampLive } from "../firing.js";
 import { identityDigest } from "../identity.js";
 import { readUploaderStatus } from "../uploader_status.js";
 import { uploaderAlive } from "./fire_lock.js";
 import { announcedSubagentFileKey, sessionFileStem, sessionLivePath, sessionStatePath, subagentFileKey, } from "../paths.js";
-import { resolveProjectKeys } from "../project.js";
+import { gitToplevel, resolveProjectKeys } from "../project.js";
 export { confinementRoots } from "../project.js";
 import { startSpawnBudget } from "../spawn_budget.js";
 import { turnStart } from "../pending_bound.js";
@@ -131,6 +131,9 @@ const MIN_SUBAGENT_BUDGET_MS = 400;
  * and a session that spawned 27 delegated agents will fire far more than four.
  */
 const MAX_SUBAGENT_FILES = 8;
+/** At most this many roots, each at most `PATH_MAX`-ish long: more is not a workspace, it is a malformed payload. */
+const MAX_WORKSPACE_ROOTS = 16;
+const MAX_WORKSPACE_ROOT_LENGTH = 4096;
 /**
  * Parse hook stdin. Claude Code supplies `{ session_id, transcript_path, cwd,
  * hook_event_name }` on stdin — NOT in the environment.
@@ -167,6 +170,10 @@ export function parseHookInput(raw) {
     if (typeof transcriptPath !== "string" || transcriptPath === "")
         return null;
     const announced = o.agent_transcript_path;
+    const rootsRaw = o.workspace_roots;
+    const roots = Array.isArray(rootsRaw) && rootsRaw.length <= MAX_WORKSPACE_ROOTS
+        ? rootsRaw.filter((r) => typeof r === "string" && r !== "" && r.length <= MAX_WORKSPACE_ROOT_LENGTH && isAbsolute(r))
+        : [];
     return {
         sessionId,
         transcriptPath,
@@ -175,7 +182,43 @@ export function parseHookInput(raw) {
         ...(typeof announced === "string" && announced !== ""
             ? { agentTranscriptPath: announced }
             : {}),
+        ...(roots.length === 0 ? {} : { workspaceRoots: roots }),
     };
+}
+/**
+ * THE TURN-END FOLDER (U11). Cursor's hook stdin has no `cwd`, so `parseHookInput` falls back to the hook's own working directory, and Cursor runs a
+ * user-level hook (`~/.cursor/hooks.json`, and the Claude Code hooks it loads as third-party hooks, `~/.claude`) from its CONFIG folder: no work tree, no
+ * turn-end repo, and, because the Cursor dialect cannot isolate records, no target at all. MEASURED on cursor-agent 2026.08.11 with a capture hook:
+ * the project-level hook ran in the workspace, the user-level ones in `~/.cursor` and `~/.claude`, and stdin carried `workspace_roots`.
+ *
+ * So for a CURSOR transcript (by the root that contains it, not by which agent id registered the hook: the third-party Claude hook delivers the same
+ * Cursor transcript) whose hook cwd is not a work tree, the turn-end folder is the first workspace root that is. Everything after is unchanged:
+ * `resolveProjectKeys` -> `isCaptureAllowed` -> the transcript confinement. A root only NAMES a repo; consent and confinement still decide.
+ */
+export function turnEndCwd(ctx, input) {
+    const roots = input.workspaceRoots;
+    if (roots === undefined || roots.length === 0)
+        return input.cwd;
+    if (agentForTranscript(ctx.home, ctx.env, input.transcriptPath) !== "cursor")
+        return input.cwd;
+    // The hook's own folder is kept ONLY when its work tree is one of the workspace's (a project-level hook runs IN the workspace). A work tree that is not
+    // among the roots is a config folder under git (people version `~/.claude` or keep $HOME in git): filing a Cursor transcript under that repository would
+    // be the wrong repository permanently, and unconsented it would capture nothing, the bug this fixes. Same resolver on both sides, no path arithmetic.
+    //
+    // ONE spawn per candidate (`gitToplevel`, not `resolveProjectKeys`' two): the hook's spawn window is 0.6 x 2200 ms on Cursor and a refused or slow
+    // spawn reads as "not a work tree". The caller resolves the full keys once, for the folder this returns. The WORKER calls this same function for a
+    // firing whose hook came up empty (`replay.ts`), with no window armed.
+    const own = gitToplevel(input.cwd);
+    let firstRoot = null;
+    for (const root of roots) {
+        const top = gitToplevel(root);
+        if (top === null)
+            continue;
+        if (own !== null && top === own)
+            return input.cwd;
+        firstRoot ??= root;
+    }
+    return firstRoot ?? input.cwd;
 }
 /**
  * Replace stderr with a sink for the rest of the process.
@@ -302,9 +345,10 @@ function dialectBudgetMs(agentId) {
  */
 async function hookBody(ctx, budgetMs, hookStartedAt) {
     const raw = await ctx.readStdin();
-    const input = parseHookInput(raw);
-    if (input === null)
+    const parsed = parseHookInput(raw);
+    if (parsed === null)
         return null;
+    const input = { ...parsed, cwd: turnEndCwd(ctx, parsed) };
     // `repoKey` is passed per call rather than captured, because the three
     // session-keyed states can fire BEFORE a project has been resolved at all —
     // `unsupported_runtime` fires before anything else runs. Only
@@ -445,6 +489,9 @@ async function hookBody(ctx, budgetMs, hookStartedAt) {
         prior,
         ...(input.agentTranscriptPath === undefined ? {} : { announced: input.agentTranscriptPath }),
         ...subSizesOf(ctx, input),
+        // U11 (recovery): a Cursor hook that parsed workspace roots and still resolved NO repo (its spawn window refused or timed out a `git` call, or none of
+        // the roots is a work tree) hands the roots to the worker, which has no window and re-runs `turnEndCwd` before it settles the session. Never when keys resolved.
+        ...(keys === null && input.workspaceRoots !== undefined && agentForTranscript(ctx.home, ctx.env, input.transcriptPath) === "cursor" ? { roots: capRoots(input.workspaceRoots) } : {}),
     };
     recordFiring(ctx.home, input.sessionId, firing);
     // Appended FIRST, stamped second, lock read third: the worker releases THEN looks at the queue, so one side always sees the other.

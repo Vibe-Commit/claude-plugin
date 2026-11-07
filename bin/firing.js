@@ -19,7 +19,7 @@
  * read liveness through it and neither may import the other.
  */
 import { appendFileSync, chmodSync, closeSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, isAbsolute } from "node:path";
 import { writeFileAtomic } from "./atomic_write.js";
 import { sessionFileStem, sessionFiringsCursorPath, sessionFiringsPath, sessionLivePath, targetsDir } from "./paths.js";
 /** The line format this build writes and reads. A reader sees a NEWER `v` as a stop sign, never as garbage (§3.14). */
@@ -28,6 +28,18 @@ export const FIRING_VERSION = 1;
 export const MAX_FIRING_BYTES = 32 * 1024;
 /** After this many uncaught throws on one firing, the worker skips it. A firing only sets an EOF, so the next one still covers its bytes. */
 export const MAX_FIRING_THROWS = 3;
+/** The JSON-encoded `roots` array is kept in order while it stays within this many bytes (16 typical paths). */
+export const MAX_FIRING_ROOTS_BYTES = 4 * 1024;
+/** The longest prefix of `roots` whose JSON encoding fits `MAX_FIRING_ROOTS_BYTES`. */
+export function capRoots(roots) {
+    const kept = [];
+    for (const root of roots) {
+        if (Buffer.byteLength(JSON.stringify([...kept, root])) > MAX_FIRING_ROOTS_BYTES)
+            break;
+        kept.push(root);
+    }
+    return kept;
+}
 /** More sub-agent files than this in one firing: the map is left out (uncapped) rather than growing the line past `MAX_FIRING_BYTES`. */
 export const MAX_FIRING_SUB_FILES = 200;
 // --- the log -------------------------------------------------------------------------------------------------------------------
@@ -60,10 +72,14 @@ export function appendFiring(home, sessionId, firing) {
 export function recordFiring(home, sessionId, firing) {
     if (appendFiring(home, sessionId, firing))
         return true;
-    if (firing.sub === undefined)
+    // Drop order when a line is over MAX_FIRING_BYTES: `sub` first (uncapped replay, today's behaviour), then `roots` (no recovery). Never the firing.
+    const { sub: _sub, ...withoutSub } = firing;
+    if (firing.sub !== undefined && appendFiring(home, sessionId, withoutSub))
+        return true;
+    if (firing.roots === undefined)
         return false;
-    const { sub: _dropped, ...withoutSub } = firing;
-    return appendFiring(home, sessionId, withoutSub);
+    const { roots: _roots, ...withoutBoth } = withoutSub;
+    return appendFiring(home, sessionId, withoutBoth);
 }
 /**
  * The firings from `from` (a cursor offset) on. Never throws: an unreadable log reads as empty.
@@ -178,6 +194,14 @@ function parseFiring(text, stem) {
             sub = Object.fromEntries(entries);
         }
     }
+    // `roots`: the same bounds as the stdin parse (absolute, <= 4096 chars, <= 16), then the byte cap. Anything else is IGNORED, never a reason to drop the firing.
+    let roots;
+    if (Array.isArray(o.roots) && o.roots.length > 0 && o.roots.length <= 16) {
+        const good = o.roots.filter((r) => typeof r === "string" && r !== "" && r.length <= 4096 && isAbsolute(r));
+        const capped = capRoots(good);
+        if (capped.length > 0)
+            roots = capped;
+    }
     return {
         v: o.v,
         at: o.at,
@@ -193,6 +217,7 @@ function parseFiring(text, stem) {
         prior,
         ...(o.announced === undefined ? {} : { announced: o.announced }),
         ...(sub === undefined ? {} : { sub }),
+        ...(roots === undefined ? {} : { roots }),
     };
 }
 const LOG_SUFFIX = ".firings.jsonl";
