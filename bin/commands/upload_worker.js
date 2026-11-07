@@ -197,6 +197,9 @@ export async function runUploadWorker(opts) {
                             if (step.class === "delivered")
                                 rejected = undefined;
                             record(stem, `done:${step.class}`, step.elapsedMs);
+                            // U11: counts only, no path. A recovery that is still a miss must say so.
+                            if (step.roots !== undefined)
+                                counts[step.roots === "recovered" ? "recovered_from_roots" : "roots_no_repo"] = (counts[step.roots === "recovered" ? "recovered_from_roots" : "roots_no_repo"] ?? 0) + 1;
                             failures.delete(stem);
                             notBefore.delete(stem);
                             worked = true;

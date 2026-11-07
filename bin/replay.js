@@ -25,14 +25,15 @@
  */
 import { loadCredential } from "./credential.js";
 import { noteCredentialExpiry } from "./credential_meta.js";
-import { advanced, readCursor, readFirings, shouldSkip, threw, writeCursor, } from "./firing.js";
+import { advanced, readCursor, readFirings, shouldSkip, stampLive, threw, writeCursor, } from "./firing.js";
 import { admitsTranscript, canonicalHookEvent, dialectFor } from "./agents/registry.js";
-import { DEFAULT_HOOK_BUDGET_MS, deliverFiring, fileSize, wait, } from "./hooks/entry.js";
+import { DEFAULT_HOOK_BUDGET_MS, deliverFiring, fileSize, turnEndCwd, wait, } from "./hooks/entry.js";
 import { claimSessionWriter } from "./hooks/fire_lock.js";
 import { SESSION_END_EVENT, settleDelayMs, settledSize } from "./hooks/session_end.js";
 import { CAPTURE_NOT_APPROVED, credentialFingerprint } from "./post.js";
 import { sessionFileStem } from "./paths.js";
 import { LockLostError, resolveTargets } from "./session_targets.js";
+import { gitToplevel } from "./project.js";
 /** The request timeout of the worker (plan §3.12): finite, longer than the slowest request observed (44 s), shorter than undici's own. */
 export const REQUEST_TIMEOUT_MS = 120_000;
 /** How often the worker re-stamps a session lock it holds, from a timer, whatever its request is doing. */
@@ -81,12 +82,12 @@ async function stepUnderLock(cfg, stem, lock) {
     const first = read.firings[0];
     if (first === undefined)
         return read.blockedByNewer ? { kind: "newer" } : { kind: "idle" };
-    const finish = (klass, requested) => {
+    const finish = (klass, requested, roots) => {
         // ⛔ Beat first: a holder that lost the lock must not move the cursor of the session's new owner.
         if (!lock.refresh())
             return { kind: "lost" };
         return writeCursor(cfg.home, stem, advanced(cursor, first.end))
-            ? { kind: "done", class: klass, elapsedMs: elapsed(), ...(requested === true ? { requested: true } : {}) }
+            ? { kind: "done", class: klass, elapsedMs: elapsed(), ...(requested === true ? { requested: true } : {}), ...(roots === undefined ? {} : { roots }) }
             : { kind: "threw", class: "cursor-unwritable", elapsedMs: elapsed() };
     };
     if (first.firing.id !== cfg.identity) {
@@ -117,7 +118,7 @@ async function stepUnderLock(cfg, stem, lock) {
     cfg.beforeCursorWrite?.();
     switch (outcome.kind) {
         case "done":
-            return finish(outcome.class, outcome.requested);
+            return finish(outcome.class, outcome.requested, outcome.roots);
         case "more":
             return { kind: "more", elapsedMs: elapsed() };
         case "later":
@@ -147,10 +148,17 @@ async function deliverOne(cfg, read, heartbeat, isLastLine) {
         agentId: f.agent,
         readStdin: () => Promise.resolve(""),
     };
+    // ⛔ U11 (recovery): a Cursor firing the HOOK could not resolve (its spawn window refused or timed out a `git` call, or a hook ran from the config folder)
+    // carries the workspace roots it parsed. The worker has no window, so it re-runs the SAME `turnEndCwd` the hook runs (one function, imported, not copied)
+    // and, if that names a work tree, resolves from it. Everything after is the ordinary path: `resolveTargets` applies `isCaptureAllowed` exactly as it does for
+    // a hook-resolved firing, so an unconsented clone yields no target (and no install, no stamp). A firing that already has keys is never touched.
+    const turnEnd = f.keys === undefined && f.roots !== undefined
+        ? turnEndCwd({ home: cfg.home, env: cfg.env }, { cwd: f.cwd, transcriptPath: f.transcript, workspaceRoots: f.roots })
+        : f.cwd;
     const input = {
         sessionId: f.sid,
         transcriptPath: f.transcript,
-        cwd: f.cwd,
+        cwd: turnEnd,
         eventName: f.event,
         ...(f.announced === undefined ? {} : { agentTranscriptPath: f.announced }),
     };
@@ -179,7 +187,7 @@ async function deliverOne(cfg, read, heartbeat, isLastLine) {
         env: cfg.env,
         sessionId: f.sid,
         transcriptPath: f.transcript,
-        turnEndCwd: f.cwd,
+        turnEndCwd: turnEnd,
         mode: isSessionEnd ? "end" : "turn",
         nowMs: Date.now(),
         heartbeat,
@@ -187,9 +195,19 @@ async function deliverOne(cfg, read, heartbeat, isLastLine) {
         ...(settle ? {} : { scanLimit: f.eof }),
         ...knownOf(f),
     });
+    // Counted, never logged: "recovered" = the roots named a work tree the gate granted; "unresolved" = a firing that carried roots and still has no repo.
+    const rootsNote = f.keys === undefined && f.roots !== undefined ? (turnEnd !== f.cwd && resolution.targets.length > 0 ? "recovered" : "unresolved") : undefined;
     if (resolution.targets.length === 0) {
         // Not a failure. But a firing that had a repo and never got a real slug is the one case `status` must be able to name.
-        return { kind: "done", class: f.keys !== undefined && f.slug === undefined ? "undeliverable" : "nothing-granted" };
+        return { kind: "done", class: f.keys !== undefined && f.slug === undefined ? "undeliverable" : "nothing-granted", ...(rootsNote === undefined ? {} : { roots: rootsNote }) };
+    }
+    if (rootsNote === "recovered") {
+        // The hook stamps `.live` for the turn-end repo it resolves; this firing's hook resolved none, so stamp it as of the HOOK's time (`f.at`), for the
+        // repo the gate granted. The post-commit ladder reads it.
+        const top = gitToplevel(turnEnd);
+        if (top !== null && resolution.targets.some((t) => t.kind === "repo" && (t.ledgerKey === top || t.worktrees.includes(top)))) {
+            stampLive(cfg.home, { repoKey: top, sessionId: f.sid }, f.at);
+        }
     }
     const results = await deliverFiring({
         ctx,
@@ -207,8 +225,9 @@ async function deliverOne(cfg, read, heartbeat, isLastLine) {
     const fingerprint = credentialFingerprint(load.credential);
     noteExpiry(cfg, fingerprint, results);
     const folded = foldResults(results);
+    const withNote = (o) => (rootsNote !== undefined && o.kind === "done" ? { ...o, roots: rootsNote } : o);
     // The fingerprint (a hash, never the credential) lets the next hook say "revoked" only about the credential it is about to use.
-    return folded.kind === "fatal" && folded.why === "rejected" ? { ...folded, fingerprint } : folded;
+    return folded.kind === "fatal" && folded.why === "rejected" ? { ...folded, fingerprint } : withNote(folded);
 }
 /**
  * `credential_ending` (plan §3.7): a 2xx carries where the credential stands (`X-Credential-Expires`). The worker remembers it in the SIDECAR (never
