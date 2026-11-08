@@ -358,32 +358,52 @@ export const shouldSkip = (cursor) => cursor.throws >= MAX_FIRING_THROWS;
 // --- liveness ------------------------------------------------------------------------------------------------------------------
 /**
  * Stamp "this session's hook ran at `atMs`" for one repo key. HOOK-ONLY: the worker runs `deliver` with `byHook: false` and never calls
- * this. A JSON object (`{at}`) rather than a bare number so P2's T7 can add `transcript` without a format change; the reader ignores
- * unknown fields. Atomic replace. Never throws; false on failure (the commit then falls to the cold rung or goes unrecorded, as today
- * before a first hook).
+ * this (it stamps only a RECOVERED firing, as of the hook's own time: `replay.ts`). A JSON object (`{at}`, now `{at, agent}`) rather than a bare number
+ * so a field can be added without a format change; the reader ignores unknown fields. Atomic replace. Never throws; false on failure (the commit then
+ * falls to the cold rung or goes unrecorded, as today before a first hook).
+ *
+ * ⛔ **`agent` IS THE TRANSCRIPT ROOT'S AGENT (`agentForTranscript`), NEVER THE HOOK'S `--agent=`.** A Cursor session fires our hook twice, once as
+ * `claude-code` and once as `cursor` (T0 X3, L16), with the same sid and the same transcript. Stamping the hook's own agent would let the
+ * `claude-code` firing mark a Cursor session as Claude Code, and the `agent_mismatch` veto (`spool.ts`) would then refuse the wrong commit.
+ * The caller passes the root's agent, and passes nothing when the transcript is under no agent's root (`unknown`): an absent field reads as "unknown",
+ * which never satisfies the veto.
  */
-export function stampLive(home, key, atMs) {
+export function stampLive(home, key, atMs, agent) {
     const path = sessionLivePath(home, key);
     if (path === null || !Number.isFinite(atMs) || atMs <= 0)
         return false;
     try {
         mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-        writeFileAtomic(path, `${JSON.stringify({ at: atMs })}\n`, 0o600);
+        const stamp = agent !== undefined && KNOWN_AGENTS[agent] === true ? { at: atMs, agent } : { at: atMs };
+        writeFileAtomic(path, `${JSON.stringify(stamp)}\n`, 0o600);
         return true;
     }
     catch {
         return false;
     }
 }
-/** The `.live` stamp at `path`, or null when absent, unreadable or not a positive number. Unknown fields are ignored. */
-export function readLiveFile(path) {
+/**
+ * The agents a `.live` stamp may name. `Record<AgentId, true>` so a fourth agent is a COMPILE error here until it is listed: a stamp naming an agent
+ * this client does not know reads as "unknown", the same as no field.
+ */
+const KNOWN_AGENTS = { "claude-code": true, "codex-cli": true, cursor: true };
+/** The `.live` stamp at `path`, or null when absent, unreadable or `at` is not a positive number. Unknown fields are ignored; an unknown `agent` reads as null. */
+export function readLiveStamp(path) {
     try {
-        const at = JSON.parse(readFileSync(path, "utf8")).at;
-        return typeof at === "number" && Number.isFinite(at) && at > 0 ? at : null;
+        const raw = JSON.parse(readFileSync(path, "utf8"));
+        const at = raw.at;
+        if (typeof at !== "number" || !Number.isFinite(at) || at <= 0)
+            return null;
+        const agent = typeof raw.agent === "string" && Object.hasOwn(KNOWN_AGENTS, raw.agent) ? raw.agent : null;
+        return { at, agent };
     }
     catch {
         return null;
     }
+}
+/** The `.live` stamp's time at `path`, or null when absent, unreadable or not a positive number. Unknown fields are ignored. */
+export function readLiveFile(path) {
+    return readLiveStamp(path)?.at ?? null;
 }
 /**
  * ⛔ THE ONE LIVENESS READER (§3.5). A session is live as of the LATER of its state file's `liveAt` (stamped by `deliver()` for a hook

@@ -35,6 +35,7 @@ import { loadCredential, savedCredentialExists } from "../credential.js";
 import { EXIT } from "../exit.js";
 import { onceRepoSlug, remoteSlugOfCommonDir, resolveRepoSlug } from "../git.js";
 import { emitJson } from "../json.js";
+import { DROP_REASONS, readDropped } from "../dropped_tally.js";
 import { readInferredSkipped } from "../inferred_tally.js";
 import { readPruneTally } from "../pending_prune.js";
 import { resolveProjectKeys } from "../project.js";
@@ -111,6 +112,8 @@ export function status(ctx, argv = [], sync = { kind: "skipped" }) {
     const waiting = commitsWaitingForRepo(ctx.home, projectKey, ctx.now().getTime());
     // `TODOS[175]`: counts of orphan waiting lines discarded in the last 7 days (null = none).
     const discarded = readPruneTally(ctx.home, projectKey, ctx.now().getTime());
+    // Multi-session attribution (T5): commit lines this machine saw and did not link to a session, by reason (null = none while the newest is under 7 days old).
+    const dropped = readDropped(ctx.home, projectKey, ctx.now().getTime());
     // `TODOS[177]`: squashes made by `git reset --soft` that were detected but could not be linked (null = none in the last 7 days).
     const inferredSkipped = readInferredSkipped(ctx.home, projectKey, ctx.now().getTime());
     // `TODOS[177]` follow-up: inferred pairs spooled right now, waiting on an ack that has not (yet) confirmed them.
@@ -243,6 +246,8 @@ export function status(ctx, argv = [], sync = { kind: "skipped" }) {
             commits_waiting: waiting,
             // `TODOS[175]`. Always an object, zeros included. ⛔ A contract change, recorded in `json-read-verbs.test.ts`.
             discarded_stale: { lines: discarded?.lines ?? 0, files: discarded?.files ?? 0 },
+            // Multi-session attribution (T5). Always an object, zeros included, one key per reason. ⛔ A contract change, recorded in `json-read-verbs.test.ts`.
+            dropped_commits: Object.fromEntries([["total", dropped?.total ?? 0], ...DROP_REASONS.map((reason) => [reason, dropped?.[reason] ?? 0])]),
             inferred_skipped: {
                 oversize: inferredSkipped?.oversize ?? 0,
                 sha256: inferredSkipped?.sha256 ?? 0,
@@ -326,6 +331,9 @@ export function status(ctx, argv = [], sync = { kind: "skipped" }) {
     }
     if (discarded !== null && discarded.lines > 0) {
         lines.push("", ...wrap(STATUS.discardedStale(discarded.lines), 2));
+    }
+    if (dropped !== null && dropped.total > 0) {
+        lines.push("", ...wrap(STATUS.droppedCommits(dropped.total, dropped.held_ambiguous), 2));
     }
     // `CR-216/U3`. Same precedent as `neverSent` above: a SENTENCE, not a fifth
     // gutter row — §10.3 draws four questions in a fixed order and the order is the

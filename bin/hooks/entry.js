@@ -51,6 +51,7 @@ import { dialectIsolates, evidenceSpecFor, findSubagentTranscripts, isolationOf,
 import { readSpoolUnion } from "../spool_union.js";
 import { fileState, loadSessionState, saveSessionState, withFileState } from "../state.js";
 import { admitsTranscript, agentForTranscript, canonicalHookEvent, dialectFor, } from "../agents/registry.js";
+import { UNKNOWN_AGENT_ID } from "../agents/types.js";
 import { FIRING_VERSION, MAX_FIRING_SUB_FILES, capRoots, recordFiring, liveAtOf, liveStampKeys, stampLive } from "../firing.js";
 import { identityDigest } from "../identity.js";
 import { readUploaderStatus } from "../uploader_status.js";
@@ -495,8 +496,11 @@ async function hookBody(ctx, budgetMs, hookStartedAt) {
     };
     recordFiring(ctx.home, input.sessionId, firing);
     // Appended FIRST, stamped second, lock read third: the worker releases THEN looks at the queue, so one side always sees the other.
+    // The stamp names the TRANSCRIPT ROOT's agent, never `ctx.agentId`: a Cursor session also fires this hook as `claude-code` (T0 X3), and a stamp that
+    // believed the flag would mark a Cursor session as Claude Code. Outside every root: no field (it reads as unknown, which no rule acts on).
+    const stampAgent = agentForTranscript(ctx.home, ctx.env, input.transcriptPath);
     for (const key of stampKeys)
-        stampLive(ctx.home, { repoKey: key, sessionId: input.sessionId }, firedAt);
+        stampLive(ctx.home, { repoKey: key, sessionId: input.sessionId }, firedAt, stampAgent === UNKNOWN_AGENT_ID ? undefined : stampAgent);
     // --- NOTICES come from the worker's status file (plan §3.7): the hook cannot see this firing's outcome, only earlier ones. ---
     const status = readUploaderStatus(ctx.home, identity);
     const payload = (() => {

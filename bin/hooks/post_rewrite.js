@@ -38,9 +38,10 @@
  * process, not the 5s Claude Code hook path.
  */
 import { EXIT } from "../exit.js";
-import { DEFAULT_AGENT_ID, dialectFor } from "../agents/registry.js";
+import { committingSession } from "../agents/registry.js";
 import { isCaptureAllowed } from "../consent.js";
 import { gitProbe, onceRepoSlug } from "../git.js";
+import { readAncestry } from "../process_ancestry.js";
 import { resolveProjectKeys } from "../project.js";
 import { activeSessionFor, appendRewrites, collapseObservedIntermediates, isFullSha, readPending, readSpool, recordRebaseAmends, takeRebaseAmends, } from "../spool.js";
 import { existsSync } from "node:fs";
@@ -111,7 +112,12 @@ export function observeRewrites(ctx) {
     // nothing for it to put on `x-commit-attributions`. The ladder is used here for
     // the one thing it still decides on this path: which session's spool the pair
     // belongs in, so that the next hook for that session delivers it.
-    const active = activeSessionFor(ctx.home, toplevel, envSessionId(ctx.env));
+    //
+    // WHO IS REWRITING is `committingSession`'s, the same single owner `post-commit` asks (multi-session attribution): a nested agent's rewrite names the NEAREST agent's session, not the
+    // outer one (T0 X2). Only the SESSION is used. The agent is not: this path never vetoes, because a pair claims nothing about authorship. A walk that cannot say leaves no id, and
+    // the ladder files the pair by liveness as it always did for a commit with no id.
+    const committing = committingSession(ctx.env, ctx.ancestry ?? readAncestry);
+    const active = activeSessionFor(ctx.home, toplevel, committing.kind === "agent" ? committing.sessionId : null);
     if (active === null)
         return 0;
     const key = { repoKey: toplevel, sessionId: active.sessionId };
@@ -144,10 +150,6 @@ function rebaseInProgress(dir) {
     if (path === "")
         return false;
     return existsSync(isAbsolute(path) ? path : join(dir, path));
-}
-/** See `post_commit.ts`'s copy — the dialect answers, and this file does not read the variable. */
-function envSessionId(env) {
-    return dialectFor(DEFAULT_AGENT_ID).sessionIdFromEnv(env);
 }
 /**
  * `<ancestor> <successor>` per line, whitespace-separated.

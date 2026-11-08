@@ -36,8 +36,9 @@
  *
  * Nothing here throws: a hook must exit 0.
  */
-import { appendFileSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { appendEvents, sumRun } from "./event_tally.js";
 import { repoSessionsDir } from "./paths.js";
 export const PENDING_TTL_MS = 7 * 24 * 3600_000;
 export const PRUNE_MAX_FILES = 50;
@@ -165,30 +166,31 @@ export function pruneOrphanPending(home, repoKey, nowMs, seams = {}) {
             }
         }
         if (files > 0 || lines > 0)
-            recordTally(dir, files, lines, nowMs);
+            recordPruneTally(dir, files, lines, nowMs);
     }
     catch {
         /* never throw from a hook */
     }
     return { files, lines };
 }
-function readTally(dir) {
+const SHAPE = {
+    reasons: new Set(["files", "lines"]),
+    legacy: (o) => {
+        if (!(Number.isSafeInteger(o.files) && Number.isSafeInteger(o.lines) && typeof o.at === "number" && Number.isFinite(o.at)))
+            return null;
+        return [
+            { r: "files", n: o.files, at: o.at },
+            { r: "lines", n: o.lines, at: o.at },
+        ].filter((e) => e.n > 0);
+    },
+};
+/** Record one prune event: `files` removed and `lines` discarded. Exported for the concurrency cell; the sweep is its only caller. Never throws. */
+export function recordPruneTally(dir, files, lines, nowMs) {
     try {
-        const t = JSON.parse(readFileSync(join(dir, TALLY_NAME), "utf8"));
-        if (Number.isSafeInteger(t.files) && Number.isSafeInteger(t.lines) && typeof t.at === "number" && Number.isFinite(t.at))
-            return t;
-    }
-    catch {
-        /* absent or damaged: no tally */
-    }
-    return null;
-}
-function recordTally(dir, files, lines, nowMs) {
-    try {
-        const prev = readTally(dir);
-        const carry = prev !== null && nowMs - prev.at <= PENDING_TTL_MS ? prev : { files: 0, lines: 0, at: nowMs };
-        const next = { files: carry.files + files, lines: carry.lines + lines, at: nowMs };
-        writeFileSync(join(dir, TALLY_NAME), `${JSON.stringify(next)}\n`, { mode: 0o600 });
+        appendEvents(join(dir, TALLY_NAME), SHAPE, [
+            { r: "files", n: files },
+            { r: "lines", n: lines },
+        ], nowMs);
     }
     catch {
         /* the discard already happened; failing to announce it must not undo or throw */
@@ -199,9 +201,9 @@ export function readPruneTally(home, repoKey, nowMs) {
     const dir = repoSessionsDir(home, repoKey);
     if (dir === null)
         return null;
-    const t = readTally(dir);
-    if (t === null || nowMs - t.at > PENDING_TTL_MS || (t.files === 0 && t.lines === 0))
+    const sums = sumRun(join(dir, TALLY_NAME), SHAPE, nowMs);
+    if (sums === null || (sums.files === 0 && sums.lines === 0))
         return null;
-    return { files: t.files, lines: t.lines };
+    return { files: sums.files, lines: sums.lines };
 }
 //# sourceMappingURL=pending_prune.js.map

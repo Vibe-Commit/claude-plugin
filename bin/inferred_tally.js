@@ -25,35 +25,29 @@
  * Counts only — never a sha, a path or a branch. One small file per repo beside the session files, named so no
  * scanner matches it (`pruned-pending.tally`'s rule); a tally older than 7 days restarts instead of accumulating.
  * Never throws: this can run inside the user's `git commit`.
+ *
+ * ⛔ **APPEND-ONLY SINCE THE MULTI-SESSION ATTRIBUTION WAVE (D12 · OV3).** This used to read the JSON object, add to it and write it back with no lock, so the worker and a concurrent `backfill` or
+ * `finalize` of another session in the same repo could lose an increment and turn a counted loss silent again. It is now one `O_APPEND` line per event (`event_tally.ts`, the same
+ * core as `dropped-commits.tally` and `pruned-pending.tally`); the window, the units and `status`'s sentences are unchanged, and a file an older client wrote still reads (as events at its own time).
  */
-import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { appendEvents, sumRun } from "./event_tally.js";
 import { repoSessionsDir } from "./paths.js";
 const TALLY_NAME = "inferred-skipped.tally";
-const TTL_MS = 7 * 24 * 3600_000;
+const REASONS = ["oversize", "sha256", "set_aside", "pruned"];
 /**
- * ⚠ ADDITIVE: `set_aside`/`pruned` default to 0 when absent, rather than invalidating a tally written by 0.4.2 or
- * earlier (which has `oversize`/`sha256` and no concept of the other two) — a missing field means "before this
- * existed," never "corrupt," same instinct as `SpoolEntry.observedAt?`.
+ * ⚠ A line written by 0.12.0 or earlier is ONE JSON object `{oversize, sha256, [set_aside, pruned,] at}`. It reads as up to four events at its own `at`. ADDITIVE as it always was:
+ * `set_aside`/`pruned` default to 0 when absent (0.4.2 and earlier have neither), rather than invalidating the line.
  */
-function read(dir) {
-    try {
-        const t = JSON.parse(readFileSync(join(dir, TALLY_NAME), "utf8"));
-        if (!(Number.isSafeInteger(t.oversize) && Number.isSafeInteger(t.sha256) && typeof t.at === "number" && Number.isFinite(t.at)))
+const SHAPE = {
+    reasons: new Set(REASONS),
+    legacy: (o) => {
+        if (!(Number.isSafeInteger(o.oversize) && Number.isSafeInteger(o.sha256) && typeof o.at === "number" && Number.isFinite(o.at)))
             return null;
-        return {
-            oversize: t.oversize,
-            sha256: t.sha256,
-            set_aside: Number.isSafeInteger(t.set_aside) ? t.set_aside : 0,
-            pruned: Number.isSafeInteger(t.pruned) ? t.pruned : 0,
-            at: t.at,
-        };
-    }
-    catch {
-        /* absent or damaged: no tally */
-    }
-    return null;
-}
+        const count = (v) => (Number.isSafeInteger(v) ? v : 0);
+        return REASONS.map((r) => ({ r, n: count(o[r]), at: o.at })).filter((e) => e.n > 0);
+    },
+};
 /**
  * Count `count` (default 1) pairs/squashes skipped for one reason. Never throws.
  *
@@ -69,18 +63,9 @@ function read(dir) {
 export function recordInferredSkipped(home, repoKey, reason, nowMs = Date.now(), count = 1) {
     try {
         const dir = repoSessionsDir(home, repoKey);
-        if (dir === null || count <= 0)
+        if (dir === null)
             return;
-        const prev = read(dir);
-        const carry = prev !== null && nowMs - prev.at <= TTL_MS ? prev : { oversize: 0, sha256: 0, set_aside: 0, pruned: 0, at: nowMs };
-        const next = {
-            oversize: carry.oversize + (reason === "oversize" ? count : 0),
-            sha256: carry.sha256 + (reason === "sha256" ? count : 0),
-            set_aside: carry.set_aside + (reason === "set_aside" ? count : 0),
-            pruned: carry.pruned + (reason === "pruned" ? count : 0),
-            at: nowMs,
-        };
-        writeFileSync(join(dir, TALLY_NAME), `${JSON.stringify(next)}\n`, { mode: 0o600 });
+        appendEvents(join(dir, TALLY_NAME), SHAPE, [{ r: reason, n: count }], nowMs);
     }
     catch {
         /* the event already happened; failing to count it must not throw */
@@ -91,9 +76,9 @@ export function readInferredSkipped(home, repoKey, nowMs) {
     const dir = repoSessionsDir(home, repoKey);
     if (dir === null)
         return null;
-    const t = read(dir);
-    if (t === null || nowMs - t.at > TTL_MS || (t.oversize === 0 && t.sha256 === 0 && t.set_aside === 0 && t.pruned === 0))
+    const sums = sumRun(join(dir, TALLY_NAME), SHAPE, nowMs);
+    if (sums === null || (sums.oversize === 0 && sums.sha256 === 0 && sums.set_aside === 0 && sums.pruned === 0))
         return null;
-    return { oversize: t.oversize, sha256: t.sha256, set_aside: t.set_aside, pruned: t.pruned };
+    return { oversize: sums.oversize, sha256: sums.sha256, set_aside: sums.set_aside, pruned: sums.pruned };
 }
 //# sourceMappingURL=inferred_tally.js.map

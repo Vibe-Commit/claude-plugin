@@ -46,7 +46,8 @@ import { dirname, join } from "node:path";
 import { keepsPendingLine } from "./pending_bound.js";
 import { repoKeyNotePath, repoSessionsDir, sessionStatePath } from "./paths.js";
 import { writeFileAtomic } from "./atomic_write.js";
-import { liveAtOf } from "./firing.js";
+import { recordDropped } from "./dropped_tally.js";
+import { liveAtOf, readLiveStamp } from "./firing.js";
 /**
  * How many SHAs one hook may put on the wire.
  *
@@ -198,6 +199,29 @@ export function wellFormedCommitLines(raw, cap = Infinity) {
     return Math.min(n, cap);
 }
 /**
+ * ⛔ **EVERY CONSUMED LINE THAT IS NOT DELIVERED IS COUNTED, ONCE, BEFORE THE REWRITE THAT DELETES IT (T5 · D6 · OV3).** A line that is consumed and never goes on the wire is deleted by
+ * the 2xx that carried its neighbours: a HELD line (`recency_heuristic`: two sessions were live; `env_session_unmatched`: it named a session that matches none) or a line that does
+ * not parse (`torn`). Until now that was silent. A wire line is delivered (or kept for the retry the server asked for), not dropped, and is never counted here.
+ *
+ * Counted by REASON; one `recordDropped` per reason per call. The count is taken from the lines being consumed in THIS call, which the rewrite removes from the file, so a re-read
+ * of the same spool counts nothing more. (A rewrite that then FAILS leaves the lines and counts them again on the retry: a tiny, stated window.)
+ */
+function countConsumedDrops(home, repoKey, consumed) {
+    const counts = new Map();
+    const bump = (reason) => void counts.set(reason, (counts.get(reason) ?? 0) + 1);
+    for (const line of consumed) {
+        const entry = parseEntry(line);
+        if (entry === null)
+            bump("torn");
+        else if (!WIRE_RUNGS.includes(entry.attribution))
+            bump(heldReasonOf(entry.attribution));
+    }
+    for (const [reason, n] of counts)
+        recordDropped(home, repoKey, reason, n);
+}
+/** A line that never goes on the wire: `recency_heuristic` is the ambiguous hold; every other non-wire rung is a session that was named and matched nothing. */
+const heldReasonOf = (rung) => (rung === "recency_heuristic" ? "held_ambiguous" : "held_unmatched");
+/**
  * Drop the first `count` entries — called ONLY after the server's 2xx.
  *
  * ⚠ **RE-READS BEFORE REWRITING, and that is not defensive tidiness.**
@@ -221,7 +245,8 @@ export function dropSpooled(home, key, count) {
     if (path === null || count <= 0)
         return false;
     try {
-        const { rest } = walkConsumed(readFileSync(path, "utf8"), count, isEntryLine);
+        const { consumed, rest } = walkConsumed(readFileSync(path, "utf8"), count, isEntryLine);
+        countConsumedDrops(home, key.repoKey, consumed);
         writeFileSync(path, rest.map((l) => `${l}\n`).join(""), { mode: 0o600 });
         chmodSync(path, 0o600);
         return true;
@@ -259,6 +284,7 @@ export function settleSpooled(home, key, count, keep) {
             const entry = parseEntry(line);
             return entry !== null && WIRE_RUNGS.includes(entry.attribution) && keep.has(entry.sha);
         });
+        countConsumedDrops(home, key.repoKey, consumed); // a KEPT line is a wire line, which is never counted: the retry the server asked for is not a drop
         writeFileSync(path, [...kept, ...rest].map((l) => `${l}\n`).join(""), { mode: 0o600 });
         chmodSync(path, 0o600);
         return true;
@@ -286,12 +312,15 @@ export function settleSpooledLines(home, key, consume, keep) {
         const lines = readFileSync(path, "utf8").split("\n").filter((l) => l.trim() !== "");
         const last = Math.max(...consume);
         const out = [];
+        const dropped = [];
         let index = 0;
         for (const line of lines) {
             const entry = parseEntry(line);
             if (entry === null) {
-                if (index <= last)
-                    continue; // malformed, inside the consumed region: dropped for free
+                if (index <= last) {
+                    dropped.push(line); // malformed, inside the consumed region: dropped for free (and counted: `torn`)
+                    continue;
+                }
                 out.push(line);
                 continue;
             }
@@ -303,7 +332,10 @@ export function settleSpooledLines(home, key, consume, keep) {
             }
             if (WIRE_RUNGS.includes(entry.attribution) && keep.has(entry.sha))
                 out.push(line);
+            else
+                dropped.push(line);
         }
+        countConsumedDrops(home, key.repoKey, dropped);
         writeFileSync(path, out.map((l) => `${l}\n`).join(""), { mode: 0o600 });
         chmodSync(path, 0o600);
         return true;
@@ -383,10 +415,31 @@ export function settleSpooledLines(home, key, consume, keep) {
  * forgot the env path, and this seam has no other check.
  */
 export function activeSessionFor(home, repoKey, envSessionId, nowMs = Date.now(), windowMs = SESSION_LIVE_WINDOW_MS) {
+    // No agent is claimed here, so the veto below can never fire: this is the ladder exactly as it was, for every caller that has no agent evidence to offer.
+    const answer = ladder(home, repoKey, envSessionId, null, nowMs, windowMs);
+    return answer.kind === "session" ? answer.session : null;
+}
+/**
+ * ⛔ **THE LADDER WITH THE COMMITTING AGENT (multi-session attribution, T3; D5).** `activeSessionFor` plus one arm: when the commit carries NO session id, its environment names an
+ * agent (`committingSession`), exactly ONE session is live in this clone, and THAT session's `.live` stamp names a DIFFERENT, KNOWN agent, the answer is a REFUSAL
+ * (`agent_mismatch`), not `sole_live_session`. The link would be written on evidence that it is wrong (a Codex first-turn commit while only a Claude Code session is live: Codex stamps
+ * nothing before its first Stop), and an edge is permanent (cr071).
+ *
+ * What does NOT change, each pinned by a cell: a commit that carries an id (rung 1, the cold rung and the named refusal are decided before this arm is reached, so an id always wins);
+ * no agent evidence (a human: `sole_live_session`, D5); the same agent; a live session whose agent is UNKNOWN (a state file only, or a stamp from before the field existed: no veto
+ * without a known agent); two or more live sessions (held, `recency_heuristic`).
+ *
+ * `agent` has NO default: a caller that forgot it would silently skip the veto, and the compiler is the only thing that will notice.
+ */
+export function attributionFor(home, repoKey, envSessionId, agent, nowMs = Date.now(), windowMs = SESSION_LIVE_WINDOW_MS) {
+    return ladder(home, repoKey, envSessionId, agent, nowMs, windowMs);
+}
+function ladder(home, repoKey, envSessionId, agent, nowMs, windowMs) {
+    const session = (s) => ({ kind: "session", session: s });
     const live = liveSessions(home, repoKey, nowMs, windowMs);
     // Rung 1 — the committing process told us, and a state file agrees.
     if (envSessionId !== null && live.some((s) => s.sessionId === envSessionId)) {
-        return { sessionId: envSessionId, attribution: "env_session_id" };
+        return session({ sessionId: envSessionId, attribution: "env_session_id" });
     }
     // ⛔ **THE COLD CASE — `CR-195`/D208, and it used to DROP THE COMMIT SILENTLY.**
     //
@@ -439,27 +492,32 @@ export function activeSessionFor(home, repoKey, envSessionId, nowMs = Date.now()
     // the case `agents/registry.ts:11-13` describes). The line is `pending`, not sendable: it promotes only if THAT
     // session's own hook later corroborates it, and otherwise ages out under `MAX_PENDING_SHAS`.
     if (envSessionId !== null && sessionStatePath(home, { repoKey, sessionId: envSessionId }) !== null) {
-        return { sessionId: envSessionId, attribution: "env_session_uncorroborated" };
+        return session({ sessionId: envSessionId, attribution: "env_session_uncorroborated" });
     }
     if (live.length === 0)
-        return null;
+        return { kind: "none" };
     // ⛔ THE NAMED REFUSAL, AND IT COMES BEFORE BOTH WRITE RUNGS. We were TOLD who
     // committed, and it is none of these — and now only when there is POSITIVE
     // evidence against the named session: its state file exists, so it is not on its
     // first turn, and it is not live. Falling through would attribute the commit to a
     // session we have positive evidence did not make it.
     if (envSessionId !== null) {
-        return { sessionId: live[0].sessionId, attribution: "env_session_unmatched" };
+        return session({ sessionId: live[0].sessionId, attribution: "env_session_unmatched" });
     }
     // Rung 2 — D5. One session, nothing contradicting it.
     if (live.length === 1) {
-        return { sessionId: live[0].sessionId, attribution: "sole_live_session" };
+        // T3 · D5: the one live session is known to be a DIFFERENT agent's than the one that made this commit. Reaching here means the commit carries no id, so only
+        // the agent's marker can say so. A missing agent on either side (a human; an old or state-only session) is not evidence, and the commit is `sole_live_session` as ever.
+        const only = live[0];
+        if (agent !== null && only.agent !== null && only.agent !== agent)
+            return { kind: "refused", reason: "agent_mismatch" };
+        return session({ sessionId: only.sessionId, attribution: "sole_live_session" });
     }
     // ⛔ Rung 3 — the guess, and TWO OR MORE candidates is now structurally
     // guaranteed here: every path with an env id returned above, and one candidate
     // returned on the line before. `commit_attributions_ambiguity_is_plural`
     // requires exactly that, and a cardinality-one row is refused 23514.
-    return { sessionId: live[0].sessionId, attribution: "recency_heuristic" };
+    return session({ sessionId: live[0].sessionId, attribution: "recency_heuristic" });
 }
 /**
  * `SessionState.liveAt` of one state file, or null when it is absent, unreadable or not a positive number.
@@ -529,7 +587,8 @@ function liveSessions(home, repoKey, nowMs, windowMs) {
         const touchedAt = readLiveAt(join(dir, entry));
         if (touchedAt === null || nowMs - touchedAt > windowMs)
             continue;
-        live.push({ sessionId: stem, at: touchedAt });
+        // T4: the agent rides the same stem's `.live` stamp (a state file alone, or a stamp written before this field existed, is `null` = unknown, which no rule acts on).
+        live.push({ sessionId: stem, at: touchedAt, agent: readLiveStamp(join(dir, `${stem}.live`))?.agent ?? null });
     }
     // ⚠ Ties broken by name so the guess is at least DETERMINISTIC. Two state files
     // written in the same millisecond is ordinary on a coarse-grained filesystem,
@@ -1495,6 +1554,10 @@ export function appendPending(home, key, entry, seams = {}) {
 }
 /** Every uncorroborated entry for this session, oldest first, at most the newest `MAX_PENDING_SHAS` (the cap lives HERE since `appendPending` no longer rewrites). */
 export function readPending(home, key) {
+    return readPendingAll(home, key).slice(-MAX_PENDING_SHAS);
+}
+/** Every well-formed pending line, oldest first, with NO cap: `readPending` shows only the newest `MAX_PENDING_SHAS`, and the rest are what the cap drops (counted, T5). */
+function readPendingAll(home, key) {
     const path = pendingSpoolPath(home, key);
     if (path === null)
         return [];
@@ -1511,7 +1574,7 @@ export function readPending(home, key) {
         if (entry !== null)
             out.push(entry);
     }
-    return out.slice(-MAX_PENDING_SHAS);
+    return out;
 }
 /** Remove the pending file entirely. Used once its lines have been promoted. */
 export function clearPending(home, key) {
@@ -1576,23 +1639,38 @@ bound, mode,
  * delivery, so a pending line with `observedAt > asOfMs` is neither promoted nor dropped: it stays in the file. Unset means "now" and
  * every line is due, which is what the inline hook always meant. A line with NO `observedAt` (an older client) is always due.
  */
-asOfMs = Number.POSITIVE_INFINITY) {
+asOfMs = Number.POSITIVE_INFINITY, seams = {}) {
     void corroboration;
-    const pending = readPending(home, key);
+    const all = readPendingAll(home, key);
+    const pending = all.slice(-MAX_PENDING_SHAS);
     if (pending.length === 0)
         return 0;
+    // T5 · `pending_over_cap`: the lines OLDER than the newest `MAX_PENDING_SHAS` were never examined here and this pass's settle deletes them (unless they were observed after this
+    // firing, which settle keeps). They are a loss: counted now, before it happens.
+    const unseen = all.slice(0, all.length - pending.length).filter((e) => !(e.observedAt !== undefined && e.observedAt > asOfMs));
+    if (unseen.length > 0)
+        recordDropped(home, key.repoKey, "pending_over_cap", unseen.length);
     let promoted = 0;
+    // D10 · OV4: a corroborated line whose insert did NOT land stays in the pending file and is retried by the next promotion, instead of being deleted with the settled
+    // ones (a silent loss of a commit this session was proved to have made). Still bounded: `MAX_PENDING_SHAS` caps what the file keeps and the 7-day prune ages it out.
+    const retry = new Set();
     for (const entry of pending) {
         if (entry.observedAt !== undefined && entry.observedAt > asOfMs)
             continue;
-        if (!keepsPendingLine(entry, bound, mode))
+        if (!keepsPendingLine(entry, bound, mode)) {
+            // T5 · `pending_before_turn`: the promotion bound refuses this line (observed before the turn being delivered began, or a stale session with no turn start). A decision, not a
+            // failure: the line is deleted by the settle below, so it is counted here, once.
+            recordDropped(home, key.repoKey, "pending_before_turn");
             continue;
+        }
         // U2: `observedAt` STAYS on the line. It is the clock the worker pins a delivery by (`observedAt <= firing.at`), and a promoted
         // line is no exception: a commit made in turn 2 must not ride a delivery capped at turn 1 because it passed through pending.
-        if (insertSpooled(home, key, { ...entry, attribution: "env_session_id" }))
+        if (insertSpooled(home, key, { ...entry, attribution: "env_session_id" }, seams))
             promoted += 1;
+        else
+            retry.add(entry.sha);
     }
-    settlePending(home, key, asOfMs);
+    settlePending(home, key, asOfMs, retry);
     return promoted;
 }
 /**
@@ -1606,28 +1684,25 @@ asOfMs = Number.POSITIVE_INFINITY) {
  * Appends when nothing newer is there (the common case: one `appendFileSync`); rewrites the file, keeping every other line's raw text,
  * only when something is. The rewrite shares `dropSpooled`'s accepted window (D14).
  */
-function insertSpooled(home, key, entry) {
+function insertSpooled(home, key, entry, seams = {}) {
     const path = spoolPath(home, key);
     if (path === null)
         return false;
     try {
         mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
         noteRepoKey(home, key.repoKey);
+        // D10: READ the spool first, always. A sha already in it is never inserted again: the next promotion after a write that LANDED but reported failure must not put a second
+        // line in, because a commit sent into a sealed turn twice is a second permanent edge (`cr071:157`). Already there counts as landed.
+        const lines = readSpoolLines(path);
+        if (lines.some((l) => parseEntry(l)?.sha === entry.sha))
+            return true;
         const line = JSON.stringify(entry);
         const at = entry.observedAt;
-        let lines = [];
-        if (at !== undefined) {
-            try {
-                lines = readFileSync(path, "utf8").split("\n").filter((l) => l.trim() !== "");
-            }
-            catch {
-                lines = [];
-            }
-        }
         const newer = at === undefined ? -1 : lines.findIndex((l) => {
             const e = parseEntry(l);
             return e !== null && e.observedAt !== undefined && e.observedAt > at;
         });
+        seams.beforeWrite?.(entry);
         if (newer === -1) {
             appendFileSync(path, `${line}\n`, { mode: 0o600 });
         }
@@ -1635,11 +1710,29 @@ function insertSpooled(home, key, entry) {
             lines.splice(newer, 0, line);
             writeFileSync(path, lines.map((l) => `${l}\n`).join(""), { mode: 0o600 });
         }
+        seams.afterWrite?.(entry);
         chmodSync(path, 0o600);
-        return true;
+    }
+    catch {
+        // A failure ANYWHERE above, the `chmod` after a write that landed included, is not yet a failure to INSERT: the answer is whether the line is there.
+    }
+    // D10 "landed": the sha is in the spool file after the attempt (a re-read; promotion and delivery run under the same session writer lock, so nothing else moves it meanwhile).
+    try {
+        return readSpoolLines(path).some((l) => parseEntry(l)?.sha === entry.sha);
     }
     catch {
         return false;
+    }
+}
+/** The non-empty lines of a spool file; none when it does not exist. Throws on any other read failure (a caller's `catch` decides). */
+function readSpoolLines(path) {
+    try {
+        return readFileSync(path, "utf8").split("\n").filter((l) => l.trim() !== "");
+    }
+    catch (error) {
+        if (error.code === "ENOENT")
+            return [];
+        throw error;
     }
 }
 /**
@@ -1647,11 +1740,11 @@ function insertSpooled(home, key, entry) {
  * Re-reads the file so a line `post-commit` appended since the pass began is judged by its own clock, not lost; with nothing newer
  * the file is removed, as `clearPending` always did. The kept lines are capped at `MAX_PENDING_SHAS`.
  */
-function settlePending(home, key, asOfMs) {
+function settlePending(home, key, asOfMs, retry = new Set()) {
     const path = pendingSpoolPath(home, key);
     if (path === null)
         return;
-    if (asOfMs === Number.POSITIVE_INFINITY) {
+    if (asOfMs === Number.POSITIVE_INFINITY && retry.size === 0) {
         clearPending(home, key);
         return;
     }
@@ -1660,9 +1753,13 @@ function settlePending(home, key, asOfMs) {
             .split("\n")
             .filter((l) => {
             const e = parseEntry(l);
-            return e !== null && e.observedAt !== undefined && e.observedAt > asOfMs;
-        })
-            .slice(-MAX_PENDING_SHAS);
+            // D10: a line whose insert did not land is KEPT (`retry`), beside the lines observed after this firing.
+            return e !== null && ((e.observedAt !== undefined && e.observedAt > asOfMs) || retry.has(e.sha));
+        });
+        // T5 · `pending_over_cap`: kept lines past the cap are the OLDEST of them, and they go.
+        if (keep.length > MAX_PENDING_SHAS)
+            recordDropped(home, key.repoKey, "pending_over_cap", keep.length - MAX_PENDING_SHAS);
+        keep.splice(0, Math.max(0, keep.length - MAX_PENDING_SHAS));
         if (keep.length === 0)
             clearPending(home, key);
         else

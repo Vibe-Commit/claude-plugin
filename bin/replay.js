@@ -28,7 +28,7 @@ import { loadCredential } from "./credential.js";
 import { noteCredentialExpiry } from "./credential_meta.js";
 import { advanced, readCursor, readFirings, shouldSkip, stampLive, threw, writeCursor, } from "./firing.js";
 import { admitsTranscript, agentForTranscript, canonicalHookEvent, dialectFor } from "./agents/registry.js";
-import { SEAL_GROWTH_MAX_BYTES } from "./agents/types.js";
+import { SEAL_GROWTH_MAX_BYTES, UNKNOWN_AGENT_ID } from "./agents/types.js";
 import { DEFAULT_HOOK_BUDGET_MS, deliverFiring, fileSize, scannedOffsets, turnEndCwd, wait, } from "./hooks/entry.js";
 import { claimSessionWriter } from "./hooks/fire_lock.js";
 import { closeSync, openSync, readSync } from "node:fs";
@@ -210,7 +210,8 @@ async function deliverOne(cfg, read, heartbeat, isLastLine, sealStem) {
         // repo the gate granted. The post-commit ladder reads it.
         const top = gitToplevel(turnEnd);
         if (top !== null && resolution.targets.some((t) => t.kind === "repo" && (t.ledgerKey === top || t.worktrees.includes(top)))) {
-            stampLive(cfg.home, { repoKey: top, sessionId: f.sid }, f.at);
+            const root = agentForTranscript(cfg.home, cfg.env, f.transcript);
+            stampLive(cfg.home, { repoKey: top, sessionId: f.sid }, f.at, root === UNKNOWN_AGENT_ID ? undefined : root);
         }
     }
     const results = await deliverFiring({

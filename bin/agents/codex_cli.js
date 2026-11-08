@@ -15,6 +15,7 @@ import { readdirSync, realpathSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import { CODEX_INDEX_FILE, codexHooksPath, codexIndexDir, codexTranscriptRoot, isInside, isTranscriptFile, } from "../paths.js";
+import { envValue } from "./evidence.js";
 import { readEntries, sessionFile } from "./session_listing.js";
 import { topLevelTimestampMs } from "./types.js";
 /**
@@ -325,13 +326,22 @@ export const CODEX_CLI = {
     // Last-turn seal (R2 · D9-A): UNMEASURED live. Any byte after the hook blocks the seal (a "leave the task running" exit can keep writing); only zero growth seals.
     growthAllowsSeal: (growth) => growth.length === 0,
     recordTimeMs: topLevelTimestampMs,
-    // ⛔ **UNMEASURED.** `null` here does NOT mean "Codex CLI has no session id in
-    // its environment" — it means nobody has run the measurement `M1` ran for
-    // Claude Code (agent commit, human commit, worktree commit) against Codex, so
-    // this client has no variable it can honestly name. ⚠ Read it as the absence
-    // of a measurement, not as a fact about the agent. Measuring it is a change to
-    // this line and nothing else.
-    sessionIdFromEnv: () => null,
+    // ⛔ **MEASURED (T0, 2026-11-08, `codex exec` 0.167.0, `gpt-6-luna` low, scratch repo, probe `post-commit`).** Codex exports TWO variables into every shell it
+    // runs, and git hands them to `post-commit`: `CODEX_THREAD_ID` and `CODEX_SESSION_ID`. On both ROOT runs (X1: every `CLAUDE_*` unset; X2: an outer
+    // `CLAUDE_CODE_SESSION_ID` left set) the two were EQUAL, equal to the `thread.started` id and to the rollout file's id, and equal to the `sid` our own hook
+    // recorded for that session (firings: `agent: codex-cli`). Source read, `openai/codex` `rust-v0.167.0`: `core/src/exec_env.rs:30-50` injects `CODEX_THREAD_ID`
+    // (the thread) and `inject_session_env` sets `CODEX_SESSION_ID`, "the shared root-session identity".
+    //
+    // ⛔ **`CODEX_SESSION_ID` FIRST, then `CODEX_THREAD_ID`: M4's rule (a sub-agent's commit binds the PARENT session),** as for Claude Code. A Codex SUB-AGENT's thread id
+    // is the child's, a thread no hook of ours ever buckets, so its commit would take the cold rung under an id that is never promoted and age out; the root
+    // identity binds the parent. ⚠ The sub-agent arm (X1b) is UNRUN: this ordering rests on the source read, and each variable alone has its own cell.
+    // Versions before 0.167.0 are unmeasured.
+    sessionIdFromEnv: (env) => envValue(env, "CODEX_SESSION_ID") ?? envValue(env, "CODEX_THREAD_ID"),
+    // MEASURED (T0 X1/X2): `CODEX_VERSION=0.167.0` and `CODEX_CI=1` (and `CODEX_MANAGED_BY_NPM=1`) in a `codex exec` shell; the nearest agent ancestor of `git`
+    // was `…/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex`. ⚠ `CODEX_CI=1` suggests `codex exec` marks itself as CI: an interactive Codex may differ
+    // in markers (not in ids, per the source read).
+    markedInEnv: (env) => envValue(env, "CODEX_VERSION") !== null || envValue(env, "CODEX_CI") !== null,
+    claimsProcess: (name) => name === "codex",
     sessionSource: codexSessionSource,
     // ⛔ NO `locateCurrentTranscript`, and the omission is the decision. Finding
     // the repository would mean reading a `cwd` out of the transcript's own
