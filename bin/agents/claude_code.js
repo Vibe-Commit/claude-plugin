@@ -346,6 +346,9 @@ export const CLAUDE_CODE = {
     growthAllowsSeal: claudeGrowthAllowsSeal,
     recordTimeMs: topLevelTimestampMs,
     sessionIdFromEnv: claudeSessionIdFromEnv,
+    // MEASURED (T0 X0, 2026-11-08): the Bash tool's environment carries `CLAUDECODE=1`; the nearest agent ancestor of `git` was `…/.local/bin/claude`.
+    markedInEnv: (env) => env.CLAUDECODE === "1",
+    claimsProcess: (name) => name === "claude",
     sessionSource: claudeSessionSource,
     locateCurrentTranscript,
 };

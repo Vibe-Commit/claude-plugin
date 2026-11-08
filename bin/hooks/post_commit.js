@@ -34,15 +34,17 @@
  */
 import { lstatSync } from "node:fs";
 import { EXIT } from "../exit.js";
-import { DEFAULT_AGENT_ID, admitsTranscript, agentForTranscript, dialectFor } from "../agents/registry.js";
+import { admitsTranscript, agentForTranscript, committingSession } from "../agents/registry.js";
 import { UNKNOWN_AGENT_ID } from "../agents/types.js";
 import { isCaptureAllowed } from "../consent.js";
 import { gitProbe, headRef, onceRepoSlug } from "../git.js";
+import { recordDropped } from "../dropped_tally.js";
 import { detectSquash } from "../inferred_squash.js";
 import { recordInferredSkipped } from "../inferred_tally.js";
+import { readAncestry } from "../process_ancestry.js";
 import { resolveProjectKeys } from "../project.js";
 import { lastFiring } from "../firing.js";
-import { activeSessionFor, appendInferred, appendPending, appendSpool } from "../spool.js";
+import { appendInferred, appendPending, appendSpool, attributionFor } from "../spool.js";
 /**
  * Observe the commit that just happened, or do nothing.
  *
@@ -99,9 +101,25 @@ export function observe(ctx) {
     // What the gate really does is refuse when no capture session is live here, and
     // — since the ladder — SAY HOW IT DECIDED. `sole_live_session` still writes for
     // a human's commit in a clone with one live session, exactly as it did at HEAD.
-    const active = activeSessionFor(ctx.home, toplevel, envSessionId(ctx.env));
-    if (active === null)
+    //
+    // WHO MADE THIS COMMIT is `committingSession`'s (multi-session attribution): every dialect's id and marker, the process tree only when two agents are evidenced. Two refusals come
+    // out of it, and neither leaves a line (there is no session to file one under, and a line that can never be sent is exactly the silent loss this change counts):
+    //   - `walk_failed`: two agents' variables are in the environment and the tree cannot name the nearest (D4/D9);
+    //   - `agent_mismatch`: no id, the commit's agent is known, and the only live session is a different known agent (D5).
+    // Each is COUNTED, once, here at the observation (`dropped_tally.ts`): this is the one place that knows.
+    const committing = committingSession(ctx.env, ctx.ancestry ?? readAncestry);
+    if (committing.kind === "walk_failed") {
+        recordDropped(ctx.home, toplevel, "walk_failed", 1, ctx.nowMs);
         return false;
+    }
+    const attributed = attributionFor(ctx.home, toplevel, committing.sessionId, committing.agent);
+    if (attributed.kind === "refused") {
+        recordDropped(ctx.home, toplevel, "agent_mismatch", 1, ctx.nowMs);
+        return false;
+    }
+    if (attributed.kind === "none")
+        return false;
+    const active = attributed.session;
     const head = headRef(toplevel);
     // No HEAD means a repository with no commits, which cannot be the state
     // immediately after one — so this is a git we could not read, not a case.
@@ -186,26 +204,6 @@ function transcriptPosition(ctx, sessionId) {
     catch {
         return {};
     }
-}
-/**
- * The committing session's own id, or null.
- *
- * ⛔ **THE DIALECT ANSWERS, NOT THIS FILE.** `sessionIdFromEnv` is a required
- * member precisely so a new agent has to declare its own variable rather than
- * inherit a guess (`D3`), and reading `CLAUDE_CODE_SESSION_ID` here would put a
- * second, quieter copy of that knowledge outside the registry.
- *
- * ⚠ **`DEFAULT_AGENT_ID`, because git hands this hook no `--agent=` flag** — the
- * installed script is `vibecommit post-commit`, with no argv to read. Asking
- * every dialect instead would be identical today (the other two answer `null`,
- * UNMEASURED) and would invent a precedence rule nobody has needed yet.
- *
- * ⚠ A value from the WRONG agent is survivable by construction: the ladder's
- * first rung requires a live state file to agree with it, and an id that
- * corroborates nothing drops to the HOLD rung rather than naming anyone.
- */
-function envSessionId(env) {
-    return dialectFor(DEFAULT_AGENT_ID).sessionIdFromEnv(env);
 }
 /** git's own `%cI` — strict ISO-8601, the committer date. `--no-show-signature`: see `inferred_squash.ts`'s reflog read for why. */
 function committedAt(dir) {

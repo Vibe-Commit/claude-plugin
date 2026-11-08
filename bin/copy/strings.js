@@ -401,6 +401,14 @@ export const STATUS = {
     discardedStale: (lines) => `${lines} waiting commit ${lines === 1 ? "line" : "lines"} older than 7 days ${lines === 1 ? "was" : "were"} ` +
         `discarded (no session claimed ${lines === 1 ? "it" : "them"}).`,
     /**
+     * Multi-session attribution (T5 · D6) — commit lines this machine saw and did not link to a session, counted by reason in `dropped-commits.tally` (`dropped_tally.ts`). A COUNT
+     * only: never a sha, a session id or a path. `total` is every reason; `ambiguous` is the part where two or more sessions were live and nothing named which one made the
+     * commit. Shown while the newest such commit is at most 7 days old, so a loss is not a non-event. ⚠ **It says what the COMMIT HOOK could not do, never that the commit is unlinked:** the commit
+     * itself is in git and in the transcript, and a link from the transcript may still name it (not for Cursor, whose transcripts carry no command output). P1's claims-sweep ruling.
+     */
+    droppedCommits: (total, ambiguous) => `The commit hook could not link ${total} ${total === 1 ? "commit" : "commits"} in this repository to a session` +
+        `${ambiguous > 0 ? ` (${ambiguous} while several sessions were live)` : ""}.`,
+    /**
      * `TODOS[177]` — squash pairs made with `git reset --soft` that were detected but never ended up recorded by the
      * server. `oversize`/`sha256` are never-spooled SQUASHES: more than 64 commits folded (the server's per-request
      * ceiling; a partial set of links is worse than none) or a sha256 repository (the server reads 40-hex only).

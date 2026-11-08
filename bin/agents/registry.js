@@ -30,6 +30,7 @@ import { isInside, isInsideAny } from "../paths.js";
 import { CLAUDE_CODE } from "./claude_code.js";
 import { CODEX_CLI } from "./codex_cli.js";
 import { CURSOR } from "./cursor.js";
+import { executableName } from "./evidence.js";
 import { HOOK_EVENTS, UNKNOWN_AGENT_ID, } from "./types.js";
 /**
  * Every dialect, in registration order.
@@ -263,5 +264,47 @@ export function admitsTranscript(home, env, transcriptPath) {
 export function agentForTranscript(home, env, transcriptPath) {
     const matches = DIALECTS.filter((dialect) => isInside(dialect.transcriptRoot(home, env), transcriptPath));
     return matches.length === 1 ? matches[0].id : UNKNOWN_AGENT_ID;
+}
+/**
+ * ⛔ **WHICH AGENT, AND WHICH OF ITS SESSIONS, MADE THIS COMMIT — read from the commit's environment, and from the process tree only when the environment cannot say.**
+ *
+ * Every dialect is asked for two kinds of evidence: its session id (`sessionIdFromEnv`) and its marker (`markedInEnv`); a dialect with either is EVIDENCED.
+ *
+ *   - NO dialect evidenced → `{agent: null, sessionId: null}`: the ladder runs as it always did for a commit with no id (`sole_live_session` for one live session, D5).
+ *   - ONE dialect evidenced → that agent and its id (or no id): no walk, no spawn. A commit with only a Claude Code id is exactly today's.
+ *   - TWO OR MORE evidenced (D4: two ids; D9: an id of one and a MARKER of another) → the process tree decides (`ancestry`, called here and only here): the NEAREST ancestor
+ *     whose executable an EVIDENCED dialect claims is the agent that ran `git`.
+ *       · it has an id in the environment → that id;
+ *       · it has no id → a no-id commit of that agent: an id inherited from the OUTER agent is IGNORED, never used;
+ *       · no ancestor is claimed, or the listing is unavailable or out of bounds → `walk_failed`.
+ *
+ * ⛔ **THE PRECEDENCE LIVES HERE AND NOWHERE ELSE.** `post-commit`, `post-rewrite` and `backfill` used to decide "whose id" in three places; they ask this.
+ * Before it, only the default dialect (Claude Code) was asked, so Codex launched from a Claude Code shell was filed under the OUTER session: a wrong, PERMANENT edge
+ * (cr071) whenever that session was live in the clone (T0 X2).
+ *
+ * `ancestry` is a thunk so the one-agent and no-agent paths spawn nothing. It returns executable names nearest-first, or `null` (could not tell).
+ * Pure given its inputs; never throws.
+ */
+export function committingSession(env, ancestry) {
+    try {
+        const evidenced = DIALECTS.filter((dialect) => dialect.sessionIdFromEnv(env) !== null || dialect.markedInEnv(env));
+        if (evidenced.length === 0)
+            return { kind: "agent", agent: null, sessionId: null };
+        if (evidenced.length === 1)
+            return { kind: "agent", agent: evidenced[0].id, sessionId: evidenced[0].sessionIdFromEnv(env) };
+        const names = ancestry();
+        if (names === null)
+            return { kind: "walk_failed" };
+        for (const comm of names) {
+            const name = executableName(comm);
+            const nearest = evidenced.find((dialect) => dialect.claimsProcess(name));
+            if (nearest !== undefined)
+                return { kind: "agent", agent: nearest.id, sessionId: nearest.sessionIdFromEnv(env) };
+        }
+        return { kind: "walk_failed" };
+    }
+    catch {
+        return { kind: "walk_failed" };
+    }
 }
 //# sourceMappingURL=registry.js.map

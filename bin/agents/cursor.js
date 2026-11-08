@@ -19,6 +19,7 @@
  */
 import { join } from "node:path";
 import { cursorHooksPath, cursorTranscriptRoot, isCursorTranscript } from "../paths.js";
+import { envValue } from "./evidence.js";
 import { readEntries, sessionFile, subdirectories } from "./session_listing.js";
 import { stripEnds } from "../text_tail.js";
 /**
@@ -257,13 +258,15 @@ export const CURSOR = {
     // Last-turn seal (A5 · A11): measured, no growth after the hook in `cursor-agent -p`. Any byte blocks the seal; only zero growth seals.
     growthAllowsSeal: (growth) => growth.length === 0,
     recordTimeMs: () => null,
-    // ⛔ **UNMEASURED.** `null` here does NOT mean "Cursor has no session id in its
-    // environment" — it means nobody has run the measurement `M1` ran for Claude
-    // Code (agent commit, human commit, worktree commit) against Cursor, so this
-    // client has no variable it can honestly name. ⚠ Read it as the absence of a
-    // measurement, not as a fact about the agent. Measuring it is a change to this
-    // line and nothing else.
-    sessionIdFromEnv: () => null,
+    // ⛔ **MEASURED FOR `cursor-agent`, UNMEASURED FOR THE DESKTOP APP.** T0 X3 (2026-11-08, `cursor-agent -p --force --trust` 2026.08.11-e8db854, `CLAUDE_*` unset,
+    // scratch repo, probe `post-commit`): the commit's environment carried `CURSOR_CONVERSATION_ID`, equal to the `-p` JSON `session_id`, to the transcript directory's
+    // name, and to the `sid` our own hook recorded for that session. ⚠ **X4 is UNRUN: the Cursor DESKTOP agent (an Electron process) and a human's commit in Cursor's
+    // integrated terminal are not measured**, so "desktop commits carry it" is a hope, not a fact; without it a desktop commit has no id and takes the no-id arms of the ladder.
+    sessionIdFromEnv: (env) => envValue(env, "CURSOR_CONVERSATION_ID"),
+    // MEASURED (T0 X3): `CURSOR_AGENT=1` and `CURSOR_INVOKED_AS=cursor-agent` (and an `AI_AGENT` variable, value not captured); the nearest agent ancestor of `git`
+    // was `…/.local/bin/cursor-agent`. The desktop app's executable is not claimed (X4).
+    markedInEnv: (env) => env.CURSOR_AGENT === "1",
+    claimsProcess: (name) => name === "cursor-agent",
     sessionSource: (home) => cursorSessionSource(home),
     // ⛔ NO `locateCurrentTranscript`, and the omission is the decision — the same
     // one Codex made. Finding the conversation for THIS project would mean munging
