@@ -303,6 +303,7 @@ export function parseBlameCommitPayload(document) {
             turns: [],
             window: null,
             sequenceWindow: null,
+            turnPending: false,
             filesWithoutTurn: null,
         };
     }
@@ -315,6 +316,7 @@ export function parseBlameCommitPayload(document) {
             turns: [],
             window: null,
             sequenceWindow: null,
+            turnPending: false,
             filesWithoutTurn: null,
         };
     }
@@ -357,6 +359,7 @@ export function parseBlameCommitPayload(document) {
         turns,
         window,
         sequenceWindow: parseSequenceWindow(document.sequence_window),
+        turnPending: document.turn_pending === true,
         filesWithoutTurn: asCount(document.files_without_turn),
     };
 }
@@ -608,6 +611,13 @@ function turnLines(ctx, payload, file) {
                 out.push(paint(ctx.colour, "muted", line));
             }
         }
+    }
+    // Commit-edge T4 (DD2 · DD3): printed AFTER the turn list, dim, and with no command hint (a teammate cannot act on one). The number is the last turn
+    // shown, in the number space the rows print (`sequence + 1`); with no stored number there is none to name, and the sentence does not invent one.
+    if (payload.turnPending) {
+        const last = payload.turns.at(-1)?.sequence ?? null;
+        const sentence = last === null ? WHY.turnPendingUnnumbered : WHY.turnPending(String(last + 1));
+        out.push("", ...wrap(sentence, BODY_INDENT).map((l) => paint(ctx.colour, "muted", l)));
     }
     // §R3's L2 — NO SILENT DROPS. Files in the commit whose `turn_hash` is NULL
     // are COUNTED, because omitting them makes a partial set read as complete.
@@ -905,6 +915,7 @@ function whyDocument(payload, commit, file) {
         sequence_window: payload.sequenceWindow === null
             ? null
             : { first: payload.sequenceWindow.first, last: payload.sequenceWindow.last, total: payload.sequenceWindow.total },
+        turn_pending: payload.turnPending,
         files_without_turn: payload.filesWithoutTurn,
     };
 }

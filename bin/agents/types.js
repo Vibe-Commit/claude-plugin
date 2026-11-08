@@ -80,4 +80,14 @@ export const UNKNOWN_AGENT_ID = "unknown";
 export const HOOK_EVENTS = ["Stop", "PreCompact", "SessionEnd", "SessionStart"];
 /** The most growth after a `SessionEnd` hook that `growthAllowsSeal` may allow. More than this is a conversation, not a trailing metadata record. */
 export const SEAL_GROWTH_MAX_BYTES = 4096;
+/** A record's top-level `timestamp` as integer ms, or `null`: an ISO string that parses to a finite time. The one reading Claude Code and Codex share. */
+export function topLevelTimestampMs(record) {
+    if (typeof record !== "object" || record === null)
+        return null;
+    const value = record.timestamp;
+    if (typeof value !== "string")
+        return null;
+    const ms = Date.parse(value);
+    return Number.isFinite(ms) ? ms : null;
+}
 //# sourceMappingURL=types.js.map

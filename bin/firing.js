@@ -133,6 +133,65 @@ export function readFirings(home, sessionId, from = 0) {
         }
     }
 }
+/** How much of the END of a firing log `lastFiring` reads. A firing line is a few hundred bytes (`MAX_FIRING_BYTES` caps it), so this holds many. */
+export const LAST_FIRING_TAIL_BYTES = 64 * 1024;
+/**
+ * Commit-edge T7: the session's LAST COMPLETE, VALID firing, from a BOUNDED tail of its log, or `null`. It runs inside `post-commit`, inside the user's
+ * `git commit`, so it never reads more than `LAST_FIRING_TAIL_BYTES` from the end, never throws, and treats anything it cannot be sure of as "none".
+ *
+ *  - the tail window's FIRST line is partial unless the window starts at byte 0, so it is dropped;
+ *  - a trailing line with no newline is a hook MID-APPEND, so it is dropped and the line before it is used;
+ *  - a complete line that does not parse, or is of a newer version, is skipped, as `readFirings` skips it;
+ *  - a missing, empty or unreadable log is `null`, and so is a window with no complete line (an oversized line).
+ *
+ * The log is append-only (`O_APPEND`) and never compacted; it goes with the target record on the 30-day schedule.
+ */
+export function lastFiring(home, sessionId, tailBytes = LAST_FIRING_TAIL_BYTES) {
+    let fd = null;
+    try {
+        fd = openSync(sessionFiringsPath(home, sessionId), "r");
+        const size = fstatSync(fd).size;
+        if (size <= 0 || !Number.isSafeInteger(size) || !Number.isSafeInteger(tailBytes) || tailBytes <= 0)
+            return null;
+        const start = Math.max(0, size - tailBytes);
+        const buf = Buffer.alloc(size - start);
+        let got = 0;
+        while (got < buf.length) {
+            const n = readSync(fd, buf, got, buf.length - got, start + got);
+            if (n <= 0)
+                break;
+            got += n;
+        }
+        const view = got === buf.length ? buf : buf.subarray(0, got);
+        // The last complete line ends at the last newline; what follows it is a hook mid-append and is never read.
+        let end = view.lastIndexOf(0x0a);
+        const stem = sessionFileStem(sessionId);
+        while (end >= 0) {
+            const prev = end === 0 ? -1 : view.lastIndexOf(0x0a, end - 1);
+            // No earlier newline in a window that does not start the FILE: this line may have lost its beginning, so it is not read.
+            if (prev === -1 && start > 0)
+                return null;
+            const parsed = parseFiring(view.subarray(prev + 1, end).toString("utf8"), stem);
+            if (parsed !== null && parsed !== "newer")
+                return parsed;
+            end = prev;
+        }
+        return null;
+    }
+    catch {
+        return null;
+    }
+    finally {
+        if (fd !== null) {
+            try {
+                closeSync(fd);
+            }
+            catch {
+                /* nothing to do */
+            }
+        }
+    }
+}
 /** A valid firing, `"newer"` for a line of a version this build does not know, or null for anything else. */
 function parseFiring(text, stem) {
     let raw;

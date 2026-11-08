@@ -587,6 +587,7 @@ export const CONNECT = {
      * | how that link was made | `x-commit-attributions` | `D190`, NEW |
      * | the replaced commit's ID | `x-rewrites` | `D190`, NEW |
      * | the path of every file the commit changed | the body trailer (`commit_files.ts`), NOT a header | 0.10.0, NEW |
+     * | when this machine observed each commit (the hook's own clock, integer ms; not the committer date) | `x-commits-at`, every agent but Cursor | commit-edge T6, NEW |
      *
      * ⛔ **THE CHANGED-FILE LIST NOW LEAVES THE MACHINE (0.10.0, E8), SO IT IS HERE.** Until 0.9.0 this note said the opposite, and
      * rightly: `post_commit.ts` gathered the list and it stayed in the spool. From 0.10.0 `capSpool` also returns `files` and the
@@ -594,7 +595,12 @@ export const CONNECT = {
      * (`git diff-tree -z --name-only`), unchanged, and the transcript scrubber does not run on them, which the sentence says
      * because "a scrubber removes 13 known secret formats" two paragraphs up would otherwise read as covering them. **Not
      * describing the paths as uploaded would now be the FALSE DISCLOSURE, which is as much a claims defect as describing what
-     * does not leave.** The committer DATE still stays local.
+     * does not leave.** The committer DATE (git's `%cI`, settable) still stays local.
+     *
+     * ⛔ **BUT A TIME NOW LEAVES (commit-edge T6): `x-commits-at`**, the wall clock of the `post-commit` process, within seconds of the committer date. The
+     * line above this paragraph's table says so; this sentence used to say no date left at all, which stopped being true. It goes beside each sha so the
+     * server can open the turn that made the commit, and it is NOT sent for a Cursor delivery (positions go there instead, `x-commits-pos`).
+     * gstack-shortcut(dec-d4317624): consent list omits x-commits-at / x-commits-pos (docs page discloses them), upgrade when an external user is onboarded or consentCommits is next edited
      *
      * ⚠ **`SpoolEntry.branch` and `delta.head.branch` are NOT the same noun.** The
      * per-commit one stays local; the repo's CURRENT branch goes out on every
@@ -1584,6 +1590,13 @@ export const WHY = {
     /** §R3's L2: files in the commit whose `turn_hash` is NULL are COUNTED, never dropped. */
     filesWithoutTurn: (count) => `${count} more files in this commit have no linked turn.`,
     /** The one-file form. `1 more files` is the tell that a count was never read. */
+    /**
+     * Commit-edge T4 (design DD2, the SAME sentence as the commit page): the commit was made in the turn after #n, which is not stored yet. `#n` is the last
+     * turn shown, 1-based. "or ends" is Alexander's last-turn-seal D8 = A: a session that ends now stores its last turn. No command hint, by design.
+     */
+    turnPending: (n) => `Made in the turn after #${n}. That turn isn't recorded yet; it appears when the session continues or ends.`,
+    /** The same, when the turns shown carry no stored number (a capture uploaded before numbers were stored): no number is invented. */
+    turnPendingUnnumbered: "Made in the turn after the last one shown. That turn isn't recorded yet; it appears when the session continues or ends.",
     fileWithoutTurn: "1 more file in this commit has no linked turn.",
     // --- Usage. §13.7: a bad argument is exit 2, never exit 1. ---
     usageWhat: "This command needs a file and a line number.",

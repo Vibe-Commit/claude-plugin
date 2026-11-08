@@ -16,6 +16,7 @@ import { createRequire } from "node:module";
 import { join } from "node:path";
 import { CODEX_INDEX_FILE, codexHooksPath, codexIndexDir, codexTranscriptRoot, isInside, isTranscriptFile, } from "../paths.js";
 import { readEntries, sessionFile } from "./session_listing.js";
+import { topLevelTimestampMs } from "./types.js";
 /**
  * `SessionEnd` is the tight one — 3 s registered, 2.2 s client.
  *
@@ -323,6 +324,7 @@ export const CODEX_CLI = {
     isolatesContentRecords: true,
     // Last-turn seal (R2 · D9-A): UNMEASURED live. Any byte after the hook blocks the seal (a "leave the task running" exit can keep writing); only zero growth seals.
     growthAllowsSeal: (growth) => growth.length === 0,
+    recordTimeMs: topLevelTimestampMs,
     // ⛔ **UNMEASURED.** `null` here does NOT mean "Codex CLI has no session id in
     // its environment" — it means nobody has run the measurement `M1` ran for
     // Claude Code (agent commit, human commit, worktree commit) against Codex, so

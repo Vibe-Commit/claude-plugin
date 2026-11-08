@@ -11,7 +11,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import { claudeConfigPath, claudeSettingsPath, isInside, isTranscriptFile, transcriptRoot, } from "../paths.js";
 import { readEntries, sessionFile, subdirectories } from "./session_listing.js";
-import { SEAL_GROWTH_MAX_BYTES } from "./types.js";
+import { SEAL_GROWTH_MAX_BYTES, topLevelTimestampMs } from "./types.js";
 /**
  * The client-side backstop, per event.
  *
@@ -344,6 +344,7 @@ export const CLAUDE_CODE = {
     // decided by that folder (R17). What stays is stated in the README.
     isolatesContentRecords: true,
     growthAllowsSeal: claudeGrowthAllowsSeal,
+    recordTimeMs: topLevelTimestampMs,
     sessionIdFromEnv: claudeSessionIdFromEnv,
     sessionSource: claudeSessionSource,
     locateCurrentTranscript,
