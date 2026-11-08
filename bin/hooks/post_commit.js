@@ -32,13 +32,16 @@
  * is correct: this is git's process, not the 5s Claude Code hook path, and
  * `TODOS[87]`'s watchdog does not exist here to be defeated.
  */
+import { lstatSync } from "node:fs";
 import { EXIT } from "../exit.js";
-import { DEFAULT_AGENT_ID, dialectFor } from "../agents/registry.js";
+import { DEFAULT_AGENT_ID, admitsTranscript, agentForTranscript, dialectFor } from "../agents/registry.js";
+import { UNKNOWN_AGENT_ID } from "../agents/types.js";
 import { isCaptureAllowed } from "../consent.js";
 import { gitProbe, headRef, onceRepoSlug } from "../git.js";
 import { detectSquash } from "../inferred_squash.js";
 import { recordInferredSkipped } from "../inferred_tally.js";
 import { resolveProjectKeys } from "../project.js";
+import { lastFiring } from "../firing.js";
 import { activeSessionFor, appendInferred, appendPending, appendSpool } from "../spool.js";
 /**
  * Observe the commit that just happened, or do nothing.
@@ -133,6 +136,10 @@ export function observe(ctx) {
         // the commits that delivery may carry are exactly those observed at or before it (`observedAt <= firing.at`): a commit made in
         // the next turn must ride the next delivery. A line without it (an older client) counts as old and is carried at once.
         observedAt: ctx.nowMs ?? Date.now(),
+        // Commit-edge T7: how far into the transcript this commit happened, for EVERY agent. Cursor's transcripts carry no times, so a position is its only placement
+        // signal and it goes on the wire (`x-commits-pos`, Cursor only). For Claude Code and Codex it never goes on the wire: it only chooses WHICH REQUEST of a
+        // multi-request delivery carries the commit (`commit_carry.ts`), the time `observedAt` still placing it.
+        ...transcriptPosition(ctx, active.sessionId),
     });
     // ⭐ `TODOS[177]` — A SQUASH BY `reset --soft` FIRES NO `post-rewrite`, so the pairs are INFERRED here, from the reflog + ancestry +
     // tree + patch-id (see `inferred_squash.ts`; all five conditions or nothing). They go to the session's INFERRED spool — a file of their
@@ -150,6 +157,35 @@ export function observe(ctx) {
         // silence is the contract
     }
     return wrote;
+}
+/**
+ * Commit-edge T7. `{ observedPos }` for a commit made in a session of ANY agent whose transcript we can place, or `{}`. Runs inside `post-commit`, inside the user's `git commit`, so it is
+ * cheap, bounded and never throws: any doubt is "no position", which the delivery sends as an empty slot (the server then falls back to its own rule).
+ *
+ *  - The transcript's path is the LAST firing's, read from the session's firing log by a bounded tail read (`lastFiring`). That replaces the plan's "the
+ *    hook saves the path in session state": hooks no longer write state (0.11), and `.live` is a bare timestamp. So a commit made before any hook of the
+ *    session fired has no path and no position, which for Cursor is also a commit with no spool line at all (`activeSessionFor`: no env id, no state).
+ *  - The agent is the TRANSCRIPT's root (A8), never `firing.agent`: Cursor's end also fires the Claude Code hook with the same sid and transcript.
+ *  - The path must live under the agent's transcript root (`admitsTranscript`), and is only STAT-ed (a regular file's byte size), never opened here. The
+ *    worker's confinement still governs the real read at delivery.
+ */
+function transcriptPosition(ctx, sessionId) {
+    try {
+        const last = lastFiring(ctx.home, sessionId);
+        if (last === null)
+            return {};
+        if (agentForTranscript(ctx.home, ctx.env, last.transcript) === UNKNOWN_AGENT_ID)
+            return {};
+        if (!admitsTranscript(ctx.home, ctx.env, last.transcript))
+            return {};
+        const stat = lstatSync(last.transcript);
+        if (!stat.isFile())
+            return {};
+        return Number.isSafeInteger(stat.size) && stat.size >= 0 ? { observedPos: stat.size } : {};
+    }
+    catch {
+        return {};
+    }
 }
 /**
  * The committing session's own id, or null.

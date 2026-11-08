@@ -268,6 +268,51 @@ export function settleSpooled(home, key, count, keep) {
     }
 }
 /**
+ * Settle the lines at these WELL-FORMED indices (the unit `count` is in), and nothing else. The set form of `settleSpooled`, for a request that carried a commit
+ * line that is not at the head of the file: a line with a transcript position rides the first request whose span reaches it, and a line without one rides the
+ * last request, so what one request carried need not be a prefix. Each consumed line is dropped, EXCEPT a wire-rung line whose sha the server asked to keep
+ * (`keep`, from `X-Commits-Retry`), which stays where it is. A line that is not in `consume` is untouched, in order.
+ *
+ * ⛔ THE SAME WALK AS `dropSpooled` (U2, trap 8): indices count WELL-FORMED lines, so a malformed line is never counted. A malformed line BEFORE the last
+ * consumed one is dropped with it (it was never countable and can never be sent); one after it stays for a later walk.
+ *
+ * ⚠ The residual race `dropSpooled` documents applies here unchanged (a re-read before the rewrite; appends only go to the end).
+ */
+export function settleSpooledLines(home, key, consume, keep) {
+    const path = spoolPath(home, key);
+    if (path === null || consume.size === 0)
+        return false;
+    try {
+        const lines = readFileSync(path, "utf8").split("\n").filter((l) => l.trim() !== "");
+        const last = Math.max(...consume);
+        const out = [];
+        let index = 0;
+        for (const line of lines) {
+            const entry = parseEntry(line);
+            if (entry === null) {
+                if (index <= last)
+                    continue; // malformed, inside the consumed region: dropped for free
+                out.push(line);
+                continue;
+            }
+            const mine = consume.has(index);
+            index += 1;
+            if (!mine) {
+                out.push(line);
+                continue;
+            }
+            if (WIRE_RUNGS.includes(entry.attribution) && keep.has(entry.sha))
+                out.push(line);
+        }
+        writeFileSync(path, out.map((l) => `${l}\n`).join(""), { mode: 0o600 });
+        chmodSync(path, 0o600);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+/**
  * Which session, if any, is live for this repo right now — ⛔ **AND HOW WE KNOW.**
  *
  * ## The defect this replaces
@@ -540,14 +585,20 @@ export function capSpool(entries) {
     const shas = [];
     const attributions = [];
     const files = [];
-    for (const entry of taken) {
+    const observedAts = [];
+    const observedPos = [];
+    const lineOf = [];
+    for (const [index, entry] of taken.entries()) {
         if (!WIRE_RUNGS.includes(entry.attribution))
             continue;
+        lineOf.push(index);
         shas.push(entry.sha);
         attributions.push(entry.attribution);
         files.push(entry.files);
+        observedAts.push(entry.observedAt ?? null);
+        observedPos.push(entry.observedPos ?? null);
     }
-    return { shas, attributions, files, count: taken.length };
+    return { shas, attributions, files, observedAts, observedPos, lineOf, count: taken.length };
 }
 /**
  * How many rewrite pairs one hook may put on the wire.
@@ -1322,7 +1373,16 @@ function parseEntry(line) {
     const branch = typeof o.branch === "string" && o.branch !== "" ? o.branch : null;
     const files = Array.isArray(o.files) ? o.files.filter((f) => typeof f === "string") : [];
     const observedAt = typeof o.observedAt === "number" && Number.isFinite(o.observedAt) && o.observedAt > 0 ? o.observedAt : undefined;
-    return { sha, branch, at, files, attribution: parseRung(o.attribution), ...(observedAt === undefined ? {} : { observedAt }) };
+    const observedPos = typeof o.observedPos === "number" && Number.isSafeInteger(o.observedPos) && o.observedPos >= 0 ? o.observedPos : undefined;
+    return {
+        sha,
+        branch,
+        at,
+        files,
+        attribution: parseRung(o.attribution),
+        ...(observedAt === undefined ? {} : { observedAt }),
+        ...(observedPos === undefined ? {} : { observedPos }),
+    };
 }
 /**
  * ⛔ **AN UNLABELLED LINE IS `recency_heuristic`, AND THAT IS NOT A DEFAULT — IT

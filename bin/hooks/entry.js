@@ -810,6 +810,11 @@ async function deliverTarget(opts) {
             inferredRewrites: union.inferred.pairs,
             inferredGroups: union.inferred.groups,
             spoolSources: union.sources,
+            // Commit-edge: between the requests of one delivery, read the spool as the request just settled it (`DeliveryContext.reloadCommits`).
+            reloadCommits: () => {
+                const fresh = readSpoolUnion(ctx.home, sessionId, ledgerKey, target.worktrees, asOf?.at);
+                return { commits: fresh.commits, spoolSources: fresh.sources };
+            },
         }, eof, 
         // ⛔ THE ROOT SET, AND IT IS NOT THE VALUE THE CONSENT GATE APPROVED (`D184 §3`): redaction is measured against this
         // target's own roots, never against the git common dir, or `isInside` would fail-close every file of an external worktree.

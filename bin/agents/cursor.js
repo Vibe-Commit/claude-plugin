@@ -256,6 +256,7 @@ export const CURSOR = {
     isolatesContentRecords: false,
     // Last-turn seal (A5 · A11): measured, no growth after the hook in `cursor-agent -p`. Any byte blocks the seal; only zero growth seals.
     growthAllowsSeal: (growth) => growth.length === 0,
+    recordTimeMs: () => null,
     // ⛔ **UNMEASURED.** `null` here does NOT mean "Cursor has no session id in its
     // environment" — it means nobody has run the measurement `M1` ran for Claude
     // Code (agent commit, human commit, worktree commit) against Cursor, so this

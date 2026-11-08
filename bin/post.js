@@ -18,7 +18,10 @@
  * @provenance vibecommit-mcp src/conversation/ingest_session.ts — wire shape, retyped
  */
 import { createHash } from "node:crypto";
-import { agentForTranscript } from "./agents/registry.js";
+import { zstdDecompressSync } from "node:zlib";
+import { agentForTranscript, dialectFor } from "./agents/registry.js";
+import { earlyCarry, lastRecordTimeMs, splitConsume } from "./commit_carry.js";
+import { COMMITS_POS_HEADER, commitPositionSlots } from "./commit_pos.js";
 import { UNKNOWN_AGENT_ID } from "./agents/types.js";
 import { noteGrantEpoch, recordRefused } from "./consent.js";
 import { headerSafe, sessionIdSafe } from "./header_safety.js";
@@ -27,7 +30,7 @@ import { COMMIT_FILES_HEADER, planTrailer } from "./commit_files.js";
 import { clearOrgPending, markOrgPending } from "./org_pending.js";
 import { MAX_DELTA_FRAME_BYTES, MAX_DELTA_RAW_BYTES, REPOSITORY_EXCLUDED, classify, markDelivered, markHeld, markSkipped, nextSpan, planChunk, resolveCaps, splitPoint, } from "./policy.js";
 import { fileState, isStopped, loadSessionState, saveSessionState, withFileState, } from "./state.js";
-import { INFERRED_SET_ASIDE_AFTER, dropInferredGroups, dropRewrites, dropSpooled, isFullSha, recordInferredAttempt, setAsideInferredGroup, settleSpooled, } from "./spool.js";
+import { INFERRED_SET_ASIDE_AFTER, dropInferredGroups, dropRewrites, settleSpooledLines, dropSpooled, isFullSha, recordInferredAttempt, setAsideInferredGroup, settleSpooled, } from "./spool.js";
 import { CLIENT_VERSION, CLIENT_VERSION_HEADER } from "./version.js";
 /** Production data plane. Overridable for tests and for a self-hosted server. */
 export const DEFAULT_INGEST_URL = "https://api.vibecommit.ai/ingest/v1/session";
@@ -76,6 +79,22 @@ export function ingestUrl(env) {
  * `trimmed.length > 255 ? null : trimmed`, read
  */
 const MAX_HEAD_BRANCH_LENGTH = 255;
+/** Commit-edge T6: the observation time of each commit, in `x-commits` order. See `commitTimeSlots`. */
+export const COMMITS_AT_HEADER = "x-commits-at";
+/**
+ * `x-commits-at`'s value, or `null` when it is not sent: comma-joined integer ms, one slot per sha in `x-commits` order, an EMPTY slot for a line that
+ * carries no stamp. Not sent when the list does not pair with the shas, when no slot has a stamp, or on a Cursor delivery (the sender rule above:
+ * Cursor sends positions). A stamp that is not a positive finite number is an empty slot.
+ */
+export function commitTimeSlots(observed, agent) {
+    const times = observed.observedAts;
+    if (times === undefined || times.length !== observed.shas.length)
+        return null;
+    if (agent === "cursor")
+        return null;
+    const slots = times.map((t) => (typeof t === "number" && Number.isFinite(t) && t > 0 ? String(Math.floor(t)) : ""));
+    return slots.some((slot) => slot !== "") ? slots.join(",") : null;
+}
 /**
  * Build the request headers.
  *
@@ -192,6 +211,18 @@ export function buildIngestHeaders(credential, delta) {
         if (observed.shas.length === observed.attributions.length) {
             headers["x-commits"] = observed.shas.join(",");
             headers["x-commit-attributions"] = observed.attributions.join(",");
+            // Commit-edge T6: the TIME each commit was observed, parallel to `x-commits` (integer ms; an empty slot = no stamp). Omitted, never sent empty.
+            // ⛔ THE SENDER RULE (lanes file, "Commit placement headers"): a time goes only on a delivery whose agent is NOT Cursor. Cursor's transcripts
+            // carry no record times, so its commits are placed by POSITION (`x-commits-pos`, T7); U2 stamps a time on every spool line, Cursor's included, and a
+            // sha that carried both would be IGNORED by the server (both present → neither used). The agent is the delivery's own, derived from the
+            // transcript's root (A8), never the firing's.
+            const at = commitTimeSlots(observed, delta.agent);
+            if (at !== null)
+                headers[COMMITS_AT_HEADER] = at;
+            // T7: the POSITION of each commit, for a Cursor delivery. Same slot count as the shas by construction (`commitPositionSlots`); re-checked here because a
+            // list that does not pair is dropped whole by the server, and a caller could hand over a hand-built value.
+            if (delta.commitsPos !== undefined && delta.commitsPos.split(",").length === observed.shas.length)
+                headers[COMMITS_POS_HEADER] = delta.commitsPos;
         }
     }
     // ⚠ Same idiom as every other conditional header here: OMITTED, never sent
@@ -227,6 +258,8 @@ export const LEAN_OMIT_HEADERS = new Set([
     "x-head-branch",
     "x-commits",
     "x-commit-attributions",
+    COMMITS_AT_HEADER,
+    COMMITS_POS_HEADER,
     COMMIT_FILES_HEADER,
     "x-rewrites",
     "x-rewrites-inferred",
@@ -562,10 +595,15 @@ async function attemptSend(ctx, agent, seq, span, body, lean,
 // ride on one delta and not on every one. A delta that is not the last sends none of them, and the spool keeps them.
 isLast = true, 
 // E8: the compressed-frame ceiling the trailer must still fit under; without it no trailer is attempted.
-frameBytes) {
+frameBytes, 
+// Commit-edge T7: this delta restarted from byte 0 because the file was replaced, so a spooled position names a DIFFERENT file and every slot is empty.
+resynced = false, 
+// COMMIT-EDGE (placement by request): the commits THIS request carries (`commit_carry.ts`): everything on the last request, the lines whose position this span
+// reaches on an earlier one, none otherwise. Its trailer, `x-commit-attributions`, `x-commits-at` and `x-commits-pos` all follow THESE shas.
+carry) {
     // ⛔ ALL OR NOTHING (`commit_files.ts`): the trailer and `x-commit-files-length` go together or neither does; `planTrailer` is the
     // one place the conditions live (granted repo, the delta that carries `x-commits`, never lean, still one frame).
-    const planned = planTrailer({ granted: ctx.commitFiles === true, isLast, lean, frameBytes, commits: ctx.commits }, body);
+    const planned = planTrailer({ granted: ctx.commitFiles === true, isLast: carry !== undefined, lean, frameBytes, commits: carry }, body);
     const sendBody = planned === null ? body : planned.body;
     const commitFilesLength = planned === null ? undefined : planned.length;
     const full = buildIngestHeaders(ctx.credential, {
@@ -577,7 +615,9 @@ frameBytes) {
         agent,
         final: ctx.final === true && isLast,
         head: isLast ? ctx.head : undefined,
-        commits: isLast ? ctx.commits : undefined,
+        commits: carry,
+        // T7: positions are converted against THIS request's span, and only for a Cursor delivery (the sender rule).
+        commitsPos: carry !== undefined ? (commitPositionSlots(carry, agent, span, resynced, ctx.transcriptPath) ?? undefined) : undefined,
         rewrites: isLast ? ctx.rewrites : undefined,
         inferredRewrites: isLast ? ctx.inferredRewrites : undefined,
         commitFilesLength,
@@ -654,6 +694,18 @@ function holdLean(ctx, key, session, current, span, caps) {
     const next = withFileState(session, ctx.fileKey, { ...markHeld(current, span, ctx.nowMs, caps), lean: true });
     saveSessionState(ctx.home, key, next);
     return { kind: "attempted", disposition: "later", detail: null, finalAck: null, inferredStored: null, inferredSetAsidePairs: 0 };
+}
+/**
+ * COMMIT-EDGE: the request's body as plain transcript bytes. `readBody` hands `deliverChunk` the COMPRESSED frame (the frame limit is measured on it), and routing a
+ * time-only commit line needs the records' times. Called only when such a line exists; a body that is not a zstd frame (a test's plain `readBody`) is returned as is.
+ */
+function plainBody(bytes) {
+    try {
+        return zstdDecompressSync(bytes);
+    }
+    catch {
+        return bytes;
+    }
 }
 /**
  * Send the undelivered span of one transcript file and apply the failure policy.
@@ -737,6 +789,8 @@ async function deliverChunk(ctx, eof, readBody, cutter) {
     }
     // An empty span (a `final` with nothing new) is the last delta by definition.
     let isLast = cutter === undefined || span.to >= eof || span.to === span.from;
+    // T7: `nextSpan` restarts from byte 0 when the offset is past the file's end (a replaced or truncated transcript).
+    const resynced = current.sentOffset > eof;
     // `seq` is claimed BEFORE the attempt and PERSISTED BEFORE THE FIRST REQUEST (U1, below), so a process killed while the
     // request is in flight cannot leave `session.seq` behind what the server holds. Persisting it only after the response (the
     // SWITCH below still writes it again, with the outcome) was the hole: a kill mid-request left the old `seq` on disk, the next
@@ -758,6 +812,17 @@ async function deliverChunk(ctx, eof, readBody, cutter) {
     // lookup for an answer that cannot have changed between two attempts
     // milliseconds apart.
     const agent = agentForTranscript(ctx.home, ctx.env, ctx.transcriptPath);
+    // COMMIT-EDGE (placement by request, `commit_carry.ts`): the commits THIS request carries. The last request carries the whole spool window, as it always
+    // did. An earlier request carries only the lines whose transcript position its span reaches, and only when the spool can be re-read for the next request
+    // (`reloadCommits`) or every step re-reads it anyway (`oneDelta`); otherwise it carries none, as before.
+    const mayCarryEarly = ctx.oneDelta === true || ctx.reloadCommits !== undefined;
+    const carryFor = (reach, last, bytes) => {
+        if (last)
+            return { carry: ctx.commits, early: null };
+        const early = mayCarryEarly ? earlyCarry(ctx.commits, reach, resynced, () => lastRecordTimeMs(dialectFor(agent), plainBody(bytes))) : null;
+        return { carry: early === null ? undefined : early.commits, early };
+    };
+    let chosen = carryFor(span, isLast, body);
     // ⛔⛔ `TODOS[182]` — `X-Session-Id` HAS NO BOUND ANYWHERE ELSE ON THE HOOK
     // PATH. The server 400s an id over its own `SESSION_ID_MAX` (200), and 400 is
     // already `never` — so an over-LONG id was never silently retried. The GAP is
@@ -784,7 +849,7 @@ async function deliverChunk(ctx, eof, readBody, cutter) {
     // every 413 half below reuse this `seq` (the server applied none of them), so once is enough.
     if (!saveSessionState(ctx.home, key, { ...session, seq }))
         return { kind: "nothing-to-send", why: "unwritable" };
-    let attempt = await attemptSend(withinBudget(ctx), agent, seq, span, body, lean, isLast, limits.frameBytes);
+    let attempt = await attemptSend(withinBudget(ctx), agent, seq, span, body, lean, isLast, limits.frameBytes, resynced, chosen.carry);
     if (attempt.kind === "unsafe") {
         return refuse(ctx, key, session, current, span, caps, attempt.header === "authorization" ? "fatal" : "never", lean);
     }
@@ -815,7 +880,7 @@ async function deliverChunk(ctx, eof, readBody, cutter) {
         // the span is simply unsent and whoever holds the session now resends it.
         if (ctx.beforeRequest !== undefined && !ctx.beforeRequest())
             return { kind: "nothing-to-send", why: "lock-lost" };
-        attempt = await attemptSend(withinBudget(ctx), agent, seq, span, body, lean, isLast);
+        attempt = await attemptSend(withinBudget(ctx), agent, seq, span, body, lean, isLast, undefined, resynced, chosen.carry);
         if (attempt.kind === "unsafe") {
             // Unreachable in practice — every lean header is already proven safe, or
             // it would never have reached the full build either — but stated rather
@@ -853,12 +918,14 @@ async function deliverChunk(ctx, eof, readBody, cutter) {
             return holdSpan(ctx, key, session, current, span, caps, lean);
         span = { from: span.from, to: at };
         isLast = false;
+        // The carrying half is RE-CHOSEN by the same rule: the lines this smaller span reaches ride it, the rest stay in the spool for a later request.
         const half = readBody(span.from, span.to);
         if (half === null)
             return { kind: "nothing-to-send", why: "read-failed" };
+        chosen = carryFor(span, false, half);
         if (ctx.beforeRequest !== undefined && !ctx.beforeRequest())
             return { kind: "nothing-to-send", why: "lock-lost" };
-        attempt = await attemptSend(withinBudget(ctx), agent, seq, span, half, lean, false);
+        attempt = await attemptSend(withinBudget(ctx), agent, seq, span, half, lean, false, undefined, resynced, chosen.carry);
         if (attempt.kind === "unsafe") {
             return refuse(ctx, key, session, current, span, caps, attempt.header === "authorization" ? "fatal" : "never", lean);
         }
@@ -960,6 +1027,20 @@ async function deliverChunk(ctx, eof, readBody, cutter) {
             // touch, so a lean session's held lines still drain exactly as soon as a non-lean request reads them.
             // PR 4a: AND ONLY ON THE DELTA THAT CARRIED THEM (`isLast`). A delta earlier in the span sent none of the commits,
             // rewrites or inferred pairs, so a 2xx for it says nothing about them and the spool must keep them for the delta that did.
+            // COMMIT-EDGE: an EARLY request settles exactly the lines it carried (and the held lines that drain with it), by line, not by prefix: what an earlier
+            // request carried need not be the head of the spool. A line the server asks to keep, or "nothing landed", stays and rides the next request.
+            if (!lean && !isLast && chosen.early !== null) {
+                const early = chosen.early;
+                const retry = outcome.kind === "response" ? outcome.commitsRetry : null;
+                const nothingLanded = outcome.kind === "response" && outcome.captureId === "";
+                const hold = nothingLanded && early.commits.shas.length > 0;
+                if (retry !== null || !hold) {
+                    const sources = ctx.spoolSources?.commits ?? [{ repoKey: key.repoKey, count: ctx.commits?.count ?? 0 }];
+                    const keep = retry !== null ? new Set(retry) : new Set();
+                    for (const { repoKey, local } of splitConsume(sources, early.consume))
+                        settleSpooledLines(ctx.home, { repoKey, sessionId: key.sessionId }, local, keep);
+                }
+            }
             if (!lean && isLast) {
                 const retry = outcome.kind === "response" ? outcome.commitsRetry : null;
                 const nothingLanded = outcome.kind === "response" && outcome.captureId === "";
@@ -1200,8 +1281,20 @@ export async function deliver(ctx, eof, readBody, cutter) {
         if (ctx.oneDelta === true || budgetLeftMs(ctx) < MIN_NEXT_DELTA_BUDGET_MS)
             return carry(delivery, true);
         last = delivery;
+        // COMMIT-EDGE: the request just settled may have consumed commit lines (an earlier request carries the ones its span reaches), so the next one reads the
+        // spool as it is NOW. A reader that fails leaves NO commits for the rest of this call, never the stale window (that would carry a settled line twice).
+        let fresh = {};
+        if (ctx.reloadCommits !== undefined) {
+            try {
+                fresh = ctx.reloadCommits() ?? { commits: { shas: [], attributions: [], files: [], count: 0 } };
+            }
+            catch {
+                fresh = { commits: { shas: [], attributions: [], files: [], count: 0 } };
+            }
+        }
         chunkCtx = {
             ...ctx,
+            ...fresh,
             // Stop reading bodies once the id is in hand: a later delta never needs one.
             readConversationId: ctx.readConversationId === true && conversationId === undefined,
         };

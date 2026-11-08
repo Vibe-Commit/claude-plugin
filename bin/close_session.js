@@ -174,6 +174,11 @@ export async function closeSession(input) {
         inferredRewrites: inferred.pairs,
         inferredGroups: inferred.groups,
         spoolSources: union.sources,
+        // Commit-edge: between the requests of one delivery, read the spool as the request just settled it (`DeliveryContext.reloadCommits`).
+        reloadCommits: () => {
+            const fresh = readSpoolUnion(home, sessionId, projectKey, worktrees, input.asOfAt);
+            return { commits: fresh.commits, spoolSources: fresh.sources };
+        },
         ...(input.seal ? { final: true } : {}),
         byHook: false,
         ...(beat === undefined ? {} : { beforeRequest: beat }),
