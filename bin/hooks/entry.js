@@ -66,6 +66,7 @@ import { pruneOrphanPending } from "../pending_prune.js";
 import { SESSION_LIVE_WINDOW_MS, pendingModeFor, promotePending, pruneExpiredInferred, readPending } from "../spool.js";
 import { meetsNodeFloor } from "../runtime.js";
 import { renderNotice } from "../system_message.js";
+import { scaledMs } from "../timer_scale.js";
 /**
  * Default wall-clock budget. `CR-028` sets the real per-event `timeout` in
  * `claude-plugin/hooks/hooks.json`; this is the client-side backstop, which must
@@ -847,7 +848,7 @@ async function deliverTarget(opts) {
             ...(heartbeat === undefined ? {} : { heartbeat }),
             ...(hookClock === null ? { unboundedTimeoutMs: requestTimeoutMs } : {}),
             // F2d: one request at a time per machine. The main delta just went; the first sub-agent request waits the floor.
-            ...(hookClock === null && delivery.kind === "attempted" ? { pauseFirstMs: UNBOUNDED_PACE_FLOOR_MS } : {}),
+            ...(hookClock === null && delivery.kind === "attempted" ? { pauseFirstMs: scaledMs(UNBOUNDED_PACE_FLOOR_MS) } : {}),
             ...(folderCap === undefined ? {} : { sizeCap: folderCap }),
             ...(asOf?.subCap === undefined ? {} : { firingCap: asOf.subCap }),
             isolation,
@@ -893,7 +894,7 @@ export function scannedOffsets(scan) {
 export const UNBOUNDED_PACE_FLOOR_MS = 250;
 export const UNBOUNDED_PACE_CAP_MS = 30_000;
 export function unboundedPaceMs(elapsedMs) {
-    return Math.min(UNBOUNDED_PACE_CAP_MS, Math.max(UNBOUNDED_PACE_FLOOR_MS, elapsedMs));
+    return scaledMs(Math.min(UNBOUNDED_PACE_CAP_MS, Math.max(UNBOUNDED_PACE_FLOOR_MS, elapsedMs)));
 }
 /** Session records one firing looks at. Examined ones move to the back of the line (their mtime moves), so none starves. */
 export const DRAIN_EXAMINE_MAX = 40;

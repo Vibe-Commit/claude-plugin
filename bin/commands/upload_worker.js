@@ -33,6 +33,7 @@ import { claimUploader, UPLOADER_BEAT_MS } from "../hooks/fire_lock.js";
 import { identityDigest } from "../identity.js";
 import { uploaderStatusPath } from "../paths.js";
 import { ingestUrl } from "../post.js";
+import { scaledMs, setTimerScaleFromEnv } from "../timer_scale.js";
 import { replayStep, REQUEST_TIMEOUT_MS } from "../replay.js";
 /** Backoff on `later` (plan §3.12). */
 export const BACKOFF_FIRST_MS = 5_000;
@@ -44,7 +45,7 @@ export const YIELD_MS = 25;
 export const NO_PROGRESS_MS = 30 * 60_000;
 export const TOTAL_MS = 60 * 60_000;
 /** How long a pass with nothing to do but wait (busy sessions, backoff) sleeps before looking again. */
-const IDLE_POLL_MS = 1_000;
+export const IDLE_POLL_MS = 1_000;
 /** The last outcomes kept in the status file. */
 const OUTCOMES_KEPT = 20;
 const realSleep = (ms) => new Promise((resolve) => {
@@ -58,6 +59,13 @@ export function backoffMs(failures, random) {
 /** `Retry-After` wins when it is longer than our own backoff, and nothing waits past the backoff ceiling. Pure. */
 export function waitAfterLaterMs(failures, retryAfterMs, random) {
     return Math.min(BACKOFF_MAX_MS, Math.max(backoffMs(failures, random), retryAfterMs ?? 0));
+}
+/**
+ * `waitAfterLaterMs` for a worker whose own waits may be scaled for tests (`timer_scale.ts`): OUR backoff is scaled, a SERVER-SENT `Retry-After` never is. At
+ * factor 1 this is exactly `waitAfterLaterMs`. Pure given `random` and the (process-wide) factor.
+ */
+export function scaledWaitAfterLaterMs(failures, retryAfterMs, random) {
+    return Math.min(BACKOFF_MAX_MS, Math.max(scaledMs(backoffMs(failures, random)), retryAfterMs ?? 0));
 }
 /** The sleep after a step that made requests: `max(250 ms, elapsed)`, capped. Pure. */
 export function paceMs(elapsedMs) {
@@ -214,7 +222,7 @@ export async function runUploadWorker(opts) {
                         case "later": {
                             const n = (failures.get(stem) ?? 0) + 1;
                             failures.set(stem, n);
-                            notBefore.set(stem, now() + waitAfterLaterMs(n, step.retryAfterMs, random));
+                            notBefore.set(stem, now() + scaledWaitAfterLaterMs(n, step.retryAfterMs, random));
                             record(stem, "later", step.elapsedMs);
                             waiting = true;
                             break;
@@ -225,7 +233,7 @@ export async function runUploadWorker(opts) {
                                 // U6b (F9c): a cursor that cannot be written re-ran the resolver every ~250 ms for the worker's whole life. Back off like a `later`.
                                 const n = (failures.get(stem) ?? 0) + 1;
                                 failures.set(stem, n);
-                                notBefore.set(stem, now() + waitAfterLaterMs(n, undefined, random));
+                                notBefore.set(stem, now() + scaledMs(waitAfterLaterMs(n, undefined, random)));
                                 waiting = true;
                             }
                             else {
@@ -276,7 +284,7 @@ export async function runUploadWorker(opts) {
                                 break;
                             case "later":
                                 drainFailures += 1;
-                                drainNotBefore = now() + waitAfterLaterMs(drainFailures, step.retryAfterMs, random);
+                                drainNotBefore = now() + scaledWaitAfterLaterMs(drainFailures, step.retryAfterMs, random);
                                 record("drain", "drain:later", step.elapsedMs);
                                 waiting = true;
                                 writeStatus("running");
@@ -285,7 +293,7 @@ export async function runUploadWorker(opts) {
                                 // F2a/c: a held (403) session costs one request, then the whole drain backs off like a `later`: the same session asked again
                                 // every second was the flood. The backoff resets on a delivery.
                                 drainFailures += 1;
-                                drainNotBefore = now() + waitAfterLaterMs(drainFailures, undefined, random);
+                                drainNotBefore = now() + scaledMs(waitAfterLaterMs(drainFailures, undefined, random));
                                 record("drain", "drain:held", step.elapsedMs);
                                 waiting = true;
                                 writeStatus("running");
@@ -330,6 +338,7 @@ export async function runUploadWorker(opts) {
 /** The process entry for `__upload-worker`: real clock, real env. Never throws, never prints, always exits 0. */
 export async function runUploadWorkerMain(env, home, selfPath = process.argv[1] ?? "") {
     try {
+        setTimerScaleFromEnv(env);
         await runUploadWorker({ home, env, nodeVersion: process.versions.node, selfPath });
     }
     catch {

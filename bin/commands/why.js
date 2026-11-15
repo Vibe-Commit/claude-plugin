@@ -92,15 +92,18 @@
  * @provenance vibecommit-mcp src/read/envelope.ts — the one-text-part wire shape, retyped
  * @provenance vibecommit-schema capture_turns + commit_file_attribution — MEASURED ABSENCE, cited
  */
-import { ABSENCE, COMMANDS, SIGNIN, WHY, renderCommitHeader, renderCommitIdentity, } from "../copy/index.js";
+import { ABSENCE, COMMANDS, SIGNIN, ORG_ANSWER, WHY, renderCommitHeader, renderCommitIdentity, } from "../copy/index.js";
 import { renderVerbHelp } from "../verb_help.js";
 import { EXIT } from "../exit.js";
 import { gitProbe, isShallowClone, resolveRepoSlug } from "../git.js";
 import { emitJson } from "../json.js";
 import { mcpUrl } from "../oauth/discovery.js";
+import { orgAnswers, orgHeadings, withOrg } from "../oauth/org_answers.js";
+import { terminalSafe } from "../printable.js";
 import { readWithSession } from "../oauth/signin.js";
 import { resolveProjectKey } from "../project.js";
 import { WRAP_COLUMNS, paint, renderErrorBlock, truncatePath, wrap } from "../term.js";
+import { Writable } from "node:stream";
 import { notAGitRepoBlock, writeFailure, writeLines } from "./context.js";
 import { channelCommand, installChannel } from "../install.js";
 /** §10.4 indents the body two columns and the turn rows four under it. */
@@ -532,9 +535,9 @@ function absence(ctx, state, fixes, commit) {
  */
 function turnRow(turn) {
     const marker = attributionMarker(turn);
-    const head = `${" ".repeat(TURN_INDENT)}${WHY.turnLabel}${turn.sequence === null ? "" : ` ${turn.sequence + 1}`}${turn.tool === null ? "" : `${GAP}[${turn.tool}]`}`;
+    const head = `${" ".repeat(TURN_INDENT)}${WHY.turnLabel}${turn.sequence === null ? "" : ` ${turn.sequence + 1}`}${turn.tool === null ? "" : `${GAP}[${terminalSafe(turn.tool)}]`}`;
     const tail = marker === "" ? "" : `${GAP}${marker}`;
-    const files = turn.files.join(", ");
+    const files = turn.files.map((f) => terminalSafe(f)).join(", ");
     if (files === "")
         return `${head}${tail}`;
     const budget = Math.max(8, WRAP_COLUMNS - head.length - tail.length - GAP.length);
@@ -560,7 +563,7 @@ const GAP = "  ";
  */
 function attributionMarker(turn) {
     if (turn.agentId !== null)
-        return WHY.subAgentMarker(turn.agentId);
+        return WHY.subAgentMarker(terminalSafe(turn.agentId));
     // ⚠ NO PRODUCER. Implemented so the row exists the day the column does; today
     // nothing on the wire can set it, and it is NEVER rendered from a zero.
     if (turn.subagentCount !== null && turn.subagentCount > 0) {
@@ -607,7 +610,8 @@ function turnLines(ctx, payload, file) {
         for (const quote of turn.excerpt) {
             // Verbatim scrubbed transcript, never a summary (§10.4). `muted`, and the
             // `>` prefix is the quote marker the drawing uses.
-            for (const line of wrap(`${WHY.excerptPrefix} ${boundQuote(quote)}`, EXCERPT_INDENT)) {
+            // rv-cap127c 3: a teammate's transcript text reaches this terminal: no control, bidi or zero-width character gets through (--json keeps the raw text)
+            for (const line of wrap(`${WHY.excerptPrefix} ${boundQuote(terminalSafe(quote, true))}`, EXCERPT_INDENT)) {
                 out.push(paint(ctx.colour, "muted", line));
             }
         }
@@ -769,16 +773,20 @@ function render(ctx, outcome, commit, file, json) {
             if (outcome.isError) {
                 return fail(ctx, json, errorCopy("RECORD_SERVICE_ERROR", WHY.serverErrorWhat, WHY.serverErrorWhy, WHY.readFix, COMMANDS.why), EXIT.failure, commit);
             }
-            const payload = parseBlameCommitPayload(outcome.document);
-            if (payload === null) {
+            // M-a answers in three shapes (src/oauth/org_answers.ts): the legacy body, a body plus `org`, and `{ org: null, results: [...] }` when several
+            // organizations answer. Each organization's BODY goes through the unchanged parser; one unreadable body makes the whole answer unreadable.
+            const answers = orgAnswers(outcome.document);
+            const payloads = answers === null ? null : answers.map((a) => parseBlameCommitPayload(a.body));
+            if (answers === null || payloads === null || payloads.some((p) => p === null)) {
                 return fail(ctx, json, errorCopy("RECORD_ANSWER_UNREADABLE", WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, COMMANDS.why), EXIT.failure, commit);
             }
+            const payload = payloads[0];
             // ⛔ SKEW IS NOT MALFORMEDNESS. The server answered correctly and this
             // build is too old to render it, so the user is sent to an upgrade rather
             // than told to report a bug that does not exist. `EXIT.failure` is kept:
             // the command genuinely produced no answer, and a caller scripting `why`
             // must not read a skew screen as success.
-            if (isVersionSkew(payload)) {
+            if (payloads.some((p) => isVersionSkew(p))) {
                 return fail(ctx, json, 
                 // The remedy follows the channel: the plugin is reinstalled, an npm install is updated. Anything that is not
                 // provably the plugin is told the npm command, since only a plugin bundle has a `/plugin install` to run.
@@ -786,9 +794,68 @@ function render(ctx, outcome, commit, file, json) {
                     ? errorCopy("CLIENT_TOO_OLD", WHY.skewWhat, WHY.skewWhy, WHY.skewFix, COMMANDS.pluginInstall)
                     : errorCopy("CLIENT_TOO_OLD", WHY.skewWhat, WHY.skewWhy, WHY.skewFixNpm, COMMANDS.npmUpdate), EXIT.failure, commit);
             }
-            return renderPayload(ctx, payload, commit, file, json);
+            if (answers.length === 1) {
+                const only = answers[0];
+                if (!json || only.org === null)
+                    return renderPayload(ctx, payload, commit, file, json);
+                // rv-cap127c 1: under --json the answer's own `org` object is kept, raw, beside the single-organization body
+                const buf = bufferStream();
+                const exit = renderPayload({ ...ctx, stdout: buf.stream }, payload, commit, file, json);
+                ctx.stdout.write(exit === EXIT.failure ? buf.text() : withOrg(buf.text(), only.org));
+                return exit;
+            }
+            return renderEach(ctx, answers.map((a, i) => ({ org: a.org, payload: payloads[i] })), commit, file, json);
         }
     }
+}
+/** A stream that keeps what is written to it. */
+function bufferStream() {
+    const chunks = [];
+    const stream = new Writable({
+        write(chunk, _enc, cb) {
+            chunks.push(String(chunk));
+            cb();
+        },
+    });
+    return { stream, text: () => chunks.join("") };
+}
+/**
+ * SEVERAL organizations answered. Each is rendered by the same `renderPayload` into its own buffer (so one organization's failure fails the whole
+ * command with nothing half-printed), and the answers are NOT merged: two organizations may hold different sessions for one commit, and a merged
+ * answer would pick one.
+ *
+ * Text: each organization's screen under its own name (`ORG_ANSWER.heading`), in the order the server sent them (Personal first, then by name).
+ * `--json`: ONE document `{ schema, verb, outcome, org: null, results: [ { org: {id, name}, outcome, ...the single-organization body } ] }` whose
+ * outcome is `turns` when any organization has turns and otherwise the first organization's state. Exit: 0 when any organization has turns,
+ * otherwise the first organization's code.
+ */
+function renderEach(ctx, answers, commit, file, json) {
+    const rendered = [];
+    for (const a of answers) {
+        const buf = bufferStream();
+        const exit = renderPayload({ ...ctx, stdout: buf.stream }, a.payload, commit, file, json);
+        rendered.push({ org: a.org, state: a.payload.state, out: buf.text(), exit });
+    }
+    const best = rendered.find((r) => r.exit === EXIT.ok) ?? rendered[0];
+    if (json) {
+        const results = rendered.map((r) => {
+            const { schema: _s, verb: _v, ...rest } = JSON.parse(r.out);
+            return { org: r.org, ...rest };
+        });
+        ctx.stdout.write(`${JSON.stringify({ schema: 1, verb: "why", outcome: best.state, org: null, results })}\n`);
+        return best.exit;
+    }
+    const lines = [];
+    const headings = orgHeadings(rendered.map((r) => r.org));
+    rendered.forEach((r, i) => {
+        if (i > 0)
+            lines.push("");
+        const heading = headings[i];
+        lines.push(heading === null || heading === undefined ? "" : ORG_ANSWER.heading(heading), "");
+        lines.push(r.out.replace(/\n$/, ""));
+    });
+    ctx.stdout.write(`${lines.join("\n")}\n`);
+    return best.exit;
 }
 /**
  * §R3's squash disclosure, and THE ONE PLACE THE TWO CLAIMS ARE DISTINGUISHED.

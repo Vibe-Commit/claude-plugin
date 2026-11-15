@@ -1703,6 +1703,15 @@ export const WHY = {
     signedOutFix: "Sign in, then run the command again:",
 };
 /**
+ * APPROVED by P6 (EST 2026-11-14). When SEVERAL organizations answer one `report` or `why` (spec A62 (b)), each organization's answer is printed under
+ * its own name, in the order the server sent them (Personal first, then by name). One organization answering prints no heading. `src/oauth/org_answers.ts`
+ * (`orgHeadings`) builds the name that is passed here: it removes control characters and, when two headings of one answer read the same, adds the first 8
+ * characters of the organization id in parentheses (APPROVED variant).
+ */
+export const ORG_ANSWER = {
+    heading: (name) => `${name}:`,
+};
+/**
  * `vibecommit report` (CR-108).
  *
  * NOTE: this surface ships NO durability copy until the E2 metric is defined
@@ -1777,6 +1786,12 @@ export const REPORT = {
      */
     probable: (count) => `${count} more matched by patch id, reported separately and not counted above.`,
     probableOne: "1 more matched by patch id, reported separately and not counted above.",
+    /**
+     * APPROVED by P6 (EST 2026-11-14), verbatim. `exact_successors` arrived as `null`: the answer is the caller's OWN-ONLY view of a repository they cannot read at
+     * repository level, so the server refuses the rewritten-commit facts rather than measuring a zero (vibecommit-mcp `src/read/coverage.ts`, `counts`).
+     * The rate then counts those commits in the denominator and not in the numerator, and says so.
+     */
+    exactUnknown: "Rebased or amended commits can't be matched to their new versions from your account, so this rate counts them as not reachable.",
     // --- The refusals. A refusal is not an absence and not a sixth state. ---
     /**
      * ⚠ **A SEPARATE PHRASING FROM `WHY.shallowWhat`, AND THE REASON IS THAT IT
