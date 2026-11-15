@@ -46,15 +46,18 @@
  *
  * @provenance vibecommit-mcp src/read/coverage.ts — the payload shape, retyped
  */
-import { ABSENCE, COMMANDS, REPORT, SIGNIN, WHY, } from "../copy/index.js";
+import { ABSENCE, COMMANDS, ORG_ANSWER, REPORT, SIGNIN, WHY, } from "../copy/index.js";
 import { renderVerbHelp } from "../verb_help.js";
 import { EXIT } from "../exit.js";
 import { currentBranch, gitProbe, isReachable, isShallowClone, resolveRepoSlug } from "../git.js";
 import { emitJson } from "../json.js";
 import { mcpUrl } from "../oauth/discovery.js";
+import { orgAnswers, orgHeadings, withOrg } from "../oauth/org_answers.js";
+import { terminalSafe } from "../printable.js";
 import { readWithSession } from "../oauth/signin.js";
 import { resolveProjectKey } from "../project.js";
 import { renderErrorBlock, wrap } from "../term.js";
+import { Writable } from "node:stream";
 import { notAGitRepoBlock, writeFailure, writeLines } from "./context.js";
 import { channelCommand } from "../install.js";
 /** §10.3 indents the body two columns, the same as `why`'s screens. */
@@ -67,6 +70,13 @@ const isRecord = (v) => typeof v === "object" && v !== null && !Array.isArray(v)
 function asCount(value) {
     return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
 }
+/** A count the server may mark "not available to this caller": a non-negative integer, or an explicit `null`. ABSENT or any other value is `undefined` (malformed). */
+function asCountOrNull(value) {
+    if (value === null)
+        return null;
+    const n = asCount(value);
+    return n === null ? undefined : n;
+}
 /** The whole document. `null` means malformed, and malformed renders as malformed. */
 export function parseCoveragePayload(document) {
     if (!isRecord(document))
@@ -75,8 +85,8 @@ export function parseCoveragePayload(document) {
     if (typeof ref !== "string" || ref.trim() === "")
         return null;
     const edgesHeld = asCount(document.edges_held);
-    const exactSuccessors = asCount(document.exact_successors);
-    if (edgesHeld === null || exactSuccessors === null)
+    const exactSuccessors = asCountOrNull(document.exact_successors);
+    if (edgesHeld === null || exactSuccessors === undefined)
         return null;
     if (!Array.isArray(document.captured_shas))
         return null;
@@ -101,8 +111,8 @@ export function parseCoveragePayload(document) {
     // parsed — see the docblock above.
     if (!isRecord(document.probable_line))
         return null;
-    const probableCount = asCount(document.probable_line.count);
-    if (probableCount === null)
+    const probableCount = asCountOrNull(document.probable_line.count);
+    if (probableCount === undefined)
         return null;
     return { ref, edgesHeld, byGrade, capturedShas, exactSuccessors, probableCount };
 }
@@ -224,19 +234,22 @@ function notAuthorized(ctx, json, authorized) {
  */
 function coverageScreen(payload, reachable, percent) {
     const lines = [
-        ...wrap(REPORT.definition(payload.ref), BODY_INDENT),
+        ...wrap(REPORT.definition(terminalSafe(payload.ref)), BODY_INDENT),
         "",
-        ...wrap(REPORT.rate(String(reachable), String(payload.edgesHeld), payload.ref, String(percent)), BODY_INDENT),
+        ...wrap(REPORT.rate(String(reachable), String(payload.edgesHeld), terminalSafe(payload.ref), String(percent)), BODY_INDENT),
     ];
     const parts = GRADE_ORDER.filter((g) => (payload.byGrade[g] ?? 0) > 0).map((g) => REPORT.gradeCount(String(payload.byGrade[g]), GRADE_LABEL[g]));
     if (parts.length > 0) {
         lines.push(...wrap(`${REPORT.gradeMixIntro} ${parts.join(", ")}.`, BODY_INDENT));
     }
     // ⚠ ITS OWN LINE, IN OUR WORDS, NEVER ADDED TO THE RATE ABOVE (D67).
-    if (payload.probableCount > 0) {
+    if (payload.probableCount !== null && payload.probableCount > 0) {
         const text = payload.probableCount === 1 ? REPORT.probableOne : REPORT.probable(String(payload.probableCount));
         lines.push("", ...wrap(text, BODY_INDENT));
     }
+    // An unknown (null) exact-successor count is said, in our words: the rate above counts only what is still reachable.
+    if (payload.exactSuccessors === null)
+        lines.push("", ...wrap(REPORT.exactUnknown, BODY_INDENT));
     return lines;
 }
 export async function report(ctx, argv, deps = {}) {
@@ -352,13 +365,79 @@ function render(ctx, outcome, projectKey, ref, window, windowCommits, opts) {
             if (outcome.isError) {
                 return fail(ctx, opts.json, errorCopy("RECORD_SERVICE_ERROR", WHY.serverErrorWhat, WHY.serverErrorWhy, WHY.readFix, COMMANDS.report), EXIT.failure);
             }
-            const payload = parseCoveragePayload(outcome.document);
-            if (payload === null) {
+            // M-a answers in three shapes (src/oauth/org_answers.ts): the legacy body, a body plus `org`, and `{ org: null, results: [...] }` when several
+            // organizations answer. Each organization's BODY goes through the unchanged parser; one unreadable body makes the whole answer unreadable.
+            const answers = orgAnswers(outcome.document);
+            const payloads = answers === null ? null : answers.map((a) => parseCoveragePayload(a.body));
+            if (answers === null || payloads === null || payloads.some((p) => p === null)) {
                 return fail(ctx, opts.json, errorCopy("RECORD_ANSWER_UNREADABLE", WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, COMMANDS.report), EXIT.failure);
             }
-            return renderPayload(ctx, payload, projectKey, ref, window, windowCommits, opts);
+            if (answers.length === 1) {
+                const only = answers[0];
+                if (!opts.json || only.org === null)
+                    return renderPayload(ctx, payloads[0], projectKey, ref, window, windowCommits, opts);
+                // rv-cap127c 1: under --json the answer's own `org` object is kept, raw, beside the single-organization body
+                const buf = bufferStream();
+                const exit = renderPayload({ ...ctx, stdout: buf.stream }, payloads[0], projectKey, ref, window, windowCommits, opts);
+                ctx.stdout.write(exit === EXIT.failure ? buf.text() : withOrg(buf.text(), only.org));
+                return exit;
+            }
+            return renderEach(ctx, answers.map((a, i) => ({ org: a.org, payload: payloads[i] })), projectKey, ref, window, windowCommits, opts);
         }
     }
+}
+/** A stream that keeps what is written to it. */
+function bufferStream() {
+    const chunks = [];
+    const stream = new Writable({
+        write(chunk, _enc, cb) {
+            chunks.push(String(chunk));
+            cb();
+        },
+    });
+    return { stream, text: () => chunks.join("") };
+}
+/**
+ * SEVERAL organizations answered. Each is rendered by the same `renderPayload` into its own buffer, so a failure in any one (an unanswerable
+ * reachability probe, a payload that disagrees with the clone) fails the whole command with nothing half-printed. Their rates are NOT merged: an
+ * edge counted in two organizations would be counted twice, and a blended rate would claim a denominator nobody holds.
+ *
+ * Text: each organization's screen under its own name (`ORG_ANSWER.heading`). `--json`: ONE document,
+ * `{ schema, verb, outcome, since, org: null, results: [ { org: {id, name}, outcome, ...the single-organization body } ] }`, outcome `coverage` when any
+ * organization has a rate and otherwise the first organization's outcome. Exit: 0 when any organization has a rate, otherwise the first organization's code.
+ */
+function renderEach(ctx, answers, projectKey, ref, window, windowCommits, opts) {
+    const rendered = [];
+    for (const a of answers) {
+        const buf = bufferStream();
+        const exit = renderPayload({ ...ctx, stdout: buf.stream }, a.payload, projectKey, ref, window, windowCommits, opts);
+        if (exit === EXIT.failure) {
+            ctx.stdout.write(buf.text()); // under --json `fail` wrote its one failure document to the (buffered) stdout; nothing of ours was printed before it
+            return exit;
+        }
+        rendered.push({ org: a.org, out: buf.text(), exit });
+    }
+    const best = rendered.find((r) => r.exit === EXIT.ok) ?? rendered[0];
+    if (opts.json) {
+        const results = rendered.map((r) => {
+            const { schema: _s, verb: _v, ...rest } = JSON.parse(r.out);
+            return { org: r.org, ...rest };
+        });
+        const first = JSON.parse(best.out);
+        ctx.stdout.write(`${JSON.stringify({ schema: 1, verb: "report", outcome: first.outcome, since: opts.since, org: null, results })}\n`);
+        return best.exit;
+    }
+    const lines = [];
+    const headings = orgHeadings(rendered.map((r) => r.org));
+    rendered.forEach((r, i) => {
+        if (i > 0)
+            lines.push("");
+        const heading = headings[i];
+        lines.push(heading === null || heading === undefined ? "" : ORG_ANSWER.heading(heading), "");
+        lines.push(r.out.replace(/\n$/, ""));
+    });
+    ctx.stdout.write(`${lines.join("\n")}\n`);
+    return best.exit;
 }
 function renderPayload(ctx, payload, projectKey, ref, window, windowCommits, opts) {
     // STATE 4 — commits exist and we hold no session for any of them. The counted
@@ -406,7 +485,7 @@ function renderPayload(ctx, payload, projectKey, ref, window, windowCommits, opt
     // ⚠ ONLY EXACT SUCCESSORS JOIN THE NUMERATOR (D67). A commit that was
     // rewritten is still reachable through the successor we hold a recorded row
     // for; a patch-id guess is NOT, and it renders on its own line instead.
-    const numerator = reachable + payload.exactSuccessors;
+    const numerator = reachable + (payload.exactSuccessors ?? 0); // null = unknown, counted as nothing and said so on the screen
     if (numerator > payload.edgesHeld) {
         // The payload disagrees with the clone about its own totals. A rate over
         // 100% is not a number to print, and clamping it would hide the disagreement
@@ -431,8 +510,9 @@ function renderPayload(ctx, payload, projectKey, ref, window, windowCommits, opt
             by_grade: payload.byGrade,
             reachable,
             exact_successors: payload.exactSuccessors,
-            counted: numerator,
-            percent,
+            // null = not known (json.ts): with the exact-successor count unknown the numerator is not the figure the screen's rate is made of
+            counted: payload.exactSuccessors === null ? null : numerator,
+            percent: payload.exactSuccessors === null ? null : percent,
             probable_count: payload.probableCount,
         });
         return EXIT.ok;
