@@ -98,7 +98,7 @@ export const HELP = {
             usage: "vibecommit backfill",
             options: [],
             exits: [
-                ["0", "Done, declined at the question, or interrupted with Ctrl+C. Sessions held for an organization's approval count as done."],
+                ["0", "Done, declined at the question, or interrupted with Ctrl+C."],
                 ["1", "The server stopped the run, could not be reached or refused this machine's credential, or it could not run. Nothing already sent is lost; run it again to resume."],
                 ["2", "No terminal, or an argument was given."],
                 ["3", "Not connected."],
@@ -222,6 +222,15 @@ function namedIds(ids) {
     const shown = ids.slice(0, 3).join(", ");
     return ids.length > 3 ? `${shown} and ${ids.length - 3} more` : shown;
 }
+const STATUS_ROUTE_WHY = {
+    not_member: "you're not a member of the organization that owns it",
+    no_github_access: "GitHub hasn't given you access",
+    github_not_confirmed: "GitHub hasn't confirmed your access yet (usually a minute)",
+    installation_suspended: "its GitHub connection is suspended",
+    other_personal_owner: "another person's GitHub account owns it",
+    unowned: "no organization owns it",
+    not_github: "folders and non-GitHub remotes stay private",
+};
 export const STATUS = {
     onForRepo: "Capture is on for this repository.",
     offForRepo: "Capture is off for this repository.",
@@ -276,6 +285,33 @@ export const STATUS = {
      */
     basisAccountOnly: "granted on your account, not on this machine",
     /**
+     * T51b (spec A74, §4.6 destination lines, §5.1 item 6): where THIS repository's captures go, from the server's shared routing
+     * predicate (`GET /ingest/v1/capture/route`). The 13 reasons map to the web's sentences VERBATIM. The owning team's name appears
+     * only in `team` and `team_unsynced` (the destination's own `org_name`, filled for members); the other sentences say `the
+     * organization that owns it`, §4.6's wording for a viewer who has no name to show, because the route names the DESTINATION, which
+     * for those reasons is the caller's Personal account.
+     */
+    /** §4.6's sentence for an answered route: `own_personal` has no reason, a team destination names itself, and the three sentences about the OWNING team (`sharing_off`, `org_paused`, `org_deleting`) name the owner the server told a member (A77). With no name: `the organization that owns it`. */
+    routeLine: (reason, orgName, ownerName) => {
+        const org = orgName ?? "the organization that owns it";
+        if (reason === "team")
+            return `Captures go to ${org}`;
+        if (reason === "team_unsynced") {
+            return `Captures go to ${org} · only you can read them until GitHub's access list arrives (usually a minute)`;
+        }
+        // A77: the sentences that name the OWNING team use the owner the server named to a member, else §4.6's no-name wording.
+        const owner = ownerName ?? "the organization that owns it";
+        const named = {
+            sharing_off: `you stopped sharing with ${owner}`,
+            org_paused: `${owner} is paused`,
+            org_deleting: `${owner} is being deleted`,
+        };
+        const why = named[reason] ?? STATUS_ROUTE_WHY[reason];
+        return why === undefined ? "Captures go to your Personal account" : `Captures go to your Personal account · ${why}`;
+    },
+    /** A 404 (an older server), a timeout, a 5xx or an answer off the contract: never a guess at a reason. */
+    routeUnavailable: "Couldn't check where this repository's captures go.",
+    /**
      * Slice 2 (S4), brief §3.3: the machine screen's account rows, after `off` and before `held`. `on account` lists what the
      * user's account grants that THIS machine has not named (an owner as `owner/`); the second line says what to do about it.
      */
@@ -314,12 +350,6 @@ export const STATUS = {
     refusedFolderWhy: "a folder at the same path was uploaded first from another member's machine, so this folder's sessions are not captured here",
     undecidedLabel: "not chosen",
     undecidedHint: (connect) => `recent sessions touched these and nothing was captured · to choose, run: ${connect}`,
-    /**
-     * Machine-level `status`: the repos whose own last upload was refused because their org has not approved capture. §10.2's held
-     * vocabulary — the beat word `held`, and the backfill screen's "the org must approve capture" (Alexander, 2026-10-24 17:20).
-     */
-    heldLabel: "held",
-    heldReason: "the org must approve capture",
     ownerTail: "all its repos, including ones you clone later",
     changeLabel: "Change what is captured",
     turnOffInside: "Turn one repo off, run inside it",
@@ -484,7 +514,10 @@ export const STATUS = {
     liveStuck: (bytes, sessions, commits, ids = []) => {
         const who = `${sessions} live ${sessions === 1 ? "session" : "sessions"} (${namedIds(ids)})`;
         const commitsClause = commits > 0 ? `, including ${commits} ${commits === 1 ? "commit" : "commits"}` : "";
-        return (`${BYTE_COUNT.format(bytes)} ${bytes === 1 ? "byte is" : "bytes are"} held from ${who}${commitsClause}; ` +
+        return (
+        // M3 (rv-capstep, accepted residual): "written off after 24 hours" is false only for a PINNED hold, which needs an OLDER server's approval
+        // refusal (a 403) that the production server never sends. No copy change.
+        `${BYTE_COUNT.format(bytes)} ${bytes === 1 ? "byte is" : "bytes are"} held from ${who}${commitsClause}; ` +
             "the oldest has waited over 30 minutes. Capture keeps retrying; anything held past 24 hours is written off instead.");
     },
     /**
@@ -505,7 +538,9 @@ export const STATUS = {
         const action = sessions === 1
             ? `If that session is finished, \`${finalizeSession} ${ids[0]}\` tries to send them and, if that works, closes it`
             : `If a session above is finished, \`${finalizeSession} <id>\` tries to send its bytes and, if that works, closes it`;
-        return (`${BYTE_COUNT.format(bytes)} ${bytes === 1 ? "byte" : "bytes"} held from ${who}${commitsClause}, with no hook in over 30 ` +
+        return (
+        // M3 (rv-capstep, accepted residual): see live_stuck above; false only for a pinned hold (an older server's approval 403).
+        `${BYTE_COUNT.format(bytes)} ${bytes === 1 ? "byte" : "bytes"} held from ${who}${commitsClause}, with no hook in over 30 ` +
             `minutes. ${action}; anything held past 24 hours is written off instead.`);
     },
     fixCommandLabel: "To reconnect, run",
@@ -725,60 +760,12 @@ export const CONNECT = {
     noTranscriptWhat: "No Claude Code session was found for this repository.",
     noTranscriptWhy: "Consent is recorded, but connect had nothing to record: no transcript exists yet for this project. Capture starts on its own the next time Claude Code runs here.",
     noTranscriptFix: "Nothing to fix. Start a session, then check:",
-    // --- The FIFTH beat: org approval required (CR-110, D65 §DR6, D81). ---
     /**
-     * ⚠ `warn`, NEVER `bad`, and **EXIT 0, never 1**. That 403 means *later*, not
-     * *failed*: the offset holds and the backlog uploads in order on approval. A
-     * red exit tells a correctly-installed user they broke something, which moves
-     * the confusion report's T+9:00 give-up to T+0:45. `held` and `armed` are the
-     * two words doing the work — both mean *ready, not running*.
-     *
-     * `capture_policy` defaults to `approval_required`, so a member of a
-     * multi-member org sees this every time; solo orgs auto-approve inside the
-     * insert and never meet it.
+     * The generic hold line (A78): the server answered the test capture with an older server's approval 403. It is a
+     * HOLD, not a failure: the offset holds and the bytes stay on disk, so exit 0 and no word about why. `warn`, never `bad`.
      */
-    pendingWhat: "Your org needs to approve capture first.",
-    /**
-     * ⚠ NAMES THE REPO, NOT THE ORG — and that is a deviation from the style
-     * guide's drawn example, made deliberately. §10.2 renders *"acohan/repo
-     * belongs to the `vibecommit` org"*, and the client cannot produce that name:
-     * the 403 body discloses nothing (no org id, no owner list, by design), and
-     * `resolveRepoSlug` yields the GIT owner, which is a different thing from the
-     * VibeCommit org that holds the capture policy. Inventing one would be a
-     * confident lie; the link resolves it, which is what the link is for.
-     */
-    pendingWhy: (repo) => `${repo} belongs to an org that requires owner approval before capture runs.`,
-    /**
-     * ⚠ THE SHARED CLAUSE, and it renders on EVERY branch. D81: `owners_notified`
-     * `null` = NOT DETERMINABLE, `0` = determinable and nobody was told, `> 0` =
-     * N notified — and **`> 0` ADDS to this sentence rather than replacing it**.
-     * One shared clause is why the two branches cannot drift apart later; a pair
-     * of independent paragraphs is how the false version gets reintroduced.
-     *
-     * It is also TRUE, and checked rather than inherited: the server upserts a
-     * `capture_requests` row BEFORE it emits the 403.
-     */
-    pendingRecorded: "Your request is recorded.",
-    /**
-     * ⚠ THE ONLY BRANCH THAT MAY CLAIM A NOTIFICATION, and it is reachable only
-     * when the server says `> 0`. Today it never does — the field is hardcoded
-     * `null` until `CR-036`, which is provisioning-blocked — so this sentence is
-     * built and unreachable ON PURPOSE. **Never render it on the null branch.**
-     * D81: a hardcoded *"we notified the owners"* installs the most damaging
-     * possible mental model at the moment of highest trust — *the owner knows, so
-     * I just wait* — so the pending state would suppress its own workaround. A
-     * user told nothing at least asks in Slack.
-     *
-     * The branch is PERMANENT, not a stopgap: addresses bounce, domains land on
-     * suppression lists, and a sole owner's address can be dead. `CR-036` landing
-     * does not delete the other branch; it only makes this one reachable.
-     */
-    pendingNotified: (owners) => owners === 1 ? "We notified the owner." : `We notified the ${owners} owners.`,
-    /** True by construction: 403 is `later`, so the offset holds and bytes stay on disk. */
-    pendingBuffered: "Nothing is lost while you wait — turns are buffered on this machine and upload in order once an owner approves.",
-    pendingTrackLabel: "Track it:",
-    /** `armed` = ready, not running. The install is correct; capture is waiting. */
-    pendingArmed: (repo) => `Capture is armed for ${repo}.`,
+    holdWhat: "The server is holding this repo's captures for now.",
+    holdBuffered: "Nothing is lost: turns stay on this machine and upload in order once the server takes them.",
 };
 /**
  * The PATH clash — `CR-025`, and `DESIGN.md` §13.6's worked example is the spec.
@@ -1099,7 +1086,8 @@ export const BACKFILL = {
     /** Outcome fragments on a repo line, joined by " · ". */
     uploaded: (count) => `${count} uploaded`,
     skipped: (count, reason) => `${count} skipped, ${reason}`,
-    held: (count) => `${count} held, the org must approve capture`,
+    /** The generic hold (A78): an older server's approval 403. No reason is given because none is shown to the user. */
+    held: (count) => `${count} held, kept on this machine`,
     failed: (count, reason) => `${count} failed, ${reason}`,
     stopped: "stopped",
     /**
@@ -1142,12 +1130,11 @@ export const BACKFILL = {
         ].filter((part) => part !== null);
         return `Uploaded ${uploaded} of ${total} ${noun}.${tail.length > 0 ? ` ${tail.join(", ")}.` : ""}`;
     },
-    /** `owners` is the held repos' owners, already phrased ("acme-corp", "acme-corp or other-org"). */
-    heldBlock: (owners) => `Held sessions wait for ${owners} to approve capture:`,
-    heldThenRun: "Then run:",
+    /** The generic hold line under the summary: nothing is lost, a re-run sends what was held. */
+    holdNote: "Held sessions stay on this machine and are sent by a later run:",
     /**
      * The stop block: a server `later` (5xx, 429) stops the run, with the resume fix. ⛔ It states only what landed: `uploaded` is
-     * sessions the server took, not sessions looked at, and "not yet uploaded" is what a re-run will OFFER again (skipped and held
+     * sessions the server took, not sessions looked at, and "not yet uploaded" is what a re-run will OFFER again (skipped
      * sessions among them), not a promise of what it will send.
      */
     stopWhat: (uploaded, total) => `Upload stopped: ${uploaded} of ${total} ${total === 1 ? "session" : "sessions"} uploaded.`,
@@ -1281,14 +1268,6 @@ export const PICKER = {
     onFor: (summary) => `Capture is on for ${summary} on this machine.`,
     onProof: "The next Claude Code, Codex or Cursor session in any of them is captured. In Claude Code, its first reply then shows \"VibeCommit captured this session.\"",
     stopOne: "To stop one repo, run inside it:",
-    /**
-     * Alexander's "caveat for other owners" (2026-10-24; amended 17:20), on the "Capture is on" block. It prints for the owners the
-     * test capture did NOT check: from `~` that is every granted owner (there is no session to probe), and in a repo it is every
-     * granted owner except the one whose delta the server answered with a 2xx. For an owner that is not the signed-in person's own
-     * account the client cannot know whether an org is yet to approve capture, so it says one may be. Never printed when every
-     * such owner is the user's own account.
-     */
-    ownerApproval: (status) => `An organization can require an owner's approval before its repos are captured; once a session in one of its repos has tried to upload, ${status} shows any that are waiting.`,
     onNewLaptop: (names) => `Capture is on for ${names} on this machine.`,
     onNewLaptopProof: "No clone of it is here yet. Clone one and open a coding agent in it; that session is captured.",
     // --- Slice 2 (S4 part 3, capture 0.8.0): the account's grants in `connect`. Brief §2-§3, VQ's rulings 2026-10-24. ---
@@ -2082,25 +2061,21 @@ export const RETIRE = {
  */
 export const REPLACE = {
     accountLabel: "account",
-    workspaceLabel: "workspace",
     replacesLabel: "replaces",
     /** `R8`: the handle was null — shown as an explicit gap, never a blank. */
     accountUnavailable: "(GitHub handle unavailable)",
     /**
-     * A4 §3. The probe of the new credential was not answered, so the workspace match cannot be shown.
-     * The block says so on the `workspace` row, in the gutter's own shape, rather than hiding the row.
+     * T41c (spec §4.7): the consent questions name NO organization. Credentials are minted into the person's Personal account (T41a) and
+     * routing is by repository, so there is no destination to name here. The lead line says where sessions go: it is the web confirm
+     * panel's sentence VERBATIM (web #161, e2ffcf2 `app/device/_lib/copy.ts:31`) plus the docs link (§4.7). Each question is ≤80 columns
+     * with the `[y/N]`; the machine variant is first, the picker path (D7 · 3A, "the repos above") second. Both are true under today's
+     * routing and M-a's.
      */
-    workspaceUnconfirmed: "(couldn't confirm with the server)",
-    /** …and the question then names NO workspace — it has none to name. ≤80 columns with the `[y/N]`. */
-    questionUnconfirmed: "Upload this machine's transcripts to the workspace you signed in to?",
-    replacesValue: (org) => `credential for ${org}`,
-    question: (org) => `Upload this machine's transcripts to ${org}?`,
-    /**
-     * 0.7.0, D7 · 3A: on the PICKER path the question names the repos, not the machine, and is the second of at most three
-     * questions in a run. The workspace is cut to 28 columns (not `question`'s 30) so the line stays within 80 with `[y/N]`.
-     */
-    questionRepos: (org) => `Upload transcripts from the repos above to ${org}?`,
-    questionReposUnconfirmed: "Upload transcripts from the repos above to your signed-in workspace?",
+    routing: "Each repository's sessions go to your Personal account, or to an organization you've joined and share with, when it owns the repository on GitHub and GitHub gives you access. vibecommit.ai/docs/teams",
+    question: "Upload this machine's transcripts to VibeCommit?",
+    questionRepos: "Upload transcripts from the repos above to VibeCommit?",
+    /** The `replaces` row on a cross-organization re-auth. It names NO organization (T41c, §4.7): credentials always land in Personal. */
+    replacesValue: "the credential saved on this machine",
     declined: "Nothing was saved. The approval is discarded.",
     /** Ctrl+C at the question (the prompt was aborted): the same outcome as N, said as what it was. */
     cancelled: "Cancelled. Nothing was saved.",
@@ -2112,7 +2087,9 @@ export const REPLACE = {
      * A4 §3, fail closed: the device flow's confirmation has nothing to show (no probe, no ticket
      * workspace), and it never saves without asking. §13.6 what / why / fix, fix last.
      */
-    unconfirmableWhat: "The workspace for this credential could not be confirmed.",
+    // L12 (rv-capstep): names no workspace (credentials land in Personal, T41c). The gate that picks this screen stays keyed on `shown.orgName == null`
+    // (finish_mint.ts), which still means "nothing to show the person"; only the words changed. WORKSPACE_UNCONFIRMED is a machine code and is unchanged.
+    unconfirmableWhat: "The new credential could not be confirmed with the server.",
     unconfirmableWhyRevoked: "Nothing was saved, and the credential just created was revoked.",
     unconfirmableWhyOrphan: "Nothing was saved. The credential just created is unused; revoke it in Settings if you want it gone.",
     unconfirmableFix: "Run the command again:",
@@ -2560,19 +2537,6 @@ export const URLS = {
      * (`post.ts` `readConversationId` guarantees it), and fall back to `commits` when there is none.
      */
     conversation: (id) => `https://vibecommit.ai/app/conversations/${id}`,
-    /**
-     * Where an org member goes to see their pending capture request — `CR-110`.
-     *
-     * ⚠ VERIFIED BY FILE, NOT BY PROBE. Every `/app/*` path on that site returns
-     * an identical 307 whether or not the route exists, so a 307 is NEVER evidence
-     * a route is real. This one was confirmed by reading
-     * `vibecommit-web/app/app/settings/capture-access/page.tsx` on `origin/main`,
-     * with `app/api/capture-access/{policy,decide}/route.ts` beside it (`CR-035c`).
-     *
-     * Deeper than the style guide's drawn `/app`, deliberately: the beat's whole
-     * job is to be actionable, and the generic dashboard does not show the request.
-     */
-    captureAccess: "https://vibecommit.ai/app/settings/capture-access",
     /**
      * The public bundle that vendors the exact binary — `CR-111d`, D20, D64.
      *

@@ -36,13 +36,12 @@ import { confinementRoots, hookBudgetMs, readSpan, recordCutter, DEFAULT_HOOK_BU
 import { installAgentHooks } from "../agent_install.js";
 import { authCommandFor, channelCommand, classifyInstall, connectCommandFor, installPostCommitHook } from "../install.js";
 import { realpathSync } from "node:fs";
-import { CAPTURE_NOT_APPROVED, deliver, credentialFingerprint, ingestUrl, } from "../post.js";
+import { deliver, credentialFingerprint, ingestUrl, isHeldDelivery, } from "../post.js";
 import { resolveProjectKeys } from "../project.js";
 import { meetsNodeFloor, NODE_FLOOR_TEXT } from "../runtime.js";
 import { credentialsPath } from "../paths.js";
 import { paint, renderErrorBlock, tildePath, truncatePath, wrap } from "../term.js";
 import { renderVerbHelp } from "../verb_help.js";
-import { approvalPendingBlock } from "./approval_pending.js";
 import { credentialProblem, rejectedCredentialBlock } from "./credential_problem.js";
 import { probeCredential } from "./probe.js";
 import { writeLines } from "./context.js";
@@ -430,18 +429,15 @@ export async function sendTestCapture(ctx, keys, credential, found) {
  * ## Order: setup first, payoff last (`DX D9`)
  *
  * The git hook and the agent hooks are installed and REPORTED FIRST, on every
- * branch — no transcript, approval pending, or the normal ending — so the last
+ * branch — no transcript or the normal ending — so the last
  * thing a new user sees is "Connected." and the session link, not ten lines of
  * hook paths that scrolled it away. After the outcome come, in this order, the
  * unconfirmed note and `pathClash`, which runs EXACTLY ONCE, here, and not in
- * any branch (`approvalPendingBeat` used to end in its own call; with a shared
- * tail the clash block would print twice on the pending path).
+ * any branch (a branch that ended in its own call would print the clash block twice).
  *
- * ⚠ Both pre-existing holes this closes were the same shape: the two hook beats
- * sat AFTER two early returns (no transcript, approval pending), so an org
- * awaiting approval, and a repo Claude Code had never run in, got NO hooks while
- * the screen said "Capture is armed" / "Capture starts on its own". Neither was
- * true on the npm channel.
+ * ⚠ The hole this closes: the two hook beats sat AFTER early returns, so a repo
+ * Claude Code had never run in got NO hooks while the screen said "Capture
+ * starts on its own". That was not true on the npm channel.
  *
  * Two things §10.2 draws that are deliberately NOT here:
  *   - **`4 turns · 1 commit`.** Counting turns means parsing the transcript, and
@@ -486,7 +482,7 @@ unconfirmed) {
     if (locate !== undefined && found === null) {
         // ⛔ STDOUT AND EXIT `pathClash`'s — `eng-review D4 = A`. The hooks are installed above, so this is
         // no longer "a silent nothing": setup is complete and capture starts on its own the next time Claude
-        // Code runs here. This file's stream rule (`approvalPendingBeat`) puts stderr with a NON-ZERO exit
+        // Code runs here. This file's stream rule puts stderr with a NON-ZERO exit
         // and an install's OUTCOME on stdout.
         // ⚠ This REVERSES the W6 brief rule "When there is no transcript, say so and exit non-zero"
         // (`AGENT_BRIEFS/capture-refactor/_drafts/w6-capture-plugin.py:620`). Its reason — a plain-shell run
@@ -506,15 +502,11 @@ unconfirmed) {
         return tail(ctx, unconfirmed);
     }
     const { delivery } = await sendTestCapture(ctx, keys, credential, found);
-    // THE FIFTH BEAT — `CR-110`, D65 §DR6, D81.
-    //
-    // ⚠ ONE outcome is branched on, identified by its ERROR CODE. The general rule
-    // below still stands: `later` and `never` are transient or per-payload (D58)
-    // and the offset holds, so a 503 must still print the ordinary ending.
-    const pending = approvalPending(delivery);
-    if (pending !== null) {
-        approvalPendingBeat(ctx, projectKey, pending.ownersNotified);
-        return tail(ctx, unconfirmed);
+    // A HOLD (A78): an older server's approval 403. The hooks are already installed above, so this is the whole ending:
+    // the generic hold line, exit 0 (`tail`'s), never "Connected" over a refusal.
+    if (isHeldDelivery(delivery)) {
+        holdBeat(ctx);
+        return holdTail(ctx, unconfirmed);
     }
     // The beat, then the URL on its own line, then what-now. Every OTHER outcome
     // of the send is deliberately not branched on: telling a user their install
@@ -535,6 +527,10 @@ unconfirmed) {
     ]);
     return tail(ctx, unconfirmed);
 }
+/** The generic hold line (A78). `warn`, never `bad`; STDOUT, because the exit is 0 and this is the install's outcome. */
+export function holdBeat(ctx) {
+    writeLines(ctx.stdout, ["", ...renderErrorBlock({ kind: "warn", what: CONNECT.holdWhat, why: [CONNECT.holdBuffered] }, ctx.colour)]);
+}
 /**
  * What follows the outcome on EVERY branch of `captureBeat`, in this order: the unconfirmed note, then
  * the PATH-clash check. The one place `pathClash` is called — a branch that called it too would print
@@ -550,6 +546,14 @@ export function tail(ctx, unconfirmed) {
         ]);
     }
     return pathClash(ctx);
+}
+/**
+ * The ending of a legacy HOLD (A78): the same unconfirmed note and the same PATH diagnostic text as `tail`, but the EXIT is 0.
+ * A hold is "later, not failed" and the hooks are installed, so a PATH problem must not turn it into a failure.
+ */
+export function holdTail(ctx, unconfirmed) {
+    tail(ctx, unconfirmed);
+    return EXIT.ok;
 }
 /**
  * Register capture with every agent on this machine and SAY WHAT HAPPENED.
@@ -659,56 +663,6 @@ function commitHookBeat(ctx, projectKey) {
             ? COMMIT_HOOK.chained(repo)
             : COMMIT_HOOK.already;
     writeLines(ctx.stdout, ["", ...wrap(line, 2), ...wrap(COMMIT_HOOK.perClone(connectCommandFor(ctx.env, ctx.selfPath)), 2)]);
-}
-/**
- * Is this delivery the org-approval-pending outcome, and nothing else?
- *
- * ⚠ **BRANCHES ON THE ERROR CODE, NEVER ON THE 403 STATUS**, and that is the
- * whole correctness content of this function. `repository_forbidden` is ALSO a
- * 403 and deliberately carries no `owners_notified` — so a client that keyed on
- * the status would tell a user whose repository simply is not theirs that *their
- * org needs to approve capture*: a false statement about someone else's org, at
- * the moment of highest trust. A test asserting "a 403 prints the pending beat"
- * passes against exactly that defect, which is why the suite drives both codes.
- *
- * Returns the `owners_notified` value on a match. `undefined` — the key absent —
- * is normalised to `null`, because both mean *not determinable* to the copy and
- * neither may assert delivery.
- */
-export function approvalPending(delivery) {
-    if (delivery === null || delivery.kind !== "attempted")
-        return null;
-    if (delivery.detail?.code !== CAPTURE_NOT_APPROVED)
-        return null;
-    return { ownersNotified: delivery.detail.ownersNotified ?? null };
-}
-/**
- * The fifth beat — style guide §10.2, D65 §DR6, D81.
- *
- * ⚠ `warn`, never `bad`. ⚠ **The exit is `captureBeat`'s `tail`'s — `EXIT.ok` unless a PATH clash, never
- * `EXIT.failure` for the 403 and never `EXIT.notConnected`** — the user is correctly installed and capture
- * is armed (the hooks were installed before this beat, so "armed" is true on the npm channel).
- * That 403 means *later*, not *failed*: `policy.ts` classes it `later`, so the
- * offset holds and the backlog uploads in order once an owner approves. A red
- * exit here tells a correctly-installed user they broke something.
- */
-export function approvalPendingBeat(ctx, projectKey, ownersNotified) {
-    // The block itself is `approval_pending.ts`'s, shared with `status`: the shared clause first, the notification second
-    // (it ADDS, it does not replace, D81), and `null` never reaches the notification clause.
-    // ⚠ STDOUT, not stderr, and the rule is consistent in this file: stderr
-    // accompanies a NON-ZERO exit here (`credentialBeat` → 3, `noTranscript` → 1,
-    // `pathClash` → 1, the sign-in failures → 1). This beat exits 0, so it is the
-    // install's OUTCOME rather than a diagnostic — and §10.2 draws it as one
-    // screen, which `2>/dev/null` would otherwise cut in half, leaving "Capture is
-    // armed" with the reason stripped off it.
-    writeLines(ctx.stdout, [
-        "",
-        ...approvalPendingBlock(ctx.colour, resolveRepoSlug(projectKey), ownersNotified),
-        "",
-        ...wrap(CONNECT.pendingArmed(truncatePath(projectKey, 52)), 2),
-    ]);
-    // No `pathClash` here: `captureBeat`'s `tail` runs it once for every branch. It is about the verbs a
-    // human types and orthogonal to whether capture is approved, and it can still exit 1.
 }
 /**
  * Does the `vibecommit` a user types belong to us? — `DESIGN.md` §13.6's worked

@@ -257,7 +257,18 @@ export function nextSpan(state, eof) {
  * without waiting a day, and the same property now covers the `last sent` row.
  */
 export function markDelivered(state, to, nowMs) {
-    return { ...state, sentOffset: to, backlog: [], lastSentAt: nowMs };
+    // A78: only the ACKNOWLEDGED bytes leave the backlog. A prefix that was acked (a 413 split's first half, a chunk of a long span) must
+    // not clear a held suffix, least of all a pinned one: trim each entry to what lies beyond `to` and keep its `at` and its pin.
+    // M2 (rv-capstep): the age cap measures how long the server has been UNREACHABLE for a held span. A partial ack proves it is reachable now, so every surviving
+    // NON-pinned entry's clock restarts at this success (a later failure then counts its 24 h from the NEXT failure, not from one that was long since answered).
+    // A pinned entry (a legacy 403, never shed) keeps its `at` and its pin.
+    const backlog = state.backlog
+        .filter((e) => e.to > to)
+        .map((e) => {
+        const trimmed = e.from < to ? { ...e, from: to } : e;
+        return trimmed.pinned === true ? trimmed : { ...trimmed, at: nowMs };
+    });
+    return { ...state, sentOffset: to, backlog, lastSentAt: nowMs };
 }
 /**
  * `never` — advance PAST the attempted span exactly once, stamping a gap.
@@ -291,7 +302,9 @@ export function markSkipped(state, from, to) {
  * than minting a second entry with a newer timestamp, which would keep resetting
  * the age cap and make it unreachable.
  */
-export function markHeld(state, span, nowMs, caps) {
+export function markHeld(state, span, nowMs, caps, 
+/** A78: the refusal was the legacy approval 403. Every held span is pinned: no cap sheds it. */
+pinned = false) {
     const base = state.sentOffset === span.from
         ? state
         : // The offset moved under us (a resync). Start the backlog over from here.
@@ -301,7 +314,12 @@ export function markHeld(state, span, nowMs, caps) {
     const backlog = span.to > heldTo
         ? [...base.backlog, { from: heldTo, to: span.to, at: nowMs }]
         : base.backlog;
-    return enforceCaps({ ...base, backlog }, nowMs, caps);
+    // A78: a pinned hold is ONE entry (first held offset .. last held byte, the first failure's `at`), however many times the span grew:
+    // the metadata stays bounded, nothing is shed, the offset is untouched.
+    const marked = pinned && backlog.length > 0
+        ? [{ from: backlog[0].from, to: backlog[backlog.length - 1].to, at: backlog[0].at, pinned: true }]
+        : backlog;
+    return enforceCaps({ ...base, backlog: marked }, nowMs, caps);
 }
 /**
  * Shed the oldest spans until every cap holds.
@@ -317,6 +335,15 @@ export function enforceCaps(state, nowMs, caps) {
     let gapCount = state.gapCount;
     while (backlog.length > 0) {
         const oldest = backlog[0];
+        if (oldest.pinned === true) {
+            // A78: a legacy-403 hold is never shed, whatever the age or byte cap. Its METADATA is still bounded: over the entry cap the two
+            // oldest entries merge (same bytes, same first offset, still pinned) instead of one being dropped.
+            if (backlog.length > caps.entries && backlog.length > 1) {
+                backlog = [{ from: oldest.from, to: backlog[1].to, at: oldest.at, pinned: true }, ...backlog.slice(2)];
+                continue;
+            }
+            break;
+        }
         const overBytes = backlog[backlog.length - 1].to - backlog[0].from > caps.bytes;
         const overAge = nowMs - oldest.at > caps.ageMs;
         const overEntries = backlog.length > caps.entries;

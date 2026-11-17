@@ -21,7 +21,7 @@
  *
  *   - The LEADING boundary is what makes `proves` registerable at all. Under a
  *     bare substring rule it fires on the shipped, D81-approved disclosure
- *     "...once an owner approves." (`strings.ts` `CONNECT.pendingBuffered`) —
+ *     "...once an owner approves." (the retired org-approval beat's copy, removed by T20) —
  *     measured, not argued: adding the row to a `.includes()` matcher turns
  *     `copy-claims.test.ts`'s "no shipped copy contains a phrase blocked on its
  *     surface" RED against correct copy. A boundary kills that by construction;

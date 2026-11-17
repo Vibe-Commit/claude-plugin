@@ -27,7 +27,6 @@ import { noteGrantEpoch, recordRefused } from "./consent.js";
 import { headerSafe, sessionIdSafe } from "./header_safety.js";
 import { recordInferredSkipped } from "./inferred_tally.js";
 import { COMMIT_FILES_HEADER, planTrailer } from "./commit_files.js";
-import { clearOrgPending, markOrgPending } from "./org_pending.js";
 import { MAX_DELTA_FRAME_BYTES, MAX_DELTA_RAW_BYTES, REPOSITORY_EXCLUDED, classify, markDelivered, markHeld, markSkipped, nextSpan, planChunk, resolveCaps, splitPoint, } from "./policy.js";
 import { fileState, isStopped, loadSessionState, saveSessionState, withFileState, } from "./state.js";
 import { INFERRED_SET_ASIDE_AFTER, dropInferredGroups, dropRewrites, settleSpooledLines, dropSpooled, isFullSha, recordInferredAttempt, setAsideInferredGroup, settleSpooled, } from "./spool.js";
@@ -313,16 +312,17 @@ function headersConstructible(headers) {
     }
 }
 /**
- * The wire's error code for org-approval-pending — `CR-128`, D81.
+ * The wire code an OLDER server answers with a 403 when admin approval is still required (approval is retired, spec §5.3/A78: the
+ * current server never sends it). It stays a HOLD: the offset holds and the bytes stay on disk, so a client paired with an older
+ * server loses nothing. No copy is attached to it; the hold line is the generic one.
  *
- * ⚠ A CROSS-REPO CONTRACT, not a local string. The server emits it as
- * `403 { error: "capture_not_approved", owners_notified }` and pins the body
- * shape in its own suite. **`repository_forbidden` is ALSO a 403** and carries
- * no `owners_notified` at all — deliberately, because it is a different
- * condition where no owner was or could have been notified. That is why every
- * consumer here branches on THIS CODE and never on the status.
+ * Consumers branch on THIS CODE and never on the status: `repository_forbidden` is ALSO a 403 and is a different condition.
  */
 export const CAPTURE_NOT_APPROVED = "capture_not_approved";
+/** Is this delivery an older server's `capture_not_approved` 403 (a HOLD, A78), and nothing else? Branches on the code, never on the 403 status. */
+export function isHeldDelivery(delivery) {
+    return delivery !== null && delivery.kind === "attempted" && delivery.detail?.code === CAPTURE_NOT_APPROVED;
+}
 /**
  * An error body is a handful of bytes by contract. Anything larger is not one
  * this client parses — a cap so a misconfigured or hostile endpoint cannot make
@@ -354,14 +354,10 @@ async function readErrorDetail(res, signal) {
     const body = await readCappedJson(res, signal);
     if (body === null || body === undefined || typeof body !== "object" || Array.isArray(body))
         return null;
-    const { error, owners_notified: owners } = body;
+    const { error } = body;
     if (typeof error !== "string" || error === "")
         return null;
-    // The key is absent (`undefined`) on bodies that do not carry it, `null` when
-    // it is present and not determinable. Both are preserved; neither is coerced
-    // into a number, because a count invented here is a claim invented here.
-    const ownersNotified = owners === null ? null : typeof owners === "number" && Number.isFinite(owners) ? owners : undefined;
-    return { code: error, ownersNotified };
+    return { code: error };
 }
 /**
  * ⛔ THE ONE CAPPED, TIMED BODY READER — `readErrorDetail` (non-2xx), `readConversationId` (`connect`'s opt-in
@@ -1115,7 +1111,11 @@ async function deliverChunk(ctx, eof, readBody, cutter) {
             }
             break;
         case "later":
-            next = withFileState(next, ctx.fileKey, { ...markHeld(current, span, ctx.nowMs, caps), lean });
+            // A78: an older server's approval 403 is a HOLD that is never shed, whatever the age or size cap ("Nothing is lost").
+            next = withFileState(next, ctx.fileKey, {
+                ...markHeld(current, span, ctx.nowMs, caps, outcome.kind === "response" && outcome.detail?.code === CAPTURE_NOT_APPROVED),
+                lean,
+            });
             break;
         case "never":
             next = withFileState(next, ctx.fileKey, { ...markSkipped(current, span.from, span.to), lean });
@@ -1138,15 +1138,7 @@ async function deliverChunk(ctx, eof, readBody, cutter) {
     // a body. A write only on a change, `grants-account.json` only (never `grants.json`), and `noteGrantEpoch` cannot throw.
     if (outcome.kind === "response")
         noteGrantEpoch(ctx.home, outcome.grantEpoch);
-    // 0.7.0: remember, for `status`, that THIS repo's upload was refused because its org has not approved capture — and
-    // forget it on the next delivery. Only that one error code sets it; a 5xx or a timeout neither sets nor clears it.
-    if (disposition === "ok")
-        clearOrgPending(ctx.home, ctx.repoSlug);
-    else if (disposition === "later" && outcome.kind === "response" && outcome.detail?.code === CAPTURE_NOT_APPROVED) {
-        // The slug is the CLIENT's (`ctx.repoSlug`), never the response body's: the 403 names nobody.
-        markOrgPending(ctx.home, ctx.nowMs, outcome.detail.ownersNotified ?? null, ctx.repoSlug);
-    }
-    else if (disposition === "never" && outcome.kind === "response" && outcome.detail?.code === REPOSITORY_EXCLUDED) {
+    if (disposition === "never" && outcome.kind === "response" && outcome.detail?.code === REPOSITORY_EXCLUDED) {
         // Slice 2: the account turned this repo off. Remember it in `grants-account.json` — NEVER `grants.json`, which a hook does not
         // write (`consent.ts`) — so the next hook's gate stops before it reads this repo's transcript. Same rule as above: the slug is
         // the client's. `recordRefused` cannot throw.
@@ -1220,7 +1212,7 @@ function withinBudget(ctx) {
  *     `vibecommit finalize`; `Delivery.more` says it stopped early. `finalize` and `connect` set no deadline and run on.
  *   - **It stops at the first delta that is not `ok`** and returns that delta's outcome: `later` and `fatal` hold exactly
  *     the bytes that failed, so a resume starts at the next unacknowledged delta, with no resend and no gap. A
- *     `capture_not_approved` 403 on any delta is such a stop, so its pending beat is printed once.
+ *     `capture_not_approved` 403 (an older server's) on any delta is such a stop.
  *   - **A skipped oversize record does not stop it.** The records after it still go out.
  *   - **`connect`'s conversation id survives a partial run** (DX D8): it is read from the first 2xx that carries it, no later
  *     delta reads a body, and it is returned even when a later delta came back `later`.
