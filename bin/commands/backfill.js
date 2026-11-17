@@ -489,9 +489,10 @@ function classify(outcome) {
             if (delivery.disposition === "fatal")
                 return { kind: "rejected" };
             if (delivery.disposition === "later") {
-                // A 403 is `later` by status (`policy.ts`), so the two refusals that share it are told apart by their CODE:
-                // an org that has not approved capture HOLDS the repo; a repo another org owns FAILS the session with its reason
-                // (`resolve_repository`'s ownership oracle) — neither is "the server is busy", which is what stops a run.
+                // A 403 is `later` by status (`policy.ts`), so the two refusals that share it are told apart by their CODE: an older
+                // server's `capture_not_approved` (approval is retired, A78, but nothing is dropped) HOLDS the repo with the generic hold
+                // line; a repo another org owns FAILS the session with its reason (`resolve_repository`'s ownership oracle). Neither is
+                // "the server is busy", which is what stops a run.
                 if (delivery.detail?.code === CAPTURE_NOT_APPROVED)
                     return { kind: "held" };
                 if (delivery.detail?.code === "repository_forbidden") {
@@ -695,9 +696,9 @@ async function uploadParent(run, candidate) {
                 continue;
             }
             const result = classify(outcome);
-            results.push(result.kind === "held" ? { kind: "held", slug: target.slug } : result);
+            results.push(result);
         }
-        // One answer for the session: a stop of the run wins, then a hold, then a failure; else it uploaded if anything did.
+        // One answer for the session: a stop of the run wins, then a failure; else it uploaded if anything did.
         return (results.find((r) => r.kind === "rejected") ??
             results.find((r) => r.kind === "stopped") ??
             results.find((r) => r.kind === "held") ??
@@ -744,14 +745,6 @@ function tallyLine(tally) {
     return parts.join(" · ");
 }
 const sumOf = (map) => [...map.values()].reduce((n, v) => n + v, 0);
-/** "an acme-corp owner", "an owner of acme-corp or other-org". */
-function ownersPhrase(slugs) {
-    const owners = [...new Set(slugs.map((slug) => slug.split("/")[0]))].sort();
-    if (owners.length === 1)
-        return `${/^[aeiou]/i.test(owners[0]) ? "an" : "a"} ${owners[0]} owner`;
-    const head = owners.slice(0, -1).join(", ");
-    return `an owner of ${head} or ${owners[owners.length - 1]}`;
-}
 /** Ctrl+C for the run: the injected signal, or a real SIGINT listener that is removed on the way out. */
 function interruption(deps) {
     if (deps.signal !== undefined)
@@ -863,7 +856,7 @@ async function upload(ctx, plan, connection, deps, signal) {
     const names = [...plan.repos.map((repo) => repo.slug), ...(parent.length > 0 ? [BACKFILL.parentLabel] : [])];
     const column = ROW_INDENT + Math.min(SLUG_MAX, Math.max(...names.map((name) => name.length))) + COLUMN_GAP;
     const nameLine = (name, text) => `${" ".repeat(ROW_INDENT)}${truncateMiddle(name, column - ROW_INDENT - COLUMN_GAP).padEnd(column - ROW_INDENT)}${text}`;
-    /** A repo's sessions, then the parent-folder group. A repo whose owner has not approved capture is held whole; the parent group is not (its targets differ per session). */
+    /** A repo's sessions, then the parent-folder group. */
     const groups = [
         ...plan.repos.map((repo) => ({ name: repo.slug, slug: repo.slug, items: repo.candidates })),
         ...(parent.length > 0 ? [{ name: BACKFILL.parentLabel, slug: null, items: parent }] : []),
@@ -873,7 +866,6 @@ async function upload(ctx, plan, connection, deps, signal) {
     let skipped = 0;
     let held = 0;
     let failed = 0;
-    const heldRepos = [];
     for (const group of groups) {
         const tally = newTally();
         let slowShown = false;
@@ -887,7 +879,7 @@ async function upload(ctx, plan, connection, deps, signal) {
             for (const candidate of group.items) {
                 if (signal.aborted)
                     break;
-                // A repo whose owner has not approved capture is held whole: the rest of it is not even tried.
+                // A repo held by the server is held whole: the rest of it is not even tried. The parent-folder group is not (its targets differ).
                 const result = heldRepo && group.slug !== null
                     ? { kind: "held" }
                     : "clone" in candidate
@@ -903,8 +895,6 @@ async function upload(ctx, plan, connection, deps, signal) {
                     tally.held += 1;
                     if (group.slug !== null)
                         heldRepo = true;
-                    else if (result.slug !== undefined)
-                        heldRepos.push(result.slug);
                 }
                 else {
                     // `stopped` (the server asked to try later, or could not be reached) and `rejected` (the credential was refused)
@@ -927,10 +917,8 @@ async function upload(ctx, plan, connection, deps, signal) {
         }
         uploaded += tally.uploaded;
         skipped += sumOf(tally.skipped);
-        failed += sumOf(tally.failed);
         held += tally.held;
-        if (tally.held > 0 && group.slug !== null)
-            heldRepos.push(group.slug);
+        failed += sumOf(tally.failed);
         const role = tally.held > 0 || tally.stopped ? "warn" : "text";
         const line = paint(ctx.colour, role, nameLine(group.name, tallyLine(tally)));
         // Overwrite the `…` line in place on a terminal; elsewhere it stays and the result prints beneath it.
@@ -944,9 +932,8 @@ async function upload(ctx, plan, connection, deps, signal) {
     writeLines(ctx.stdout, ["", `  ${paint(ctx.colour, kind, glyph(ctx.colour, kind))} ${summary}`]);
     if (held > 0) {
         writeLines(ctx.stdout, [
-            ...wrap(BACKFILL.heldBlock(ownersPhrase(heldRepos)), 4).map((l) => paint(ctx.colour, "muted", l)),
-            `      ${paint(ctx.colour, "accent", URLS.captureAccess)}`,
-            `    ${BACKFILL.heldThenRun} ${paint(ctx.colour, "accent", channelCommand(ctx.env, ctx.selfPath, COMMANDS.backfill))}`,
+            ...wrap(BACKFILL.holdNote, 4).map((l) => paint(ctx.colour, "muted", l)),
+            `      ${paint(ctx.colour, "accent", channelCommand(ctx.env, ctx.selfPath, COMMANDS.backfill))}`,
         ]);
     }
     return { exit: EXIT.ok, end: "uploaded", uploaded };
@@ -1018,7 +1005,7 @@ folders = [], deps = {}) {
 // The verb
 // ---------------------------------------------------------------------------
 /**
- * `vibecommit backfill`. Exit `0` done (held sessions included: org-pending is 0, as in §10.2), `1` stopped with the resume
+ * `vibecommit backfill`. Exit `0` done (held sessions included), `1` stopped with the resume
  * fix, `2` no terminal, `3` not connected, `4` nothing to upload. It ends on the dashboard URL after a completed run or a
  * no, and on its resume fix after a stop.
  */

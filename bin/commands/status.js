@@ -27,13 +27,14 @@
 import { AGENT_HOOKS, COMMANDS, FINALIZE, HELP, OFF, STATUS, URLS, relativeAge } from "../copy/index.js";
 import { renderVerbHelp } from "../verb_help.js";
 import { authCommandFor, channelCommand } from "../install.js";
-import { credentialFingerprint } from "../post.js";
+import { credentialFingerprint, ingestUrl } from "../post.js";
 import { GrantsUnreadableError, excludeSlug, grantsUnreadable, isCaptureAllowed, isLocalSlug, normalizeSlug, ownerOfSlug, readAccountState, readAllowList, readGrants, revokeProject, } from "../consent.js";
 import { queueGrantOps } from "../grants_sync.js";
+import { fetchCaptureRoute } from "../capture_route.js";
 import { endDateText, endingSoon, metaFor } from "../credential_meta.js";
 import { loadCredential, savedCredentialExists } from "../credential.js";
 import { EXIT } from "../exit.js";
-import { onceRepoSlug, remoteSlugOfCommonDir, resolveRepoSlug } from "../git.js";
+import { onceRepoSlug, remoteSlugOfCommonDir, resolveRepoSlug, strictRepoSlug } from "../git.js";
 import { emitJson } from "../json.js";
 import { DROP_REASONS, readDropped } from "../dropped_tally.js";
 import { readInferredSkipped } from "../inferred_tally.js";
@@ -45,8 +46,6 @@ import { LABEL_GUTTER, WRAP_COLUMNS, glyph, labelled, paint, renderErrorBlock, t
 import { credentialProblem, credentialProblemBlock, rejectedCredentialBlock } from "./credential_problem.js";
 import { captureBasis } from "../machine_state.js";
 import { accountRowsFor, machineStatus } from "./status_machine.js";
-import { approvalPendingBlock } from "./approval_pending.js";
-import { readOrgPending } from "../org_pending.js";
 import { writeFailure, writeLines } from "./context.js";
 import { stoppedSyncReason } from "./sync_reason.js";
 import { hookStateLines } from "./status_hooks.js";
@@ -62,9 +61,43 @@ export async function statusVerb(ctx, argv, deps) {
     if (argv.includes("--help") || argv.includes("-h"))
         return status(ctx, argv);
     const sync = await syncForVerb(ctx, argv.includes("--json"), deps);
-    return status(ctx, argv, sync);
+    // T51b (A74): where this repository's captures go, from the server's shared predicate. Prose only: `--json` stays as it was.
+    const route = argv.includes("--json") ? null : await routeForStatus(ctx, deps);
+    return status(ctx, argv, sync, route);
 }
-export function status(ctx, argv = [], sync = { kind: "skipped" }) {
+/**
+ * One bounded read of `GET /ingest/v1/capture/route` for the repo `status` is run in. `null` (no line at all) when there is nothing
+ * to ask: not in a work tree, capture off here (a switch that is Off prints no destination line, §4.6), no usable credential or
+ * ingest address. Never throws.
+ */
+async function routeForStatus(ctx, deps) {
+    try {
+        const keys = resolveProjectKeys(ctx.cwd);
+        if (keys === null)
+            return null;
+        if (!isCaptureAllowed(ctx.home, keys, onceRepoSlug(keys.worktree)))
+            return null;
+        const load = loadCredential({ env: ctx.env, home: ctx.home });
+        if (load.kind !== "ok")
+            return null;
+        const url = ingestUrl(ctx.env);
+        if (url === null)
+            return null;
+        // L9 (rv-capstep): the STRICT slug. `resolveRepoSlug` answers a guess when git fails (a timeout, a missing binary), and a guessed slug reaches the server as
+        // `not_github`, a destination sentence about the wrong repository. A lookup that could not be made is "couldn't check", never a guessed reason.
+        const slug = strictRepoSlug(keys.worktree);
+        if (slug === null)
+            return { kind: "unavailable" };
+        return await fetchCaptureRoute(url, load.credential, slug, {
+            fetch: deps.fetch,
+            timeoutMs: deps.timeoutMs,
+        });
+    }
+    catch {
+        return { kind: "unavailable" };
+    }
+}
+export function status(ctx, argv = [], sync = { kind: "skipped" }, route = null) {
     // `TODOS[184]`. Check-first, before any git/credential/consent resolution — same ordering principle
     // every other verb's `--help` check uses. Reads and writes nothing.
     if (argv.includes("--help") || argv.includes("-h")) {
@@ -151,11 +184,7 @@ export function status(ctx, argv = [], sync = { kind: "skipped" }) {
     // from what the hook last heard (`X-Credential-Expires`), so it is as fresh as the last capture.
     const endsAt = fingerprint === null ? null : endingSoon(metaFor(ctx.home, fingerprint), ctx.now().getTime());
     const endsText = endsAt === null ? null : endDateText(endsAt);
-    // 0.7.0: this repo's own last upload was refused because its org has not approved capture (a hook's `later`, remembered
-    // by `org_pending.ts`). Raised only for a repo that is on, and cleared by the next delivery.
-    const orgPending = on ? readOrgPending(ctx.home, resolveRepoSlug(projectKey)) : null;
     const kind = on &&
-        orgPending === null &&
         stopped === null &&
         endsText === null &&
         writtenOff.gaps === 0 &&
@@ -177,6 +206,11 @@ export function status(ctx, argv = [], sync = { kind: "skipped" }) {
                 ? [labelled(ROW_INDENT, STATUS.basisLabel, STATUS.basisAccountOnly)]
                 : []),
     ];
+    // T51b: the destination sentence, only for a repo that is on (an Off switch prints none). A 401 says nothing here: the credential's
+    // own screen owns it. Anything else that did not answer says so, and never guesses a reason.
+    if (on && route !== null && route.kind !== "unauthorized") {
+        lines.push(...wrap(route.kind === "ok" ? STATUS.routeLine(route.reason, route.orgName, route.ownerName) : STATUS.routeUnavailable, ROW_INDENT));
+    }
     // Question 2: the last successful send FOR THIS REPO. `status` has no
     // session_id — it is interactive — so this is a scan of the repo's session
     // files rather than a lookup (`lastSendForRepo`).
@@ -216,9 +250,8 @@ export function status(ctx, argv = [], sync = { kind: "skipped" }) {
             // Slice 2 (S4): `"account_not_here"` when the repo is not on but the account grants it (the machine document's
             // `account_not_here` key, spelled the same). A new value of an existing key: a contract change for the 0.8.0 release list.
             basis: on ? basisKind(ctx, projectKey) : accountOnly ? "account_not_here" : null,
-            // 0.7.0: `{ at_ms }` when this repo's last upload was refused because its org has not approved capture, else `null`.
-            // A contract change, recorded in `json-read-verbs.test.ts`.
-            org_pending: orgPending === null ? null : { at_ms: orgPending.at },
+            // Admin approval is retired (spec §5.3, A78): always `null`. The key stays so a reader of the 0.7.0+ document keeps its shape.
+            org_pending: null,
             last_send: lastSend === null ? null : { at_ms: lastSend.at, seq: lastSend.seq },
             // U7 (plan §3.8). Always an object; `sessions_checked` is the denominator, so an empty scan cannot read as clean. ⛔ A contract change,
             // recorded in `json-read-verbs.test.ts`.
@@ -362,10 +395,6 @@ export function status(ctx, argv = [], sync = { kind: "skipped" }) {
     }
     // 0.7.0, `SessionStart`: a missing registration (npm channel only), commit hooks that are off, or `core.hooksPath`.
     lines.push(...hookStateLines(ctx, projectKey, on));
-    // §10.2's held beat, with its existing copy, for the repo whose own upload got the 403. Not a new sentence.
-    if (orgPending !== null) {
-        lines.push("", ...approvalPendingBlock(ctx.colour, resolveRepoSlug(projectKey), orgPending.ownersNotified));
-    }
     // Codex runs no user-level hook until the user trusts it. Said, never detected (VQ + Alexander, 2026-10-24).
     if (on)
         lines.push("", ...wrap(AGENT_HOOKS.codexTrust, 2));

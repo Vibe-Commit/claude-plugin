@@ -22,8 +22,7 @@ import { credentialProblemBlock } from "./credential_problem.js";
 import { authCommandFor, channelCommand } from "../install.js";
 import { loadCredential } from "../credential.js";
 import { machineCapture, machineSummary, refusedFoldersNow, undecidedNow } from "../machine_state.js";
-import { isLocalSlug, normalizeSlug, ownerOfSlug } from "../consent.js";
-import { listOrgPending } from "../org_pending.js";
+import { normalizeSlug } from "../consent.js";
 import { lastSendOnMachine } from "../state.js";
 import { uploaderJson, uploaderRows, uploaderView } from "../uploader_view.js";
 import { LABEL_GUTTER, WRAP_COLUMNS, glyph, labelled, paint, tildePath, truncatePath, wrap } from "../term.js";
@@ -119,35 +118,12 @@ export function accountRowsFor(ctx, sync) {
     const view = readAccountView(ctx.home, capture.kind === "on" ? capture.perClone.flatMap((c) => (c.slug === null ? [] : [normalizeSlug(c.slug)])) : [], sync);
     return view === null ? [] : accountRows(ctx, view);
 }
-/**
- * The repos waiting on an organization's approval: every standing marker in `org_pending.ts`'s slug directory (written when
- * THAT repo's own upload got `403 capture_not_approved`, cleared by a 2xx from ANY clone of it), reduced by VT's conditions.
- * (i) Only a slug still ON under the current grants and exclusions — a repo turned off, or no longer granted, is not "waiting".
- * (ii) Deduped by slug (one file per slug already; kept defensively). (iii) A marker with no slug is skipped, never an unnamed
- * row. A `local:` slug names a path and cannot belong to an organization.
- */
-function waitingRepos(ctx, capture) {
-    const { grants } = capture;
-    const perClone = new Set(capture.perClone.flatMap((c) => (c.slug === null ? [] : [normalizeSlug(c.slug)])));
-    const waiting = new Set();
-    for (const marker of listOrgPending(ctx.home)) {
-        if (marker.slug === null)
-            continue;
-        const slug = normalizeSlug(marker.slug);
-        if (isLocalSlug(slug) || grants.excluded.includes(slug))
-            continue;
-        if (grants.owners.includes(ownerOfSlug(slug)) || grants.repos.includes(slug) || perClone.has(slug))
-            waiting.add(slug);
-    }
-    return [...waiting].sort();
-}
 export function machineStatus(ctx, argv, sync = { kind: "skipped" }) {
     const capture = machineCapture(ctx.home);
     // Slice 2 (S4). `null` when `grants.json` is unreadable: the pending queue is unknowable, so no account rows.
     const view = capture.kind === "unreadable"
         ? null
         : readAccountView(ctx.home, capture.kind === "on" ? capture.perClone.flatMap((c) => (c.slug === null ? [] : [normalizeSlug(c.slug)])) : [], sync);
-    const waiting = capture.kind === "on" ? waitingRepos(ctx, capture) : [];
     const undecidedJson = argv.includes("--json") ? undecidedNow(ctx.home, ctx.now().getTime() - UNDECIDED_WINDOW_MS) : [];
     const refusedJson = argv.includes("--json") ? refusedFoldersNow(ctx.home, ctx.now().getTime() - UNDECIDED_WINDOW_MS) : [];
     const load = loadCredential({ env: ctx.env, home: ctx.home });
@@ -172,9 +148,8 @@ export function machineStatus(ctx, argv, sync = { kind: "skipped" }) {
             ...(undecidedJson.length > 0 ? { undecided: undecidedJson } : {}),
             // C3: a granted folder the server refused (another member's machine uploaded that path first). Same rule: only when non-empty.
             ...(refusedJson.length > 0 ? { refused_folders: refusedJson.map((row) => ({ folder: row.folder, at_ms: row.at })) } : {}),
-            // 0.7.0: the slugs whose own last upload was refused because their org has not approved capture (still on, deduped,
-            // named). A machine key for the release paragraph; it does not change the exit code.
-            org_pending: waiting,
+            // Admin approval is retired (spec §5.3, A78): always `[]`. The key stays so a reader of the 0.7.0+ document keeps its shape.
+            org_pending: [],
             grants_unreadable: capture.kind === "unreadable",
             // U7 (plan §3.8): the background uploader. ⛔ A contract change, recorded in `json-read-verbs.test.ts`.
             uploader: uploaderJson(upload),
@@ -218,10 +193,6 @@ export function machineStatus(ctx, argv, sync = { kind: "skipped" }) {
         lines.push(...undecidedRows(ctx));
         if (view !== null)
             lines.push(...accountRows(ctx, view));
-        // §10.2's held vocabulary: the beat word and "the org must approve capture". One row, naming the repos; never an unnamed one.
-        if (waiting.length > 0) {
-            lines.push(...rows(STATUS.heldLabel, waiting), `${" ".repeat(ROW_INDENT + LABEL_GUTTER)}${STATUS.heldReason}`);
-        }
     }
     // A machine that names nothing still shows what its account grants and what is queued, right under the heading.
     if (capture.kind === "none")

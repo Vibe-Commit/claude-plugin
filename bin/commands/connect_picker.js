@@ -21,12 +21,11 @@ import { channelCommand, connectCommandFor, installCaptureHooks } from "../insta
 import { machineCapture, machineSummary, readPerClone } from "../machine_state.js";
 import { buildModel, folderCaptureAgents, grantQuestion, hasAdditions, isNoChange, NO_CHANGE, notUnderstoodLines, parseTyped, preChange, renderGrantBlock, renderTyped, } from "../picker.js";
 import { runChecklist } from "../picker_checklist.js";
-import { credentialFingerprint } from "../post.js";
-import { metaFor } from "../credential_meta.js";
+import { isHeldDelivery } from "../post.js";
 import { paint, renderErrorBlock, tildePath, truncatePath, wrap } from "../term.js";
 import { signInBeat } from "./browser_credential.js";
 import { accountChange, accountNoteLines, changeOps, commitG, joiningMachine, lastAccountState, mintForG, settleG, splitAccountExclusions, } from "./connect_account.js";
-import { agentHookBeat, approvalPending, approvalPendingBeat, askOrCancel, cancelled, disclosure, grantsUnreadableBlock, obtainCredential, sendTestCapture, tail, } from "./connect.js";
+import { agentHookBeat, askOrCancel, cancelled, disclosure, grantsUnreadableBlock, holdBeat, holdTail, obtainCredential, sendTestCapture, tail, } from "./connect.js";
 import { writeLines } from "./context.js";
 import { pickerNotListedLines, sawNoSession, scanMachine } from "./scan.js";
 /**
@@ -266,11 +265,9 @@ async function connectPickerRun(ctx, options, deps, here, keys, g) {
     ];
     commitHooksStep(ctx, clones);
     agentHookBeat(ctx);
-    // ⛔ IN A REPO, THE TEST CAPTURE RUNS BEFORE "Capture is on", AND ITS OUTCOME PICKS THE ENDING (VQ item 7, adopting VT).
-    // 0.6.0's payoff was evidence — this session, recorded, with a link — and "Capture is on" printed ahead of a result that
-    // can contradict it (an org that has not approved capture) would say the opposite of what happens next. So: hooks
-    // (L11), then the probe inside ONE hook budget (the same call the `local:` path makes), then either the held beat or
-    // "Capture is on" with the session link as the one URL line. From `~` there is no session to probe and nothing changes.
+    // ⛔ IN A REPO, THE TEST CAPTURE RUNS BEFORE "Capture is on" (VQ item 7, adopting VT). 0.6.0's payoff was evidence — this
+    // session, recorded, with a link. So: hooks (L11), then the probe inside ONE hook budget (the same call the `local:` path
+    // makes), then "Capture is on" with the session link as the one URL line. From `~` there is no session to probe and nothing changes.
     let probe = null;
     if (keys !== null && here !== null && here.kind === "repo" && on(normalizeSlug(here.slug))) {
         const { hasLocator, found } = locateTranscript(ctx, keys.worktree);
@@ -278,23 +275,19 @@ async function connectPickerRun(ctx, options, deps, here, keys, g) {
             ? { delivery: null }
             : await sendTestCapture(ctx, keys, got.credential, found);
         probe = { hasLocator, found, delivery };
-        const pending = approvalPending(delivery);
-        if (pending !== null) {
-            // `capture_not_approved` for THIS repo (CR-110, D81): armed, waiting on an owner. Never "Capture is on" over it, and no
-            // offer to upload more into a refusal. `deliver` has recorded it, so `status` says the same.
-            approvalPendingBeat(ctx, keys.worktree, pending.ownersNotified);
-            return tail(ctx, got.unconfirmed);
+        if (isHeldDelivery(delivery)) {
+            // A HOLD (A78): an older server's approval 403 for THIS repo. The generic hold line, never "Capture is on" over it and
+            // no offer to upload more into it; the hooks were installed above, and the exit is `tail`'s (0).
+            holdBeat(ctx);
+            return holdTail(ctx, got.unconfirmed);
         }
     }
     // D18 · D19: "Capture is on" before the optional upload, so it is on screen within seconds of the sign-in.
-    // The block cannot know whether an organization has approved capture for a repo it did not probe: it says one may need to,
-    // when a granted owner is not the person's own account. In a repo the owner the test capture CHECKED is left out.
-    const checkedOwner = probe !== null && here !== null && answeredWith2xx(probe.delivery) ? ownerOfSlug(normalizeSlug(here.slug)) : null;
     // A run that granted only folders, on a machine with no repository on, has no repository block to print: "Capture is on for 0
     // repos, no clone of it is here yet" would be false. The folder lines below are its whole answer.
     const foldersOnly = (change.addFolders ?? []).length > 0 && change.addOwners.length + change.addRepos.length + change.turnOn.length === 0;
     if (!(foldersOnly && machineCapture(ctx.home).kind !== "on")) {
-        captureOnBlock(ctx, model, change, clones.length === 0, otherOwnersCaveat(ctx, got.credential, checkedOwner), joined, accountNoteLines(ctx, accountSync));
+        captureOnBlock(ctx, model, change, clones.length === 0, joined, accountNoteLines(ctx, accountSync));
     }
     // Folders granted in this run, said once, after the block that names the repos (R7: the claim is who can read them).
     const grantedNow = change.addFolders ?? [];
@@ -318,36 +311,6 @@ async function connectPickerRun(ctx, options, deps, here, keys, g) {
 function locateTranscript(ctx, projectKey) {
     const locate = dialectFor(ctx.agentId).locateCurrentTranscript;
     return { hasLocator: locate !== undefined, found: locate === undefined ? null : locate(ctx.home, ctx.env, projectKey) };
-}
-/** Did the server answer any delta of the test capture with a 2xx? (`ok`, or a `later` that carries delta 1's session id.) */
-function answeredWith2xx(delivery) {
-    return delivery?.kind === "attempted" && (delivery.disposition === "ok" || delivery.conversationId !== undefined);
-}
-/**
- * Does any granted owner differ from the signed-in person's own GitHub handle? (Alexander, 2026-10-24: "Caveat for other
- * owners".) Compared case-insensitively over the owners granted whole AND the owners of repos granted one by one; an `account`
- * the server did not give (`null`) cannot be shown to match, so it counts as differing. Nothing granted, nothing to caveat.
- * `account` is whatever the whoami probe or the mint recorded for this credential, so it is known by the time the block prints.
- *
- * ⛔ **IN A REPO, THE CHECKED OWNER DOES NOT COUNT** (Alexander, 17:20). "Checked" means the server answered ANY delta of the
- * test capture with a 2xx — the delivery is `ok`, or it carries a `conversationId` (after PR 4a a big session can get a 2xx on
- * delta 1 and a timeout on delta 2, which combines to `later` with delta 1's id; a 2xx proves the org approved). Every other
- * outcome — no transcript, a `later`, a network loss — leaves this repo's owner unchecked, and it counts like any other.
- */
-function otherOwnersCaveat(ctx, credential, checkedOwner) {
-    const on = machineCapture(ctx.home);
-    if (on.kind !== "on")
-        return false;
-    // The owner of the repo the test capture just checked is not "another owner": the server answered for it (see `checkedOwner`).
-    const skip = checkedOwner === null ? null : checkedOwner.toLowerCase();
-    const owners = [...on.grants.owners, ...on.grants.repos.map(ownerOfSlug)].filter((o) => o !== "" && o.toLowerCase() !== skip);
-    if (owners.length === 0)
-        return false;
-    const account = metaFor(ctx.home, credentialFingerprint(credential))?.account ?? null;
-    if (account === null)
-        return true;
-    const own = account.toLowerCase();
-    return owners.some((owner) => owner.toLowerCase() !== own);
 }
 /**
  * The one URL line after "Capture is on". From `~` (no probe) it is the dashboard, as after a no. In a repo it is the
@@ -549,8 +512,6 @@ function commitHooksStep(ctx, clones) {
  * 0.6.0 in-repo screen only.
  */
 function captureOnBlock(ctx, model, change, noClones, 
-/** The "other owners" caveat, for owners the test capture did not check: see `otherOwnersCaveat`. */
-caveat, 
 /** What the joining-machine question (screen 2) named here, for the new-laptop line. */
 joined = [], 
 /** Muted lines under the block when the sync after the writes did not tell the account (`accountNoteLines`). */
@@ -570,7 +531,7 @@ untold = []) {
             ...renderErrorBlock({
                 kind: "ok",
                 what: PICKER.onNewLaptop(names.length <= 3 ? names.join(", ") : summary),
-                why: [PICKER.onNewLaptopProof, AGENT_HOOKS.codexTrust, ...(caveat ? [PICKER.ownerApproval(channelCommand(ctx.env, ctx.selfPath, COMMANDS.status))] : [])],
+                why: [PICKER.onNewLaptopProof, AGENT_HOOKS.codexTrust],
             }, ctx.colour),
             ...untold,
         ]);
@@ -581,7 +542,7 @@ untold = []) {
         ...renderErrorBlock({
             kind: "ok",
             what: PICKER.onFor(summary),
-            why: [PICKER.onProof, AGENT_HOOKS.codexTrust, ...(caveat ? [PICKER.ownerApproval(channelCommand(ctx.env, ctx.selfPath, COMMANDS.status))] : [])],
+            why: [PICKER.onProof, AGENT_HOOKS.codexTrust],
         }, ctx.colour),
         ...untold,
         ...wrap(`${PICKER.stopOne} ${channelCommand(ctx.env, ctx.selfPath, COMMANDS.off)}`, 2),

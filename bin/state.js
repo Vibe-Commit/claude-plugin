@@ -878,7 +878,7 @@ function parseFileState(value) {
             // the rest: a non-contiguous backlog makes `pendingBytes` a fiction.
             if (from !== cursor || to <= from)
                 break;
-            backlog.push({ from, to, at });
+            backlog.push(e.pinned === true ? { from, to, at, pinned: true } : { from, to, at });
             cursor = to;
         }
     }

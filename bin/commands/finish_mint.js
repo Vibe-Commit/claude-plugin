@@ -1,9 +1,6 @@
-/** The one question (default No). On the picker path it names the repos chosen, not the machine (0.7.0, D7 · 3A). */
-function workspaceQuestion(scope, orgName) {
-    if (scope === "repos") {
-        return orgName === null ? REPLACE.questionReposUnconfirmed : REPLACE.questionRepos(truncateMiddle(orgName, 28));
-    }
-    return orgName === null ? REPLACE.questionUnconfirmed : REPLACE.question(truncateMiddle(orgName, 30));
+/** The one question (default No). It names no organization (T41c, §4.7); on the picker path it names the repos chosen, not the machine (0.7.0, D7 · 3A). */
+function workspaceQuestion(scope) {
+    return scope === "repos" ? REPLACE.questionRepos : REPLACE.question;
 }
 /**
  * Everything between "the server minted a credential" and "this machine has it" — `finishMint` — and the
@@ -85,17 +82,16 @@ export async function finishMint(ctx, input) {
         return { kind: "failed" };
     }
     if (crossOrg || askUnnamed || input.confirm === "always") {
-        // Values are text this package does not control (a workspace name, a handle): cut each in the
-        // MIDDLE to what the gutter leaves, so no row passes 80 columns (§13.4).
+        // The handle is text this package does not control: cut it in the MIDDLE to what the gutter leaves, so no
+        // row passes 80 columns (§13.4). ⛔ T41c (§4.7): NO organization name is printed anywhere in this block (the
+        // credential lands in Personal and routing is by repository), neither as a `workspace` row nor on `replaces`.
         const room = WRAP_COLUMNS - 2 - LABEL_GUTTER;
-        const orgName = shown?.orgName ?? null;
         writeLines(ctx.stdout, [
             "",
             labelled(2, REPLACE.accountLabel, truncateMiddle(shown?.account == null ? REPLACE.accountUnavailable : `@${shown.account}`, room)),
-            labelled(2, REPLACE.workspaceLabel, truncateMiddle(orgName ?? REPLACE.workspaceUnconfirmed, room)),
-            ...(crossOrg && prior?.who.kind === "ok"
-                ? [labelled(2, REPLACE.replacesLabel, truncateMiddle(REPLACE.replacesValue(prior.who.orgName), room))]
-                : []),
+            ...(crossOrg && prior?.who.kind === "ok" ? [labelled(2, REPLACE.replacesLabel, REPLACE.replacesValue)] : []),
+            "",
+            ...wrap(REPLACE.routing, 2),
         ]);
         // ⛔ A REJECTED QUESTION IS AN N (VQ F1). On a terminal, Ctrl+C at a `readline/promises` question does
         // not raise SIGINT: the interface closes and the promise REJECTS with an AbortError. Left to escape,
@@ -103,7 +99,7 @@ export async function finishMint(ctx, input) {
         // just created LIVE and unused in the person's Settings. Any rejection means nobody said yes.
         let answer;
         try {
-            answer = await ctx.ask(`  ${workspaceQuestion(input.scope, orgName)} ${paint(ctx.colour, "muted", CONNECT.consentAnswers)} `);
+            answer = await ctx.ask(`  ${workspaceQuestion(input.scope)} ${paint(ctx.colour, "muted", CONNECT.consentAnswers)} `);
         }
         catch {
             answer = null;
