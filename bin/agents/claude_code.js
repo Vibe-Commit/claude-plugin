@@ -11,7 +11,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import { claudeConfigPath, claudeSettingsPath, isInside, isTranscriptFile, transcriptRoot, } from "../paths.js";
 import { readEntries, sessionFile, subdirectories } from "./session_listing.js";
-import { SEAL_GROWTH_MAX_BYTES, topLevelTimestampMs } from "./types.js";
+import { SEAL_GROWTH_MAX_BYTES, TEST_CAPTURE_RECENT_MS, topLevelTimestampMs } from "./types.js";
 /**
  * The client-side backstop, per event.
  *
@@ -120,7 +120,11 @@ export function isHashedProjectName(name) {
  * this module out of an import cycle with the registry, whose failure mode is a
  * temporal-dead-zone `undefined` at module load rather than an error.)
  */
-function locateCurrentTranscript(home, env, projectKey) {
+function locateCurrentTranscript(home, env, projectKey, options = {}) {
+    // The newest transcript is returned only when it was written within `maxAgeMs` of `now` (cli-ux PR-A, T6a, ENG-5).
+    // Older than that is the same answer as none found, so the callers' no-session path covers both.
+    const now = options.now ?? Date.now();
+    const maxAgeMs = options.maxAgeMs ?? TEST_CAPTURE_RECENT_MS;
     const root = transcriptRoot(home, env);
     const name = encodeProjectPath(projectKey);
     // A hashed folder name cannot be derived from the path, so there is nothing to
@@ -161,7 +165,11 @@ function locateCurrentTranscript(home, env, projectKey) {
             };
         }
     }
-    return best === null ? null : { path: best.path, sessionId: best.sessionId, size: best.size };
+    if (best === null)
+        return null;
+    if (now - best.mtime > maxAgeMs)
+        return null;
+    return { path: best.path, sessionId: best.sessionId, size: best.size, mtimeMs: best.mtime };
 }
 /**
  * ⛔ **MEASURED (`M1`), 2026-08-21, BOTH ARMS.**

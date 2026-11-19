@@ -70,7 +70,7 @@
  * registers nothing, and reports success — the same matches-nothing failure as
  * an unrecognised event name, relocated to the document level.
  */
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync, } from "node:fs";
 import { basename, dirname, join } from "node:path";
 /**
  * What marks an entry as ours — the FAST PATH, not the whole identity.
@@ -161,10 +161,17 @@ binaryExists = () => true) {
         catch (error) {
             // ⛔ RULE 3. We hold the user's settings in our hands here; a parse we do
             // not understand is not permission to replace them.
-            return {
-                kind: "refused",
-                why: error instanceof Error ? error.message : "not valid JSON",
-            };
+            // FD5 (review 2): never the parser's own message. On current Node it can quote part of the file, and this file can hold
+            // secrets (`env`). Only the place is kept: V8's LAST ` at position N` (the message may quote the file first), turned into a
+            // line and column of `raw` (review 3). No parentheses, because the caller already wraps the why in them.
+            const found = error instanceof Error ? [...error.message.matchAll(/ at position (\d+)/g)] : [];
+            const offset = found.length > 0 ? Number(found[found.length - 1][1]) : Number.NaN;
+            let where = "";
+            if (Number.isInteger(offset) && offset >= 0 && offset <= raw.length) {
+                const before = raw.slice(0, offset);
+                where = ` at line ${before.split("\n").length}, column ${offset - before.lastIndexOf("\n")}`;
+            }
+            return { kind: "refused", why: `it is not valid JSON${where}` };
         }
         if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
             return { kind: "refused", why: "the document is not a JSON object" };
@@ -363,6 +370,56 @@ function entryFor(shape, registration) {
         ],
     };
 }
+function errnoOf(error) {
+    return error?.code;
+}
+function errorText(error) {
+    return error instanceof Error ? error.message : String(error);
+}
+/**
+ * The OS error without its path: Node's message is "CODE: text, syscall 'path'". The caller
+ * already prints the (truncated) config path, so the why must not repeat it.
+ */
+function osReason(error) {
+    const code = errnoOf(error);
+    const bare = errorText(error).replace(/, [a-z]+ '[^']*'$/, "");
+    return code !== undefined && !bare.startsWith(code) ? `${code}: ${bare}` : bare;
+}
+function unreadableWhy(error) {
+    return `it cannot be read: ${osReason(error)}`;
+}
+function unreadableLinkWhy(error) {
+    return `its link target cannot be read: ${osReason(error)}`;
+}
+/**
+ * Where the config actually lives. A missing path is absent. A regular file is its own
+ * target. A symlink resolves to its target, which we write through; a DANGLING symlink is
+ * refused rather than created through or replaced: a link into a directory that is not
+ * there (an unmounted dotfiles checkout, say) is a setup problem for the user to fix, and
+ * replacing the link would silently drop it.
+ */
+function locateConfig(path) {
+    let link;
+    try {
+        link = lstatSync(path);
+    }
+    catch (error) {
+        if (errnoOf(error) === "ENOENT")
+            return { kind: "absent" };
+        return { kind: "refused", why: unreadableWhy(error) };
+    }
+    if (!link.isSymbolicLink())
+        return { kind: "present", target: path };
+    try {
+        return { kind: "present", target: realpathSync(path) };
+    }
+    catch (error) {
+        const why = errnoOf(error) === "ENOENT"
+            ? "it is a symlink to a file that does not exist"
+            : unreadableLinkWhy(error);
+        return { kind: "refused", why };
+    }
+}
 /**
  * Merge our registrations into `path` and write it back.
  *
@@ -376,16 +433,28 @@ function entryFor(shape, registration) {
  * the user tightened to `0600` must not be widened by us having rewritten it.
  */
 export function writeAgentHooks(path, shape, registrations) {
+    // ⛔ Only ENOENT means "absent". Any other read error (EACCES on a 0600 file the
+    // user owns in another account's directory, EISDIR, ...) means the config exists
+    // and we cannot see it, so writing over it would replace the user's settings with
+    // a file holding only our hooks (ENG-36). Refuse, and name the path and the error.
+    const located = locateConfig(path);
+    if (located.kind === "refused")
+        return { kind: "refused", path, why: located.why };
+    const target = located.kind === "present" ? located.target : path;
     let raw = null;
     let mode;
-    try {
-        raw = readFileSync(path, "utf8");
-        mode = statSync(path).mode & 0o777;
-    }
-    catch {
-        // Absent is the ordinary case on a first install; anything else surfaces on
-        // the write below rather than being guessed at here.
-        raw = null;
+    if (located.kind === "present") {
+        try {
+            raw = readFileSync(target, "utf8");
+            mode = statSync(target).mode & 0o777;
+        }
+        catch (error) {
+            if (errnoOf(error) !== "ENOENT") {
+                const why = target === path ? unreadableWhy(error) : unreadableLinkWhy(error);
+                return { kind: "refused", path, why };
+            }
+            raw = null;
+        }
     }
     const merged = mergeHookDocument(raw, shape, registrations, existsSync);
     if (merged.kind === "refused")
@@ -399,13 +468,15 @@ export function writeAgentHooks(path, shape, registrations) {
     // path is worse than a fresh review — the hook would point at a binary that is gone.
     if (raw !== null && merged.text === raw)
         return { kind: "already", path, events };
-    const temp = join(dirname(path), `.${AGENT_HOOK_MARKER.replace(/\W+/g, "-")}.tmp`);
+    // The temp file and the rename live in the TARGET's directory: for a symlinked config
+    // that is where the bytes belong, and a rename over the link would replace the link.
+    const temp = join(dirname(target), `.${AGENT_HOOK_MARKER.replace(/\W+/g, "-")}.tmp`);
     try {
-        mkdirSync(dirname(path), { recursive: true });
+        mkdirSync(dirname(target), { recursive: true });
         writeFileSync(temp, merged.text, { mode: mode ?? 0o600 });
         if (mode !== undefined)
             chmodSync(temp, mode);
-        renameSync(temp, path);
+        renameSync(temp, target);
     }
     catch (error) {
         return { kind: "failed", path, why: error instanceof Error ? error.message : "write failed" };

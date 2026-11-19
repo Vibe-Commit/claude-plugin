@@ -44,7 +44,7 @@
  * rows (`project_pre_launch_no_data`), so there is nothing to migrate. See
  * `resolveProjectKeys`.
  */
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { writeFileAtomic } from "./atomic_write.js";
 import { grantedFolders } from "./folder_grants.js";
@@ -95,9 +95,9 @@ export function grantProject(home, consentKey, now) {
         ...readAllowList(home),
         [consentKey]: { at: now.toISOString() },
     };
-    writeFileSync(path, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
-    // writeFileSync's `mode` is ignored when the file already exists.
-    chmodSync(path, 0o600);
+    // Atomic: a kill between the temp write and the rename leaves the old file whole,
+    // where an in-place write left a torn file that reads back as "no consent".
+    writeFileAtomic(path, `${JSON.stringify(next, null, 2)}\n`, 0o600);
 }
 /** Revoke consent for one project (`vibecommit off`). */
 export function revokeProject(home, consentKey) {
@@ -108,8 +108,7 @@ export function revokeProject(home, consentKey) {
     delete next[consentKey];
     const path = projectsPath(home);
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    writeFileSync(path, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
-    chmodSync(path, 0o600);
+    writeFileAtomic(path, `${JSON.stringify(next, null, 2)}\n`, 0o600);
     return true;
 }
 export const EMPTY_GRANTS = {

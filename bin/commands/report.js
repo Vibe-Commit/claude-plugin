@@ -29,24 +29,24 @@
  *
  * ## ⚠⚠ WHAT `--since` CAN AND CANNOT BOUND — READ THIS BEFORE CHANGING IT
  *
- * **`commit_coverage` ACCEPTS NO WINDOW.** Its input schema is `{repo |
- * repository_id, ref}` and `ref` is the only required field; there is no
- * `since`. So the server's `edges_held` and `captured_shas` are
- * **repository-wide**, and the rate computed from them is repository-wide too.
+ * **THIS CLIENT SENDS `commit_coverage` NO WINDOW: `{ repo, ref }` only.** The
+ * tool's optional `since`/`until` (CR-151) bound when the server RECORDED an
+ * edge, not when the commit was made, so they are not `--since` and are not sent.
+ * The server's `edges_held` and `captured_shas` are therefore **repository-wide**,
+ * and so is the rate. `--since` bounds **the local half only**: the commit list
+ * read from the user's own clone, which selects the two empty states (both name
+ * the window, because both are local facts). **The rate's sentence claims no
+ * window, deliberately**, because claiming one would be the plausible-wrong-answer
+ * class (D98) on the product's most load-bearing number.
  *
- * `--since` therefore bounds **the local half only** — the commit list this
- * module reads out of the user's own clone, which is what selects the two empty
- * states (both of which name the window, because both are local facts). **The
- * rate's sentence claims no window, deliberately**, because claiming one would
- * be the plausible-wrong-answer class (D98) on the product's most load-bearing
- * number.
- *
- * That split is a real gap, it is reported rather than smoothed, and closing it
- * needs a `since` on the server tool — a row in a repo this task may not write.
+ * That split is a real gap, reported rather than smoothed. Closing it needs a
+ * server window on the commit's own time, which CR-151's is not. (CLI UX PR-A:
+ * this comment used to say the tool accepts no window, which was true only
+ * before CR-151.)
  *
  * @provenance vibecommit-mcp src/read/coverage.ts — the payload shape, retyped
  */
-import { ABSENCE, COMMANDS, ORG_ANSWER, REPORT, SIGNIN, WHY, } from "../copy/index.js";
+import { ABSENCE, ARGS, COMMANDS, ORG_ANSWER, REPORT, SIGNIN, WHY, } from "../copy/index.js";
 import { renderVerbHelp } from "../verb_help.js";
 import { EXIT } from "../exit.js";
 import { currentBranch, gitProbe, isReachable, isShallowClone, resolveRepoSlug } from "../git.js";
@@ -131,11 +131,8 @@ const GRADE_LABEL = {
     declared: REPORT.gradeDeclaredLabel,
 };
 /**
- * `--since <YYYY-MM-DD> [--ref <ref>]`.
- *
- * There is no argument parser in this package and `why` deliberately did not
- * add one; this matches that restraint — two flags, read positionally after
- * their names, and anything else is a usage error.
+ * `[--since <YYYY-MM-DD>] [--ref <ref>]`, or `--since=<date>` and `--ref=<ref>`. A value flag with no value is a problem, never a
+ * silent default (T16, ENG-9). A bare word that is not a flag is refused: `report 2026-07-08` did not mean what it looked like.
  *
  * ⚠ **THE DATE SHAPE IS ENFORCED RATHER THAN PASSED THROUGH.** `git log
  * --since` accepts almost anything and silently widens the window on input it
@@ -147,29 +144,43 @@ export function parseArgs(argv) {
     let ref = null;
     for (let i = 0; i < argv.length; i += 1) {
         const arg = argv[i];
-        if (arg === "--since") {
+        if (arg === "--since" || arg === "--ref") {
             const value = argv[i + 1];
             if (value === undefined || value.startsWith("-"))
-                return "usage";
-            since = value;
+                return { problem: "needs-value", flag: arg };
+            if (arg === "--since")
+                since = value;
+            else
+                ref = value;
             i += 1;
         }
-        else if (arg === "--ref") {
-            const value = argv[i + 1];
-            if (value === undefined || value.startsWith("-"))
-                return "usage";
-            ref = value;
-            i += 1;
+        else if (arg.startsWith("--since=") || arg.startsWith("--ref=")) {
+            const eq = arg.indexOf("=");
+            const value = arg.slice(eq + 1);
+            if (value === "")
+                return { problem: "needs-value", flag: arg.slice(0, eq) };
+            if (arg.startsWith("--since="))
+                since = value;
+            else
+                ref = value;
         }
         else if (!arg.startsWith("-")) {
-            // A bare positional is not part of this verb's grammar, and accepting one
-            // would let `report 2026-07-08` look like it worked.
-            return "usage";
+            return { problem: "unrecognized", token: arg };
         }
     }
-    if (since === null)
-        return "usage";
-    return ISO_DATE.test(since) ? { since, ref } : "bad-date";
+    if (since !== null && !ISO_DATE.test(since))
+        return { problem: "bad-date" };
+    return { since, ref };
+}
+/**
+ * The default window's start (T16, ENG-10, ENG-45): the local calendar date six days before `now`, so today plus the six before it
+ * are the seven days. Built by calendar arithmetic on the Date constructor, never by subtracting 6 x 24 hours, which lands on the
+ * wrong date for an hour or so after a spring-forward.
+ */
+export function defaultSince(now) {
+    const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 6);
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${start.getFullYear()}-${pad(start.getMonth() + 1)}-${pad(start.getDate())}`;
 }
 // ---------------------------------------------------------------------------
 // Rendering.
@@ -264,12 +275,23 @@ export async function report(ctx, argv, deps = {}) {
     // to stderr, nothing on stdout); the three ANSWER states branch.
     const json = argv.includes("--json");
     const args = parseArgs(argv);
-    if (args === "usage") {
-        return fail(ctx, json, errorCopy("REPORT_NEEDS_SINCE", REPORT.usageWhat, REPORT.usageWhy, REPORT.usageFix, COMMANDS.report), EXIT.usage);
-    }
-    if (args === "bad-date") {
+    if ("problem" in args) {
+        // An identifier, not a literal, at the writer (`copy-inline-literals` follows argument positions).
+        const reportVerb = "report";
+        // The why line names THIS install's help command (the plugin channel has no `vibecommit` on PATH), as `main()`'s refusal does.
+        const reportHelp = channelCommand(ctx.env, ctx.selfPath, ARGS.helpCommand(reportVerb));
+        if (args.problem === "needs-value") {
+            return fail(ctx, json, errorCopy("ARGUMENT_NEEDS_VALUE", ARGS.needsValueWhat(args.flag), `${ARGS.acceptsWhy(reportHelp)} ${ARGS.nothingRead}`, ARGS.fixLabel, ARGS.helpCommand(reportVerb)), EXIT.usage);
+        }
+        if (args.problem === "unrecognized") {
+            return fail(ctx, json, errorCopy("UNRECOGNIZED_ARGUMENT", ARGS.unrecognizedWhat(args.token, reportVerb), `${ARGS.acceptsWhy(reportHelp)} ${ARGS.nothingRead}`, ARGS.fixLabel, ARGS.helpCommand(reportVerb)), EXIT.usage);
+        }
         return fail(ctx, json, errorCopy("REPORT_SINCE_UNREADABLE", REPORT.sinceWhat, REPORT.sinceWhy, REPORT.sinceFix, COMMANDS.report), EXIT.usage);
     }
+    // T16: the window. The start is the explicit date, or today minus six calendar days. Git gets `<date> 00:00`, so the date given is the
+    // first day counted (a bare date would take the time of day from now, and drop that day's earlier commits).
+    const since = args.since ?? defaultSince(ctx.now());
+    const windowLine = args.since === null ? REPORT.windowLineDefault(since) : REPORT.windowLineExplicit(since);
     const projectKey = resolveProjectKey(ctx.cwd);
     if (projectKey === null) {
         writeFailure(ctx, notAGitRepoBlock(ctx), json ? "report" : null);
@@ -292,12 +314,12 @@ export async function report(ctx, argv, deps = {}) {
     // ⚠ THE WINDOW IS A LOCAL FACT, and so are both empty states. `git log`
     // answers "what commits are on this ref in this window" without a server,
     // which is what lets state 3 render before anything is read.
-    const log = gitProbe(projectKey, ["log", "--format=%H", `--since=${args.since}`, ref, "--"]);
+    const log = gitProbe(projectKey, ["log", "--format=%H", `--since=${since} 00:00`, ref, "--"]);
     if (log === null) {
         return fail(ctx, json, errorCopy("REPORT_REF_UNNAMEABLE", REPORT.refWhat, REPORT.refWhy, REPORT.refFix, COMMANDS.reportRef), EXIT.usage);
     }
     const windowShas = log.split("\n").filter((line) => line.trim() !== "");
-    const window = REPORT.window(args.since);
+    const window = REPORT.window(since);
     if (windowShas.length === 0) {
         // STATE 3 — no commits at all. Different fact from state 4, and collapsing
         // them would read as a coverage claim we cannot make.
@@ -310,7 +332,7 @@ export async function report(ctx, argv, deps = {}) {
         // vs "none" on this verb.
         if (json) {
             emitJson(ctx.stdout, "report", "no_commits", {
-                since: args.since,
+                since,
                 ref,
                 window_commits: 0,
                 edges_held: null,
@@ -342,7 +364,8 @@ export async function report(ctx, argv, deps = {}) {
     });
     return render(ctx, outcome, projectKey, ref, window, windowShas.length, {
         json,
-        since: args.since,
+        since,
+        header: windowLine,
     });
 }
 /** Every arm of `Read`, and every arm of `Authorized` inside one of them. */
@@ -410,7 +433,7 @@ function renderEach(ctx, answers, projectKey, ref, window, windowCommits, opts) 
     const rendered = [];
     for (const a of answers) {
         const buf = bufferStream();
-        const exit = renderPayload({ ...ctx, stdout: buf.stream }, a.payload, projectKey, ref, window, windowCommits, opts);
+        const exit = renderPayload({ ...ctx, stdout: buf.stream }, a.payload, projectKey, ref, window, windowCommits, { ...opts, header: null });
         if (exit === EXIT.failure) {
             ctx.stdout.write(buf.text()); // under --json `fail` wrote its one failure document to the (buffered) stdout; nothing of ours was printed before it
             return exit;
@@ -427,7 +450,8 @@ function renderEach(ctx, answers, projectKey, ref, window, windowCommits, opts) 
         ctx.stdout.write(`${JSON.stringify({ schema: 1, verb: "report", outcome: first.outcome, since: opts.since, org: null, results })}\n`);
         return best.exit;
     }
-    const lines = [];
+    // The window line is printed ONCE, above the organization headings (T16).
+    const lines = opts.header === null ? [] : [opts.header, ""];
     const headings = orgHeadings(rendered.map((r) => r.org));
     rendered.forEach((r, i) => {
         if (i > 0)
@@ -517,7 +541,7 @@ function renderPayload(ctx, payload, projectKey, ref, window, windowCommits, opt
         });
         return EXIT.ok;
     }
-    writeLines(ctx.stdout, coverageScreen(payload, numerator, percent));
+    writeLines(ctx.stdout, opts.header === null ? coverageScreen(payload, numerator, percent) : [opts.header, "", ...coverageScreen(payload, numerator, percent)]);
     return EXIT.ok;
 }
 //# sourceMappingURL=report.js.map

@@ -78,6 +78,15 @@ export const UNKNOWN_AGENT_ID = "unknown";
  *   SessionStart   SessionStart   SessionStart   sessionStart    NEVER
  */
 export const HOOK_EVENTS = ["Stop", "PreCompact", "SessionEnd", "SessionStart"];
+/**
+ * How recently a transcript must have been written for `connect`'s test capture to send it: 30 minutes (cli-ux PR-A, T6a;
+ * plan §4.8, ENG-6). Its own constant, NOT `SESSION_LIVE_WINDOW_MS` (`spool.ts`): that one is commit attribution's knob, sized
+ * to "a plausible single turn", and retuning it must not change what the grant block promises.
+ *
+ * It lives here, and not beside `SESSION_LIVE_WINDOW_MS` in `spool.ts`, so the locator can read it without importing a new
+ * module into the hook process: `claude_code.ts` already imports this file, and `spool.ts` is not on that path.
+ */
+export const TEST_CAPTURE_RECENT_MS = 30 * 60 * 1000;
 /** The most growth after a `SessionEnd` hook that `growthAllowsSeal` may allow. More than this is a conversation, not a trailing metadata record. */
 export const SEAL_GROWTH_MAX_BYTES = 4096;
 /** A record's top-level `timestamp` as integer ms, or `null`: an ISO string that parses to a finite time. The one reading Claude Code and Codex share. */

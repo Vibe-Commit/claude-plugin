@@ -88,7 +88,7 @@ export function glyph(enabled, kind) {
  * own line rather than broken: breaking a URL makes it uncopyable, which costs
  * more than the overflow.
  */
-export function wrap(text, indent, hangingIndent = indent) {
+export function wrap(text, indent, hangingIndent = indent, width = WRAP_COLUMNS) {
     const words = text.split(/\s+/).filter((w) => w.length > 0);
     if (words.length === 0)
         return [];
@@ -98,7 +98,7 @@ export function wrap(text, indent, hangingIndent = indent) {
     let empty = true;
     for (const word of words) {
         const candidate = empty ? current + word : `${current} ${word}`;
-        if (!empty && candidate.length > WRAP_COLUMNS) {
+        if (!empty && candidate.length > width) {
             lines.push(current);
             currentIndent = hangingIndent;
             current = " ".repeat(currentIndent) + word;
@@ -180,5 +180,66 @@ export function tildePath(path, home) {
         return `~${path.slice(home.length)}`;
     }
     return path;
+}
+/**
+ * Terminal columns one code point takes: 0 for a combining mark, 2 for a wide East Asian or emoji code point, 1 otherwise. A
+ * small table, not a dependency: it covers the CJK, Hangul, fullwidth and common emoji blocks a folder or repository name uses.
+ */
+function codePointWidth(cp) {
+    if (cp === 0)
+        return 0;
+    if (cp < 0x300)
+        return 1;
+    // Combining marks (the common blocks): a mark sits on the character before it and takes no column of its own.
+    if ((cp >= 0x300 && cp <= 0x36f) || (cp >= 0x1ab0 && cp <= 0x1aff) || (cp >= 0x20d0 && cp <= 0x20ff) || (cp >= 0xfe20 && cp <= 0xfe2f))
+        return 0;
+    if (cp === 0x200d || (cp >= 0xfe00 && cp <= 0xfe0f))
+        return 0; // zero-width joiner and variation selectors
+    const wide = (cp >= 0x1100 && cp <= 0x115f) ||
+        (cp >= 0x2e80 && cp <= 0xa4cf && cp !== 0x303f) ||
+        (cp >= 0xac00 && cp <= 0xd7a3) ||
+        (cp >= 0xf900 && cp <= 0xfaff) ||
+        (cp >= 0xfe30 && cp <= 0xfe4f) ||
+        (cp >= 0xff00 && cp <= 0xff60) ||
+        (cp >= 0xffe0 && cp <= 0xffe6) ||
+        (cp >= 0x1f300 && cp <= 0x1f64f) ||
+        (cp >= 0x1f900 && cp <= 0x1f9ff) ||
+        (cp >= 0x20000 && cp <= 0x3fffd);
+    return wide ? 2 : 1;
+}
+/**
+ * Clip a line to at most `max` display columns, KEEPING its SGR escapes (they take no column) and never splitting a character.
+ * A line cut while a colour is open ends with a reset, so the colour cannot run past the window. A line that fits is returned
+ * unchanged, byte for byte.
+ */
+export function clipDisplay(line, max) {
+    const esc = "\x1b";
+    let out = "";
+    let width = 0;
+    let cut = false;
+    let i = 0;
+    while (i < line.length) {
+        if (line[i] === esc && line[i + 1] === "[") {
+            const end = line.indexOf("m", i);
+            if (end !== -1 && /^\x1b\[[0-9;]*m$/.test(line.slice(i, end + 1))) {
+                out += line.slice(i, end + 1);
+                i = end + 1;
+                continue;
+            }
+        }
+        const cp = line.codePointAt(i) ?? 0;
+        const ch = String.fromCodePoint(cp);
+        const w = codePointWidth(cp);
+        if (width + w > max) {
+            cut = true;
+            break;
+        }
+        out += ch;
+        width += w;
+        i += ch.length;
+    }
+    if (!cut)
+        return line;
+    return out.includes(esc) ? `${out}${SGR.reset}` : out;
 }
 //# sourceMappingURL=term.js.map
