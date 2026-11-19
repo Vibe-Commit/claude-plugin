@@ -28,7 +28,8 @@ import { writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { createInterface } from "node:readline/promises";
 import { Writable } from "node:stream";
-import { resolveAgentId } from "./agents/registry.js";
+import { DIALECTS, resolveAgentId } from "./agents/registry.js";
+import { checkArgs, isCheckedVerb, isShellSafeToken, orList, redactCredential } from "./args.js";
 import { auth } from "./commands/auth.js";
 import { browserCredential } from "./commands/browser_credential.js";
 import { updateNudge } from "./update_nudge.js";
@@ -39,14 +40,16 @@ import { report } from "./commands/report.js";
 import { backfill, backfillForConnect } from "./commands/backfill.js";
 import { scan } from "./commands/scan.js";
 import { why } from "./commands/why.js";
-import { HELP, INTERNAL, USAGE } from "./copy/index.js";
+import { defaultTempRoots } from "./temp_roots.js";
+import { ARGS, AUTH, HELP, INTERNAL, USAGE } from "./copy/index.js";
+import { INGEST_TOKEN_PREFIX } from "./credential.js";
 import { EXIT } from "./exit.js";
-import { channelCommand, installChannel } from "./install.js";
+import { authCommandFor, channelCommand, installChannel } from "./install.js";
 import { renderJsonError } from "./json.js";
 import { readStdin } from "./stdin.js";
 import { LABEL_GUTTER, renderErrorBlock, resolveColour, wrap } from "./term.js";
 import { CLIENT_VERSION } from "./version.js";
-import { VERBS, isVerb } from "./verbs.js";
+import { VERBS, VERB_GROUPS, isVerb } from "./verbs.js";
 // `CR-216/U2` adds `auth`, and adding it MOVES `test/help.golden.txt` — which
 // `CR-084d` and the `post-commit` note below were both careful not to do. The
 // difference is the point: those two are a FLAG and a HIDDEN verb, neither of
@@ -69,27 +72,31 @@ export { VERBS, isVerb };
  * indentation and the label gutter carry it, which is §13.1's point about
  * `NO_COLOR` being a lossless degradation rather than a downgrade.
  */
-export function renderHelp() {
+export function renderHelp(env = process.env, selfPath = process.argv[1] ?? "") {
+    // PR-A T14 (plan 4.3). The two channel lines take the channel's command (CEO-13): on a plugin-only machine there is no
+    // `vibecommit` on PATH, so printing it would send a person to a command that does not exist.
     const lines = [
         ...wrap(HELP.tagline, 2),
         "",
         ...wrap(`${USAGE.usageLabel} ${HELP.usage}`, 2),
-        "",
-        ...wrap(USAGE.commandsLabel, 2),
+        ...wrap(`${HELP.startHereLabel} ${channelCommand(env, selfPath, HELP.startHereCommand)}`, 2),
     ];
-    for (const verb of VERBS) {
-        // The description is wrapped on its own and the verb column is written over
-        // the first line's indent. Wrapping `verb + padding + description` as one
-        // string would not work: `wrap` normalises whitespace, so the fixed gutter
-        // would collapse to a single space.
-        const head = `    ${verb.padEnd(LABEL_GUTTER)}`;
-        const body = wrap(HELP.commands[verb], head.length);
-        lines.push(head + body[0].slice(head.length), ...body.slice(1));
+    for (const [label, verbs] of Object.entries(VERB_GROUPS)) {
+        lines.push("", ...wrap(label, 2));
+        for (const verb of verbs) {
+            // The description is wrapped on its own and the verb column is written over
+            // the first line's indent. Wrapping `verb + padding + description` as one
+            // string would not work: `wrap` normalises whitespace, so the fixed gutter
+            // would collapse to a single space.
+            const head = `    ${verb.padEnd(LABEL_GUTTER)}`;
+            const body = wrap(HELP.short[verb], head.length);
+            lines.push(head + body[0].slice(head.length), ...body.slice(1));
+        }
     }
-    lines.push("", ...wrap(`${USAGE.docsLabel} ${HELP.docsUrl}`, 2));
+    lines.push("", ...wrap(`${HELP.helpOneLabel} ${channelCommand(env, selfPath, HELP.helpOneCommand)}`, 2), ...wrap(`${USAGE.docsLabel} ${HELP.docsUrl}`, 2));
     return lines.join("\n");
 }
-function interactiveContext(argv) {
+export function interactiveContext(argv) {
     return {
         env: process.env,
         home: homedir(),
@@ -99,6 +106,8 @@ function interactiveContext(argv) {
         // the bottom of this file makes — `connect` needs it to know whether the
         // agent it was told about has a way to find the running session at all.
         agentId: resolveAgentId(argv),
+        // D-TEMP (T5): the production picker and offer leave temporary folders out unless granted. Set here and nowhere else.
+        tempRoots: defaultTempRoots(),
         colour: resolveColour({
             env: process.env,
             isTty: process.stdout.isTTY === true,
@@ -136,8 +145,145 @@ function interactiveContext(argv) {
         selfPath: process.argv[1] ?? "",
     };
 }
+/** The unknown-command block (PR 7, Q6): a code, and the way to the command list as the LAST line. No help dump. */
+function unknownCommand(name, argv) {
+    const colour = resolveColour({
+        env: process.env,
+        isTty: process.stderr.isTTY === true,
+        noColorFlag: argv.includes("--no-color"),
+        json: false,
+    });
+    process.stderr.write(`${renderErrorBlock({
+        kind: "bad",
+        code: "UNKNOWN_COMMAND",
+        what: USAGE.unknownCommandWhat(redactCredential(name)),
+        why: [],
+        fixLabel: USAGE.unknownCommandFix,
+        fixes: [channelCommand(process.env, process.argv[1] ?? "", USAGE.unknownCommandHelp)],
+    }, colour).join("\n")}\n`);
+    return EXIT.usage;
+}
+/**
+ * T22a (ENG-32, ENG-42): a token that IS a credential, or whose value after its first `=` is one. `acme/my_vcik_tool` is not:
+ * the match is at the start only, so a name that merely contains the prefix passes.
+ */
+function isCredentialShaped(token) {
+    if (token.startsWith(INGEST_TOKEN_PREFIX))
+        return true;
+    const eq = token.indexOf("=");
+    return eq >= 0 && token.slice(eq + 1).startsWith(INGEST_TOKEN_PREFIX);
+}
+/**
+ * One exit path for the two refusals (review fix, json.ts's contract). Under `--json` on a JSON verb the failure is ONE
+ * document on stdout and NOTHING on stderr, as every other `--json` failure is; otherwise the text block goes to stderr.
+ * The same exit code either way. A block never carries the credential's value, so neither stream can.
+ */
+function refuse(argv, block) {
+    if (argv.includes("--json") && JSON_VERBS.includes(argv[0] ?? "")) {
+        process.stdout.write(renderJsonError(argv[0], block));
+        return EXIT.usage;
+    }
+    const colour = resolveColour({
+        env: process.env,
+        isTty: process.stderr.isTTY === true,
+        noColorFlag: argv.includes("--no-color"),
+        json: false,
+    });
+    process.stderr.write(`${renderErrorBlock(block, colour).join("\n")}\n`);
+    return EXIT.usage;
+}
+/**
+ * The `CREDENTIAL_IN_ARGV` block, the same copy `auth` prints (`AUTH.argv*`). It names no token: the value is printed nowhere.
+ * Runs before anything else in `main()`, so `vibecommit vcik_…` never reaches `UNKNOWN_COMMAND`, which echoes the token.
+ */
+function credentialRefusal(argv) {
+    const self = process.argv[1] ?? "";
+    return refuse(argv, {
+        kind: "bad",
+        code: "CREDENTIAL_IN_ARGV",
+        what: AUTH.argvWhat,
+        why: [AUTH.argvWhy],
+        fixLabel: AUTH.argvFix,
+        fixes: [channelCommand(process.env, self, AUTH.argvFixPrompt), AUTH.argvFixStdin(authCommandFor(process.env, self))],
+    });
+}
+/**
+ * FB5: `vibecommit <verb>` followed by the verb's own arguments, with the one token at `index` replaced by `suggestion`.
+ * FD3: null, so the fix stays `--help`, unless (a) the corrected argv passes the check in full, (b) every token of the line is
+ * shell-safe, and (c) it is not a `help <verb>` request (a corrected line there would run the verb, not show its help).
+ */
+function correctedLine(verb, index, suggestion, argv, agentIds) {
+    if (argv[0] === "help")
+        return null;
+    const args = argv.slice(1).map((token, i) => (i === index ? suggestion : token));
+    if (checkArgs(verb, args, agentIds) !== null)
+        return null;
+    const tokens = ["vibecommit", verb, ...args];
+    return tokens.every(isShellSafeToken) ? tokens.join(" ") : null;
+}
+/**
+ * T22a, D-ARGS, DX-2: the refusal block for the shared check. The `what` names the token (cut at 40, `--flag=…` without its value).
+ * The last line is a runnable command: the corrected command where there is one (printed, never run), else `--help`.
+ * Nothing is read, asked or sent before this runs.
+ */
+function argumentRefusal(verb, refusal, argv) {
+    const self = process.argv[1] ?? "";
+    const helpFix = channelCommand(process.env, self, ARGS.helpCommand(verb));
+    if (refusal.kind === "needs-value") {
+        return refuse(argv, {
+            kind: "bad",
+            code: "ARGUMENT_NEEDS_VALUE",
+            what: ARGS.needsValueWhat(refusal.shown),
+            why: [ARGS.acceptsWhy(helpFix), ARGS.nothingRead],
+            fixLabel: ARGS.fixLabel,
+            fixes: [helpFix],
+        });
+    }
+    const why = [
+        ARGS.acceptsWhy(helpFix),
+        ...(refusal.accepted === null ? [] : [ARGS.agentIdsWhy(orList(refusal.accepted))]),
+        ...(refusal.suggestion === null ? [] : [ARGS.didYouMean(refusal.suggestion)]),
+        ARGS.nothingRead,
+    ];
+    // A did-you-mean fix is the corrected command, so it gets its own label; the --help fix keeps `See what it takes:`.
+    // FB5 (review finding 12): the corrected command is the REAL argv with only the one bad token replaced. Any other token that
+    // carries a credential is redacted, so the line never re-prints one.
+    const corrected = refusal.suggestion === null || refusal.kind !== "unrecognized"
+        ? null
+        : (() => {
+            const line = correctedLine(verb, refusal.index, refusal.suggestion, argv, DIALECTS.map((dialect) => dialect.id));
+            return line === null ? null : channelCommand(process.env, self, redactCredential(line));
+        })();
+    return refuse(argv, {
+        kind: "bad",
+        code: "UNRECOGNIZED_ARGUMENT",
+        what: ARGS.unrecognizedWhat(refusal.shown, verb),
+        why,
+        fixLabel: corrected === null ? ARGS.fixLabel : ARGS.fixLabelCorrected,
+        fixes: [corrected ?? helpFix],
+    });
+}
 async function main(argv) {
     const [verb] = argv;
+    // T22a, ENG-32: FIRST the credential check over every token, then the shared argument check for the verb, and only then the
+    // rest of `main()` (`UNKNOWN_COMMAND`, `--help`, `help <verb>`, and the pending-revoke retry below), so a refused argument
+    // reads nothing and makes no request.
+    if (argv.some(isCredentialShaped))
+        return credentialRefusal(argv);
+    const checked = verb === "help" ? argv[1] : verb;
+    // FB1 (review finding 2): `auth`'s own rule is that ANY positional token is a pasted credential, whatever its shape, so it runs
+    // here, before the shared flag check. `auth --pastee "“vcik_…”"` is then CREDENTIAL_IN_ARGV, not UNRECOGNIZED_ARGUMENT.
+    if (checked === "auth" && argv.slice(verb === "help" ? 2 : 1).some((token) => !token.startsWith("-")))
+        return credentialRefusal(argv);
+    // FD6 (review 2, finding 6): `auth` takes no names, so ANY token that contains the prefix is a pasted credential, whatever sits in front
+    // of it (`--paste=“vcik_…”` has a smart quote after its `=`, which isCredentialShaped does not look past).
+    if (checked === "auth" && argv.slice(verb === "help" ? 2 : 1).some((token) => token.includes(INGEST_TOKEN_PREFIX)))
+        return credentialRefusal(argv);
+    if (isCheckedVerb(checked)) {
+        const refusal = checkArgs(checked, argv.slice(verb === "help" ? 2 : 1), DIALECTS.map((dialect) => dialect.id));
+        if (refusal !== null)
+            return argumentRefusal(checked, refusal, argv);
+    }
     if (verb === undefined || verb === "--help" || verb === "-h") {
         process.stdout.write(`${renderHelp()}\n`);
         return EXIT.ok;
@@ -146,24 +292,20 @@ async function main(argv) {
         process.stdout.write(`${CLIENT_VERSION}\n`);
         return EXIT.ok;
     }
-    if (!isVerb(verb)) {
-        // PR 7 (Q6): a block like every other failure — a code, and the way to the command list as the LAST line. No help dump.
-        const colour = resolveColour({
-            env: process.env,
-            isTty: process.stderr.isTTY === true,
-            noColorFlag: argv.includes("--no-color"),
-            json: false,
-        });
-        process.stderr.write(`${renderErrorBlock({
-            kind: "bad",
-            code: "UNKNOWN_COMMAND",
-            what: USAGE.unknownCommandWhat(verb),
-            why: [],
-            fixLabel: USAGE.unknownCommandFix,
-            fixes: [channelCommand(process.env, process.argv[1] ?? "", USAGE.unknownCommandHelp)],
-        }, colour).join("\n")}\n`);
-        return EXIT.usage;
+    // PR-A T14: `help <verb>` is `<verb> --help`, byte for byte (the same screen, through the same verb). `help` alone is the
+    // top-level help. `help <unknown>` is the unknown-command block, naming what was asked for.
+    if (verb === "help") {
+        const target = argv[1];
+        if (target === undefined) {
+            process.stdout.write(`${renderHelp(process.env, process.argv[1] ?? "")}\n`);
+            return EXIT.ok;
+        }
+        if (isVerb(target))
+            return await runVerb(target, [target, "--help"], interactiveContext(argv));
+        return unknownCommand(target, argv);
     }
+    if (!isVerb(verb))
+        return unknownCommand(verb, argv);
     const ctx = interactiveContext(argv);
     // Slice 2 (S4, R3-11): a credential `g` made and did not keep is revoked by the NEXT verb that runs — once, at its start, silent,
     // needing no credential, inside one 3 s bound across every row. Not for `--help`, not for `scan` (network-free by contract,
@@ -268,7 +410,9 @@ async function runVerb(verb, argv, ctx) {
             return await report(ctx, argv.slice(1));
         case "finalize":
             // `TODOS[146]`. Same shape as `report`: the verb reads its own flags.
-            return await finalize(ctx, argv.slice(1));
+            // T22a: `--no-color` is the global flag, accepted everywhere by the shared check. `finalize`'s own parser has no notion
+            // of it, so it is taken out here, and only here: the other verbs' parsers already ignore a dash token they do not read.
+            return await finalize(ctx, argv.slice(1).filter((arg) => arg !== "--no-color"));
     }
 }
 /**

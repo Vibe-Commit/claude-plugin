@@ -117,7 +117,7 @@ const SSH_TIMEOUT_MS = 2_000;
  * added here starts claiming the github.com namespace. Every other host is
  * host-qualified instead — see `parseRemoteSlug`.
  */
-const GITHUB_HOSTS = new Set(["github.com", "ssh.github.com"]);
+export const GITHUB_HOSTS = new Set(["github.com", "ssh.github.com"]);
 /**
  * A hostname we are willing to hand to `ssh` and to put in a slug.
  *
@@ -132,15 +132,15 @@ const GITHUB_HOSTS = new Set(["github.com", "ssh.github.com"]);
  * No leading or trailing `-` or `.`, and nothing outside the LDH set, which is
  * what a real DNS name is anyway.
  */
-const HOSTNAME = /^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/;
+export const HOSTNAME = /^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/;
 /**
  * A GitHub account name: alphanumerics and hyphens, no leading or trailing
  * hyphen. Deliberately GitHub's own rule rather than "anything without a
  * slash" — see the confidence note on `resolveRepoSlug`.
  */
-const OWNER = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/;
+export const OWNER = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/;
 /** A GitHub repository name. `.` and `..` are excluded below, not here. */
-const REPO = /^[A-Za-z0-9._-]+$/;
+export const REPO = /^[A-Za-z0-9._-]+$/;
 /**
  * `owner/repo` for a work tree whose `origin` is GitHub, `host/owner/repo` for
  * any other host, else `local:<sha256(abspath)[0:12]>`.

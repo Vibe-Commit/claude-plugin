@@ -7,6 +7,15 @@
  * for exactly that reason.
  */
 export const VERBS = ["auth", "connect", "scan", "backfill", "status", "off", "why", "report", "finalize"];
+/**
+ * The groups the top-level help lists the verbs under (plan 4.3). Each verb is in exactly one group
+ * (`test/help-grouped.test.ts`), so a new verb cannot drop out of help. The labels are shown uppercase.
+ */
+export const VERB_GROUPS = {
+    "SET UP": ["connect", "backfill", "auth"],
+    CHECK: ["status", "scan", "why", "report"],
+    CHANGE: ["off", "finalize"],
+};
 export function isVerb(value) {
     return VERBS.includes(value);
 }

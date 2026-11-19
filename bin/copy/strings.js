@@ -24,7 +24,27 @@ import { INGEST_TOKEN_PREFIX } from "../credential.js";
 /** `--help` copy. The `why` line is verbatim-approved (D61 §PS6) — do not reword. */
 export const HELP = {
     usage: "vibecommit <command> [options]",
-    tagline: "Record Claude Code sessions against the commits they produced.",
+    tagline: "Record coding-agent sessions (Claude Code, Codex, Cursor) against the commits they produced.",
+    /**
+     * PR-A T14 (plan 4.3): the one-line descriptions the TOP-LEVEL help lists. `commands` below stays the full sentence each
+     * verb's own `--help` opens with. `off` and `auth` keep today's meanings until PR-B and PR-C (ENG-7).
+     */
+    short: {
+        connect: "Choose which repositories to capture. Signs in if needed.",
+        backfill: "Upload earlier sessions still on this machine. Optional.",
+        auth: "Renew or replace this machine's credential.",
+        status: "Show what is captured and when it last uploaded.",
+        scan: "List repositories coding agents ran in. Uploads nothing.",
+        why: "Show the conversation behind the commit that changed a line.",
+        report: "Show this repository's capture coverage.",
+        off: "Stop capturing for this repo.",
+        finalize: "Close a finished session so its last commits can be recorded.",
+    },
+    /** The top-level help's two channel lines (CEO-13): the command is passed through `channelCommand`, so a plugin install prints its own. */
+    startHereLabel: "Start here:",
+    startHereCommand: "vibecommit connect",
+    helpOneLabel: "Help for one command:",
+    helpOneCommand: "vibecommit help <command>",
     commands: {
         // `CR-216/U2`. FIRST in the list by habit, not by sequence: that "nothing for `connect` to use until
         // this has run" reason has been false since `CR-226` (`connect` signs in itself on a machine with no
@@ -45,7 +65,8 @@ export const HELP = {
         off: "Stop capturing for this repo.",
         // VERBATIM-APPROVED (D61 §PS6). Any reword needs a new claims-register row.
         why: "Show the conversation turns recorded against the commit that last changed this line.",
-        report: "Summarise capture coverage over a time window.",
+        // FB4 (review finding 7, plan 4.3): the approved text. The coverage is the whole repository, so no window is named (4.16).
+        report: "Show this repository's capture coverage.",
         // `TODOS[146]`. Typed by a person or a script AFTER a one-shot run, so it is in the list.
         finalize: "Close a finished session's last turn so commits made in it can be recorded.",
     },
@@ -91,6 +112,7 @@ export const HELP = {
             options: [["--json", "Print one JSON document instead of text."]],
             exits: [
                 ["0", "Repositories found."],
+                ["2", "Bad arguments."],
                 ["4", "None found."],
             ],
         },
@@ -126,9 +148,9 @@ export const HELP = {
             ],
         },
         report: {
-            usage: "vibecommit report --since <date> [--ref <ref>] [--json]",
+            usage: "vibecommit report [--since <date>] [--ref <ref>] [--json]",
             options: [
-                ["--since", "Start of the window, as YYYY-MM-DD. Required."],
+                ["--since", "Start of the window, as YYYY-MM-DD. Default: the last 7 days."],
                 ["--ref", "The branch or commit to count. Default: the current branch."],
                 ["--json", "Print one JSON document instead of text."],
             ],
@@ -757,8 +779,8 @@ export const CONNECT = {
      * grammar as a set, and a sixth phrasing invented here is what that task
      * exists to prevent.
      */
-    noTranscriptWhat: "No Claude Code session was found for this repository.",
-    noTranscriptWhy: "Consent is recorded, but connect had nothing to record: no transcript exists yet for this project. Capture starts on its own the next time Claude Code runs here.",
+    noTranscriptWhat: "No recent Claude Code session was found for this repository.",
+    noTranscriptWhy: "Consent is recorded, but nothing was sent as a check: connect looks only at Claude Code sessions from the last 30 minutes. Capture starts on its own the next time Claude Code runs here.",
     noTranscriptFix: "Nothing to fix. Start a session, then check:",
     /**
      * The generic hold line (A78): the server answered the test capture with an older server's approval 403. It is a
@@ -832,9 +854,11 @@ export const AGENT_HOOKS = {
     // false install claim this unit exists to delete.
     codexTrust: "Codex asks you to trust new hooks the next time it starts — until you do, it will not run them.",
     refusedWhat: (agent) => `Session capture could NOT be set up for ${agent}.`,
-    refusedWhy: (path, why) => `${path} could not be read as JSON (${why}), and it was left exactly as it is. Overwriting a file we cannot parse would discard settings we cannot see.`,
+    // DRAFT copy (CLI UX PR-A review 2): true for every refusal kind, the unreadable and the wrong-shape documents as well as a syntax error.
+    refusedWhy: (path, why) => `${path} was left exactly as it is (${why}). Rewriting a file we cannot read, or cannot merge our hooks into, would lose what is in it now.`,
     refusedFixLabel: "Fix:",
-    refusedFix: (path, connect) => `check ${path} for a syntax error, then run \`${connect}\` again`,
+    // DRAFT copy (CLI UX PR-A review 2): names the problem above rather than asking for valid JSON, which a wrong-shape file already is.
+    refusedFix: (path, connect) => `fix the problem with ${path} named above, then run \`${connect}\` again`,
     failedWhat: (agent) => `Session capture could NOT be set up for ${agent}.`,
     failedWhy: (path, why) => `Writing ${path} failed: ${why}. Commit capture and any agent already configured are unaffected.`,
 };
@@ -1179,6 +1203,10 @@ export const PICKER = {
     folders: "folders outside a repository",
     moreFoldersTyped: (count) => `${count} more ${count === 1 ? "folder" : "folders"} · type more to list them`,
     moreFoldersChecklist: (count) => `${count} more ${count === 1 ? "folder" : "folders"}`,
+    /** D-TEMP: the one collapsed row for temporary folders, shown as `+  N temporary folders`; `more` expands it. */
+    temporaryFolders: (count) => `${count} temporary ${count === 1 ? "folder" : "folders"}`,
+    /** D-TEMP, the typed prompt's form of the same row: it says how to expand it, as `moreFoldersTyped` does. */
+    temporaryFoldersTyped: (count) => `${count} temporary ${count === 1 ? "folder" : "folders"} · type more to list them`,
     labelFolders: "folders",
     /** The folder grant line (R7 · D9): the one claim about who can read a folder's sessions. */
     folderPrivate: "(private to you)",
@@ -1212,6 +1240,8 @@ export const PICKER = {
     promptMark: "> ",
     /** `tokens` is the already-joined list (`9 (no row 9), acme, corp`): the corpus renders every template with a string. */
     notUnderstood: (tokens) => `Not understood: ${tokens}. Nothing was chosen.`,
+    /** DRAFT copy (CLI UX PR-A review): not in the plan's screens. The fix line for a refused name: what to TYPE at the prompt (`text`). */
+    typeInstead: (text) => `Type ${text} instead.`,
     noRow: (n) => `${n} (no row ${n})`,
     alreadyOn: (token, remove) => `${token} (already on; ${remove} stops it)`,
     notOn: (token) => `${token} (not on)`,
@@ -1222,8 +1252,27 @@ export const PICKER = {
     /** Sessions exist but none could be listed (the `Not listed here:` block is not empty): scan's own wording. */
     emptyListable: "Type owner/ or owner/repo, for example alexvibecommit/, to capture a repository that is not listed.",
     /** The checklist (D28). */
-    hint: "↑↓ move · space choose · enter done · t typed prompt · ctrl+c cancel",
-    hintTyped: (connectTyped) => `For a screen reader, run: ${connectTyped}`,
+    hint: "↑↓ move · space select · enter continue · q quit · t type names instead",
+    hintTyped: (connectTyped) => `Screen reader? Run: ${connectTyped}`,
+    /** The count line (4.1), recomputed on each keypress from `changeOf()`. */
+    countNone: "Nothing chosen yet",
+    countAdd: (added) => `${added} to add, nothing to stop`,
+    countStop: (stopped) => `nothing to add, ${stopped} to stop`,
+    countBoth: (added, stopped) => `${added} to add, ${stopped} to stop`,
+    /** Enter with nothing new (4.4): the count line says so, and the picker stays. */
+    stayNothing: "Nothing chosen yet. Press space to select, or q to quit.",
+    /** Space on a repo under a ticked `all` row (4.4, D-COVERED): the meta of that row, and the footer sentence. */
+    coveredBy: "covered by all",
+    coveredFooter: 'Covered by "all". Untick "all" to choose repos one by one.',
+    /** The window's edge lines (4.6): the selectable rows above and below the drawn ones. */
+    moreAbove: (count) => `↑ ${count} more above`,
+    moreBelow: (count) => `↓ ${count} more below`,
+    /** The switch to the typed prompt explains itself (4.5): two muted lines, only when the checklist declined on its own. */
+    narrowWindow: (columns) => `This window is ${columns} columns wide; the arrow-key list needs 80.`,
+    noArrowKeys: "This terminal can't draw the arrow-key list.",
+    chooseTyped: (connect) => `Choose by typing below, or widen the window and run ${connect}.`,
+    /** q or Esc (4.4): nothing changed, and the machine is not capturing. */
+    noChangesPlain: "No changes.",
     /** The enter-with-nothing lines (D5). */
     nothingGranted: (connect) => `Nothing granted. Run \`${connect}\` again any time.`,
     noChanges: (summary) => `No changes. Capture stays on for ${summary}.`,
@@ -1718,7 +1767,10 @@ export const REPORT = {
      * meaningless because the number is ref-relative."* `commit_coverage` makes
      * `ref` a REQUIRED payload field for exactly this reason.
      */
-    definition: (ref) => `Coverage is the share of the commits we hold a recorded session for that are still reachable from ${ref}.`,
+    definition: (ref) => 
+    // The metric is reachable / held, over the commits we hold a recorded session for (`rate` below). CEO-15's whole-repository
+    // statement is added to the ORIGINAL wording, not substituted for it: "of the commits in the whole repository" is a different metric.
+    `Coverage is the share of the commits we hold a recorded session for, across the whole repository, that are still reachable from ${ref}.`,
     rate: (reachable, held, ref, percent) => `${reachable} of ${held} commits with a recorded session are still reachable from ${ref} (${percent}%).`,
     /** §10.3 draws `Of those:` and then the per-grade split. */
     gradeMixIntro: "Of those:",
@@ -1804,6 +1856,9 @@ export const REPORT = {
      * which are answered from the clone.
      */
     window: (since) => `the window since ${since}`,
+    /** T16 (plan 4.16): the first line of the coverage screen. The default names its length; an explicit `--since` does not. */
+    windowLineDefault: (since) => `Commits since ${since} (the last 7 days):`,
+    windowLineExplicit: (since) => `Commits since ${since}:`,
     usageWhat: "This command needs a start date.",
     usageWhy: "The window bounds which commits are counted, so the answer is not defined without one. Nothing was read and nothing was sent.",
     usageFix: "Name the date the window starts:",
@@ -2466,9 +2521,9 @@ export const COMMANDS = {
      * `CR-108`. The ARGUMENT SHAPE, shown once so the usage error and the retry
      * fix line cannot drift apart — the same convention `why` uses.
      */
-    report: "vibecommit report --since 2026-07-08",
+    report: "vibecommit report",
     /** The ref form, for the detached-HEAD refusal. */
-    reportRef: "vibecommit report --since 2026-07-08 --ref main",
+    reportRef: "vibecommit report --ref main",
     off: "vibecommit off",
     /** The picker's screen-reader flag: a FLAG on `connect`, like `signIn`. */
     connectTyped: "vibecommit connect --typed",
@@ -2554,5 +2609,25 @@ export const URLS = {
     pluginBundle: "https://github.com/Vibe-Commit/claude-plugin",
     /** The reconnect page `SYSTEM_MESSAGE.credentialRejectedFallback` points at. */
     install: "https://vibecommit.ai/install",
+};
+/**
+ * PR-A T22a: the refusal block for the shared argument check (`src/args.ts`, plan 4.11 DX-2, D-ARGS).
+ * ⚠ `acceptsWhy`, `fixLabel` and `unrecognizedWhat` are DRAFT wording (the plan's own draft for `connect --zzz`, and no exact
+ * copy exists for the rest); they are listed as open copy questions. `nothingRead` is the plan's verbatim sentence.
+ */
+export const ARGS = {
+    unrecognizedWhat: (shown, verb) => `${shown} is not something \`vibecommit ${verb}\` takes.`,
+    /** FB2 (review finding 4): takes the routed help command (`channelCommand`), so a plugin-only machine is never sent to `vibecommit`. */
+    acceptsWhy: (helpCommand) => `Its options are listed under \`${helpCommand}\`.`,
+    didYouMean: (flag) => `Did you mean ${flag}?`,
+    nothingRead: "Nothing was read and nothing was uploaded.",
+    needsValueWhat: (flag) => `${flag} needs a value.`,
+    /** DRAFT copy (open question): the fix line is `vibecommit <verb> --help`. */
+    fixLabel: "See what it takes:",
+    /** DRAFT copy (open question): the fix line is the corrected command (a did-you-mean), printed and never run. */
+    fixLabelCorrected: "Or run:",
+    helpCommand: (verb) => `vibecommit ${verb} --help`,
+    /** DRAFT copy (open question). `names` is the registry's ids, joined by `orList` in `args.ts` (no list is hard-coded here). */
+    agentIdsWhy: (names) => `The agent is one of ${names}.`,
 };
 //# sourceMappingURL=strings.js.map

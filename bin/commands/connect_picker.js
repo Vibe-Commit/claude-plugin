@@ -112,12 +112,21 @@ async function connectPickerRun(ctx, options, deps, here, keys, g) {
         grantedFolders: grantedFolders(ctx.home),
         excludedFolders: excludedFolders(ctx.home),
         folderLabel: (path) => truncatePath(tildePath(path, ctx.home), 46),
+        // D-TEMP (T5): absent in a test context, so the rigs' folders keep their rows; the production context sets the default roots.
+        tempRoots: ctx.tempRoots ?? [],
     });
     // ⛔ `g` IS OFFERED ONLY WHERE THE CREDENTIAL BEAT WOULD MINT (exception 3): no credential at all (an `absent` file, not a faulty
     // one), a terminal, and a browser to sign in with. The `auth` chain passes no browser and always leaves a credential, so it can
     // never reach this; the same gate as `obtainCredential`'s keeps the two in step.
     const offerAccount = account !== null && loaded.kind === "absent" && ctx.stdinIsTty && deps.browser !== undefined;
-    let pick = await choose(ctx, options, deps, model, offerAccount);
+    // T1 (ENG-41): the static block (Found, the screen-reader line, `Not listed here:`) prints once per run. The checklist writes it;
+    // `choose` (both calls, around `g`) and `typedPick` read this flag so a second screen does not repeat it.
+    const shown = { header: false };
+    // 4.5: the switch to the typed prompt explains itself, once, when the checklist declined on its own.
+    const choice = checklistChoice(ctx, options, model);
+    if (choice.kind === "typed" && choice.why !== null)
+        writeLines(ctx.stdout, switchLines(ctx, choice.why));
+    let pick = await choose(ctx, options, deps, model, offerAccount, shown);
     /** The grant block's heading and the repos `g` named, when the list is the account's own. */
     let accountList = null;
     if (pick.kind === "account" && account !== null) {
@@ -135,8 +144,9 @@ async function connectPickerRun(ctx, options, deps, here, keys, g) {
             writeLines(ctx.stdout, [
                 "",
                 ...wrap(minted.snapshot === null ? PICKER.gUnavailable(connectCommandFor(ctx.env, ctx.selfPath)) : PICKER.gEmpty, 2),
+                "",
             ]);
-            pick = await choose(ctx, options, deps, model, false);
+            pick = await choose(ctx, options, deps, model, false, shown);
         }
         else {
             const known = new Set(model.owners.flatMap((group) => group.repos.map((repo) => repo.slug)));
@@ -153,6 +163,12 @@ async function connectPickerRun(ctx, options, deps, here, keys, g) {
     };
     if (pick.kind === "cancel" || pick.kind === "account")
         return abandon(true);
+    if (pick.kind === "quit") {
+        // 4.4: q and Esc leave with exit 0. The machine's own summary when it captures; otherwise the plain line.
+        const on = machineCapture(ctx.home);
+        writeLines(ctx.stdout, ["", ...wrap(on.kind === "on" ? PICKER.noChanges(machineSummary(on)) : PICKER.noChangesPlain, 2)]);
+        return abandon(false);
+    }
     if (pick.kind === "none" || isNoChange(pick.change)) {
         // Enter is "change nothing" (D5): no grant, no credential, and a completed consent flow (§13.7).
         const on = machineCapture(ctx.home);
@@ -298,7 +314,12 @@ async function connectPickerRun(ctx, options, deps, here, keys, g) {
     // The backfill offer. Left out (`deps.backfill`), no offer is made and the ending is the one after a no. The URL follows
     // what LANDED (D19): the conversations list once at least one session was uploaded, whether the run finished or stopped.
     let url = probeUrl(probe);
-    const parentFolders = scanned.folders ?? [];
+    // D-TEMP (T5): the offer leaves out the temporary folders the picker collapsed, unless the person granted them (a granted one is not in
+    // `model.temporaryFolders`). The same classifier as the picker, so the offer and the rows cannot disagree.
+    // The grants are read again here, because a temporary folder granted in THIS run is no longer collapsed.
+    const temporaryPaths = new Set(model.temporaryFolders.map((folder) => folder.path));
+    const grantedAtOffer = new Set(grantedFolders(ctx.home));
+    const parentFolders = (scanned.folders ?? []).filter((folder) => !temporaryPaths.has(folder.path) || grantedAtOffer.has(folder.path));
     if (deps.backfill !== undefined && (onRepos.length > 0 || parentFolders.length > 0) && !askedNoMore) {
         const outcome = await deps.backfill(ctx, onRepos, parentFolders);
         if (outcome.kind !== "declined" && outcome.uploaded > 0)
@@ -325,43 +346,72 @@ function probeUrl(probe) {
     const id = probe.delivery?.kind === "attempted" ? probe.delivery.conversationId : undefined;
     return id === undefined ? URLS.commits : URLS.conversation(id);
 }
-/** The checklist when a person is driving a real terminal (D28); the typed prompt otherwise. */
-function useChecklist(ctx, options, model) {
+function checklistChoice(ctx, options, model) {
     if (options.typed === true || !ctx.stdinIsTty)
-        return false;
+        return { kind: "typed", why: null };
     const out = ctx.stdout;
-    if (out.isTTY !== true || ctx.env.TERM === "dumb")
-        return false;
+    if (out.isTTY !== true)
+        return { kind: "typed", why: null };
+    // FA5: nothing to list means no list on any terminal, so no switch line may promise one (checked before TERM and the width).
+    // A folder counts (4.5), a temporary one too (T5c): a machine whose sessions are all in folders outside a repo gets the checklist.
+    const listed = model.onNow.length + model.owners.length + model.account.length + model.turnedOff.length + model.folders.length + model.temporaryFolders.length;
+    if (listed === 0)
+        return { kind: "typed", why: null };
+    if (ctx.env.TERM === "dumb")
+        return { kind: "typed", why: { kind: "dumb" } };
     // The frame is erased by line count, so a terminal narrower than the frame (which soft-wraps) would leave debris. A width
     // of 0 or none is a terminal that does not say, which is not a narrow one.
     if (out.columns !== undefined && out.columns > 0 && out.columns < 80)
-        return false;
-    return model.onNow.length + model.owners.length + model.account.length + model.turnedOff.length > 0;
+        return { kind: "typed", why: { kind: "narrow", columns: out.columns } };
+    return { kind: "checklist" };
+}
+/** The two muted lines that explain the switch (4.5), wrapped at the window's known width. */
+function switchLines(ctx, why) {
+    // The arrow-key list needs 80 (DESIGN.md §13.4); a `dumb` terminal wraps at the same 80-column rule.
+    const width = why.kind === "narrow" ? why.columns : 80;
+    const first = why.kind === "narrow" ? PICKER.narrowWindow(why.columns) : PICKER.noArrowKeys;
+    const second = PICKER.chooseTyped(connectCommandFor(ctx.env, ctx.selfPath));
+    return [...wrap(first, 2, 2, width), ...wrap(second, 2, 2, width)].map((line) => paint(ctx.colour, "muted", line));
 }
 async function choose(ctx, options, deps, model, 
 /** Slice 2: `g` is a choice here (screen 1a). */
-offerAccount) {
+offerAccount, 
+/** T1: whether the static block has been printed this run (shared with `typedPick`). */
+shown) {
     const nowMs = ctx.now().getTime();
-    if (useChecklist(ctx, options, model)) {
-        const result = await runChecklist(model, { colour: ctx.colour, nowMs, typedCommand: channelCommand(ctx.env, ctx.selfPath, COMMANDS.connectTyped), offerAccount }, { input: deps.checklist?.input ?? process.stdin, output: ctx.stdout, ...deps.checklist });
+    if (checklistChoice(ctx, options, model).kind === "checklist") {
+        const result = await runChecklist(model, {
+            colour: ctx.colour,
+            nowMs,
+            typedCommand: channelCommand(ctx.env, ctx.selfPath, COMMANDS.connectTyped),
+            offerAccount,
+            headerPrinted: shown.header,
+            columns: () => ctx.stdout.columns,
+        }, { input: deps.checklist?.input ?? process.stdin, output: ctx.stdout, ...deps.checklist });
+        // The checklist has printed the static block by now, whatever it resolves with.
+        shown.header = true;
         if (result.kind === "cancel")
             return { kind: "cancel" };
+        if (result.kind === "quit")
+            return { kind: "quit" };
         if (result.kind === "account")
             return { kind: "account" };
         if (result.kind === "done")
             return { kind: "change", change: result.change, noClone: new Set() };
         // `t`: the typed prompt, from the same model.
     }
-    return await typedPick(ctx, model, nowMs, offerAccount);
+    return await typedPick(ctx, model, nowMs, offerAccount, shown);
 }
 /** How many answers in a row the typed prompt will refuse before it gives up. */
 const MAX_MISSES = 10;
 /** The typed prompt (§10.12 "The picker, typed"): re-asks on any token it does not understand, never applying part. */
-async function typedPick(ctx, model, nowMs, offerAccount) {
+async function typedPick(ctx, model, nowMs, offerAccount, shown) {
     const pre = preChange(model);
     let showAll = false;
     for (;;) {
-        writeLines(ctx.stdout, renderTyped(model, { colour: ctx.colour, nowMs, showAll, offerAccount }));
+        writeLines(ctx.stdout, renderTyped(model, { colour: ctx.colour, nowMs, showAll, offerAccount, headerPrinted: shown.header }));
+        // FA4: the static block is printed once per run, so every later typed screen (after `g`, or `more`) starts at its rows.
+        shown.header = true;
         let misses = 0;
         for (;;) {
             const answer = await askOrCancel(ctx, `  ${PICKER.promptMark}`);
@@ -372,6 +422,8 @@ async function typedPick(ctx, model, nowMs, offerAccount) {
                 return { kind: "account" };
             if (parsed.kind === "more") {
                 // `more` reprints with every repo shown and numbered afresh, then asks again. Nothing is chosen yet.
+                // FD7 (review 2): the answer's line is the last thing on screen, so the reprint gets its one blank line here, and only here.
+                writeLines(ctx.stdout, [""]);
                 showAll = true;
                 break;
             }

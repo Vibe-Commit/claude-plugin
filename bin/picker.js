@@ -27,6 +27,8 @@ import { ownerOfSlug, normalizeSlug, normalizeOwner, isLocalSlug } from "./conse
 import { AGENT_HOOKS, SCAN, PICKER, shortDate } from "./copy/index.js";
 import { DIALECTS, agentIsolatesRecords } from "./agents/registry.js";
 import { LABEL_GUTTER, paint, truncateMiddle, wrap } from "./term.js";
+import { GITHUB_HOSTS, HOSTNAME, OWNER, REPO, parseRemoteSlug } from "./git.js";
+import { defaultTempRoots, safeRealpath } from "./temp_roots.js";
 /** D9: each owner group shows at most this many repos before the `+ N more` row. */
 export const GROUP_CAP = 8;
 /** The gap between the name column and the counts, as `scan`'s screen has it. */
@@ -199,7 +201,7 @@ export function buildModel(input) {
     }
     const excludedSet = new Set(input.excludedFolders ?? []);
     const offered = capturable.filter((folder) => !grantedFolders.has(folder.path));
-    const folders = [
+    const candidates = [
         ...offered.map((folder) => ({
             path: folder.path,
             label: folderLabel(folder.path),
@@ -214,6 +216,11 @@ export function buildModel(input) {
             .filter((path) => !offered.some((folder) => folder.path === path))
             .map((path) => ({ path, label: folderLabel(path), sessions: 0, sinceMs: 0, latestMs: 0, agents: emptyAgents(), excluded: true })),
     ];
+    // D-TEMP: temporary folders are classified here, not in `scan`, so the scan's own folders are untouched. Granted ones are never here
+    // (they are `on now` rows above), so a granted temporary folder still shows there.
+    const inTemp = temporaryPredicate(input.tempRoots ?? defaultTempRoots(), input.realpath ?? safeRealpath);
+    const folders = candidates.filter((folder) => !inTemp(folder.path));
+    const temporaryFolders = candidates.filter((folder) => inTemp(folder.path));
     const isOn = (slug) => coveredByGrant(slug) || perCloneSlugs.has(slug);
     const byOwner = new Map();
     for (const repo of repos.values()) {
@@ -250,7 +257,19 @@ export function buildModel(input) {
         notListed: input.notListed,
         found: input.repos.length,
         sawNothing: input.sawNothing,
+        temporaryFolders,
     };
+}
+/**
+ * D-TEMP: is `path` under one of `roots`? Both sides are realpathed, and a root matches whole path segments only (`/tmpx/foo` is not under
+ * `/tmp`). A repository is never tested with this: only folders are.
+ */
+export function temporaryPredicate(roots, realpath = safeRealpath) {
+    // Both the path as given and its realpath are tested, against both forms of each root: a folder that does not exist (a test fixture, or
+    // a path under macOS's `/var/folders`, which realpaths to `/private/var/folders`) still matches its root's spelling.
+    const forms = (path) => [path, realpath(path)].map((p) => p.replace(/\/+$/, ""));
+    const realRoots = roots.flatMap(forms);
+    return (path) => forms(path).some((p) => realRoots.some((root) => p === root || p.startsWith(`${root}/`)));
 }
 /**
  * The numbered rows in screen order. `showAll` is the `more` token: every repo is shown and numbered afresh. Without it
@@ -263,7 +282,9 @@ export function numberedRows(model, showAll) {
         for (const repo of shown)
             rows.push({ kind: "repo", repo });
     }
-    for (const folder of showAll ? model.folders : model.folders.slice(0, GROUP_CAP))
+    // D-TEMP: the temporary folders are numbered only once expanded (`more`), after the folders they follow on screen.
+    const folderRows = showAll ? [...model.folders, ...model.temporaryFolders] : model.folders.slice(0, GROUP_CAP);
+    for (const folder of folderRows)
         rows.push({ kind: "folder", folder });
     for (const row of model.account)
         rows.push({ kind: "account", row });
@@ -271,8 +292,57 @@ export function numberedRows(model, showAll) {
         rows.push({ kind: "off", row });
     return rows;
 }
-const OWNER_TOKEN = /^[^\s/]+(?:\/[^\s/]+)*\/$/u;
-const REPO_TOKEN = /^[^\s/]+(?:\/[^\s/]+)*\/[^\s/]+$/u;
+/** The remote's host and path, for the forms a person pastes: `https://host/path`, `ssh://user@host/path`, `user@host:path`, `host/path`. */
+const REMOTE_FORM = /^(?:[a-z][a-z0-9+.-]*:\/\/)?(?:[^/@]*@)?([^/:]+)(?::\d+)?[:/](.*)$/i;
+/**
+ * D-TEMP's sibling (ENG-1): the fix target for a refused name, which is `parseRemoteSlug`'s own answer for the token, with `https://` put in
+ * front so it spawns nothing (an `https` host never reaches `ssh -G`). Only a GitHub or dotted host has an answer; an SSH alias
+ * (`git@github-work:…`) has none, because only `ssh` could say which host it means.
+ */
+export function fixTarget(token) {
+    const m = REMOTE_FORM.exec(token);
+    if (m === null)
+        return null;
+    const host = m[1].toLowerCase();
+    if (!host.includes(".") && !GITHUB_HOSTS.has(host))
+        return null;
+    return parseRemoteSlug(`https://${host}/${m[2]}`);
+}
+/** A host a name may carry (`host/owner/repo`): it passes the scan's HOSTNAME rule and is not a GitHub host (ENG-43). */
+function isQualifyingHost(host) {
+    return HOSTNAME.test(host) && !GITHUB_HOSTS.has(host.toLowerCase());
+}
+/**
+ * ENG-1 / ENG-37: the ONE name validator, for every input path (the typed prompt now; positional names and `off` later). It implements the
+ * grammar the scan emits: `owner/repo` and `owner/`, and `host/owner/repo` and `host/owner/` when the host is a qualifying host. Refused:
+ * a token with `://`, `:` or `@`, a `.git` ending, a GitHub host first, a dotted two-segment owner, a three-segment token whose first
+ * segment is not a qualifying host, more than three segments, and an empty segment. A refusal carries the fix target (`fixTarget`).
+ */
+export function checkName(token) {
+    const refuse = () => ({ ok: false, target: fixTarget(token) });
+    if (token.includes("://") || token.includes(":") || token.includes("@") || token.endsWith(".git"))
+        return refuse();
+    const trailing = token.endsWith("/");
+    const segments = (trailing ? token.slice(0, -1) : token).split("/");
+    if (segments.some((segment) => segment === ""))
+        return refuse();
+    const repoOk = (repo) => REPO.test(repo) && repo !== "." && repo !== "..";
+    if (trailing) {
+        if (segments.length === 1 && OWNER.test(segments[0]))
+            return { ok: true, kind: "owner", key: normalizeSlug(segments[0]) };
+        if (segments.length === 2 && isQualifyingHost(segments[0]) && OWNER.test(segments[1])) {
+            return { ok: true, kind: "owner", key: normalizeSlug(segments.join("/")) };
+        }
+        return refuse();
+    }
+    if (segments.length === 2 && OWNER.test(segments[0]) && repoOk(segments[1])) {
+        return { ok: true, kind: "repo", key: normalizeSlug(segments.join("/")) };
+    }
+    if (segments.length === 3 && isQualifyingHost(segments[0]) && OWNER.test(segments[1]) && repoOk(segments[2])) {
+        return { ok: true, kind: "repo", key: normalizeSlug(segments.join("/")) };
+    }
+    return refuse();
+}
 /**
  * Parse one typed answer (D8 · 4A). ⛔ **Never applies part of an answer:** any token that is not understood returns
  * `error` naming each such token, and nothing is chosen. `owner/` and `owner/repo` are always accepted, a clone here or
@@ -363,37 +433,37 @@ export function parseTyped(input, model, showAll, offerAccount = false) {
                 else
                     bad.push(PICKER.notOn(token));
             }
-            else if (OWNER_TOKEN.test(remove)) {
-                const name = normalizeOwner(remove);
-                if (grantedOwners.has(name))
-                    stopOwners.add(name);
+            else {
+                const named = checkName(remove);
+                if (!named.ok)
+                    bad.push(token);
+                else if (named.kind === "owner") {
+                    if (grantedOwners.has(named.key))
+                        stopOwners.add(named.key);
+                    else
+                        bad.push(PICKER.notOn(token));
+                }
+                else if (grantedRepos.has(named.key))
+                    stopRepos.add(named.key);
+                else if (cloneSlugs.has(named.key))
+                    stopClones.add(named.key);
                 else
                     bad.push(PICKER.notOn(token));
             }
-            else if (REPO_TOKEN.test(remove)) {
-                const name = normalizeSlug(remove);
-                if (grantedRepos.has(name))
-                    stopRepos.add(name);
-                else if (cloneSlugs.has(name))
-                    stopClones.add(name);
-                else
-                    bad.push(PICKER.notOn(token));
-            }
-            else
+        }
+        else {
+            const named = checkName(token);
+            if (!named.ok)
                 bad.push(token);
-        }
-        else if (OWNER_TOKEN.test(token)) {
-            const name = normalizeOwner(token);
-            if (grantedOwners.has(name))
-                bad.push(PICKER.alreadyOn(token, `-${token}`));
+            else if (named.kind === "owner") {
+                if (grantedOwners.has(named.key))
+                    bad.push(PICKER.alreadyOn(token, `-${token}`));
+                else
+                    addOwners.add(named.key);
+            }
             else
-                addOwners.add(name);
+                addSlug(named.key, token);
         }
-        else if (REPO_TOKEN.test(token)) {
-            addSlug(normalizeSlug(token), token);
-        }
-        else
-            bad.push(token);
     }
     if (bad.length > 0)
         return { kind: "error", tokens: bad };
@@ -488,43 +558,61 @@ function layout(rows) {
 function ownerLine(group, colour) {
     return `  ${paint(colour, "text", `${group.owner}/`)}    ${paint(colour, "text", group.token)}  ${paint(colour, "text", PICKER.ownerAll(group.repos.length))}`;
 }
+/** FD1: `wrap` at `width`, except that a backtick span is one unbreakable word (its inner spaces are held back while wrapping). */
+function wrapKeepingSpans(line, indent, width) {
+    const HELD = "\u0001";
+    const held = line.replace(/`[^`]*`/g, (span) => span.replaceAll(" ", HELD));
+    return wrap(held, indent, indent, width).map((l) => l.replaceAll(HELD, " "));
+}
 /** The `Not listed here:` block, muted, or nothing. */
-export function notListedBlock(model, colour) {
+export function notListedBlock(model, colour, width) {
     if (model.notListed.length === 0)
         return [];
+    // FA2: a checklist passes its frame width, so a long line wraps instead of being cut. The typed screen passes none and is unchanged.
+    // FD1: a backtick span (a command) is never broken across lines, so the command is drawn whole.
+    const body = (line) => (width === undefined ? [`    ${line}`] : wrapKeepingSpans(line, 4, width));
     return [
         "",
         paint(colour, "muted", `  ${SCAN.notListed}`),
-        ...model.notListed.map((line) => paint(colour, "muted", `    ${line}`)),
+        ...model.notListed.flatMap((line) => body(line).map((l) => paint(colour, "muted", l))),
     ];
 }
 /** The screen above the prompt, as lines — the typed picker (§10.12 "The picker, typed"). */
 export function renderTyped(model, options) {
     const { colour, nowMs, showAll } = options;
-    const lines = [""];
+    // `headerPrinted`: the static block was printed already (by the checklist, or an earlier typed screen of this run). Then this screen
+    // starts at its rows, and the blank line before them is the one the block ends with (T1, ENG-41; FA4: no doubled blank line).
+    const header = options.headerPrinted !== true;
+    const lines = header ? [""] : [];
     if (model.found === 0 &&
         model.onNow.length === 0 &&
         model.turnedOff.length === 0 &&
         model.owners.length === 0 &&
         model.folders.length === 0 &&
+        model.temporaryFolders.length === 0 &&
         model.account.length === 0) {
         return [
             ...lines,
             ...wrap(model.sawNothing ? PICKER.emptyNone : SCAN.noneListable, 2).map((l) => paint(colour, "strong", l)),
             ...(model.sawNothing ? [...wrap(PICKER.emptyExpected, 2), ...wrap(AGENT_HOOKS.codexTrust, 2)] : []),
-            ...notListedBlock(model, colour),
+            ...(header ? notListedBlock(model, colour) : []),
             "",
             ...wrap(model.sawNothing ? PICKER.emptyType : PICKER.emptyListable, 2),
             ...(options.offerAccount === true ? wrap(PICKER.gLine, 2) : []),
             `  ${PICKER.enterNothing}`,
         ];
     }
-    lines.push(...wrap(SCAN.found(model.found), 2).map((l) => paint(colour, "strong", l)), "");
+    if (header)
+        lines.push(...wrap(SCAN.found(model.found), 2).map((l) => paint(colour, "strong", l)));
+    if (header)
+        lines.push("");
     const onNow = model.onNow.map((row) => onNowDisplay(row, nowMs));
     const shown = (g) => (showAll ? g.repos : g.repos.slice(0, GROUP_CAP));
     const repoRows = model.owners.flatMap((g) => shown(g).map((r) => repoDisplay(r, nowMs)));
     const shownFolders = showAll ? model.folders : model.folders.slice(0, GROUP_CAP);
     const folderRows = shownFolders.map((f) => folderDisplay(f, nowMs));
+    // D-TEMP: expanded (`more`), the temporary folders are listed after the folders; unexpanded, they are one collapsed row.
+    const tempRows = showAll ? model.temporaryFolders.map((f) => folderDisplay(f, nowMs)) : [];
     const account = model.account.map((row) => ({
         name: row.kind === "owner" ? `${row.key}/` : row.key,
         meta: PICKER.onAccountHint,
@@ -535,7 +623,7 @@ export function renderTyped(model, options) {
         meta: PICKER.turnOnHint,
         agents: "",
     }));
-    const { cut, column, withAgents } = layout([...onNow, ...repoRows, ...folderRows, ...account, ...off]);
+    const { cut, column, withAgents } = layout([...onNow, ...repoRows, ...folderRows, ...tempRows, ...account, ...off]);
     const row = (n, display) => `${String(n).padStart(6)}  ${paint(colour, "text", cut(display.name).padEnd(column))}${" ".repeat(GAP)}${paint(colour, "muted", withAgents(display))}`;
     let n = 0;
     if (model.onNow.length > 0) {
@@ -552,13 +640,18 @@ export function renderTyped(model, options) {
             lines.push(paint(colour, "muted", `     +  ${PICKER.moreTyped(hidden, group.owner)}`));
         }
     }
-    if (folderRows.length > 0) {
+    if (folderRows.length > 0 || model.temporaryFolders.length > 0) {
         lines.push(paint(colour, "muted", `  ${PICKER.folders}`));
         for (const d of folderRows)
             lines.push(row(++n, d));
         const hiddenFolders = model.folders.length - shownFolders.length;
         if (hiddenFolders > 0)
             lines.push(paint(colour, "muted", `     +  ${PICKER.moreFoldersTyped(hiddenFolders)}`));
+        for (const d of tempRows)
+            lines.push(row(++n, d));
+        if (!showAll && model.temporaryFolders.length > 0) {
+            lines.push(paint(colour, "muted", `     +  ${PICKER.temporaryFoldersTyped(model.temporaryFolders.length)}`));
+        }
     }
     if (account.length > 0) {
         lines.push(paint(colour, "muted", `  ${PICKER.onAccount}`));
@@ -570,7 +663,9 @@ export function renderTyped(model, options) {
         for (const d of off)
             lines.push(row(++n, d));
     }
-    lines.push(...notListedBlock(model, colour), "");
+    if (header)
+        lines.push(...notListedBlock(model, colour));
+    lines.push("");
     lines.push(`  ${paint(colour, "text", PICKER.choose(model.owners.length > 0))}`);
     if (options.offerAccount === true)
         lines.push(...wrap(PICKER.gLine, 2).map((l) => paint(colour, "text", l)));
@@ -581,9 +676,21 @@ export function renderTyped(model, options) {
     lines.push(`  ${paint(colour, "text", preSlug === null ? PICKER.enterNothing : PICKER.enterThisRepo(preSlug))}`);
     return lines;
 }
-/** The `Not understood:` line the prompt prints before it asks again. */
+/** The `Not understood:` line the prompt prints before it asks again, and the fix line under it for a refused name. */
 export function notUnderstoodLines(tokens) {
-    return wrap(PICKER.notUnderstood(tokens.join(", ")), 2);
+    const lines = wrap(PICKER.notUnderstood(tokens.join(", ")), 2);
+    // ENG-37 (FA1): a refused NAME re-asks with the name to TYPE at the prompt. This build refuses positional names, so no `connect`
+    // command is printed. Only a raw token (no spaces: the formatted refusals of `alreadyOn`, `notOn` and `noRow` contain spaces) that
+    // has a name's separator is checked; any other token keeps the one line, and a refusal with no fix target prints no extra line.
+    for (const token of tokens) {
+        if (!/^\S+$/u.test(token) || !/[/:@]/u.test(token))
+            continue;
+        const removal = token.startsWith("-");
+        const named = checkName(token.replace(/^-/u, ""));
+        if (!named.ok && named.target)
+            lines.push(`  ${PICKER.typeInstead(`${removal ? "-" : ""}${named.target}`)}`);
+    }
+    return lines;
 }
 /**
  * The `You chose:` block — the thing the y/N is asking about (D7 · 3A), on the §13.5 label gutter. One label per kind of

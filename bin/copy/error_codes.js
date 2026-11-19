@@ -28,6 +28,7 @@ export const ERROR_CODES = {
     NODE_TOO_OLD: { summary: "The Node runtime is older than this version supports." },
     UNKNOWN_COMMAND: { summary: "The first argument is not a vibecommit command." },
     UNRECOGNIZED_ARGUMENT: { summary: "An argument the command does not take." },
+    ARGUMENT_NEEDS_VALUE: { summary: "An argument that needs a value was given without one." },
     // — the repository and the machine —
     NOT_A_REPO: { summary: "The command was run outside a git work tree." },
     NOT_CONNECTED: { summary: "This repository is not allowed to be captured." },
@@ -85,7 +86,8 @@ export const ERROR_CODES = {
     RECORD_ANSWER_UNREADABLE: { summary: "The record service answered in a way this version cannot read." },
     WHY_NEEDS_FILE_AND_LINE: { summary: "`why` needs a file and a line number." },
     BLAME_FAILED: { summary: "`git blame` could not attribute the line." },
-    REPORT_NEEDS_SINCE: { summary: "`report` needs a start date." },
+    // T16: retired. The window has a default now, so no path raises this; the code is never reused (the contract header).
+    REPORT_NEEDS_SINCE: { summary: "`report` needs a start date.", retired: true },
     REPORT_SINCE_UNREADABLE: { summary: "The start date could not be read." },
     REPORT_REF_UNNAMEABLE: { summary: "`report` needs a ref it can name." },
     REPORT_REACHABILITY_UNKNOWN: { summary: "Whether a captured commit is reachable could not be determined." },
