@@ -39,7 +39,8 @@ import { DEFAULT_INTERVAL_S, pollDeviceToken, SLOW_DOWN_STEP_S, startDeviceAutho
 import { machineLabel, mintUrl, requestMint } from "../oauth/mint.js";
 import { HTTP_TIMEOUT_MS, openBrowser as platformOpenBrowser } from "../oauth/signin.js";
 import { paint, renderErrorBlock, wrap } from "../term.js";
-import { finishMint } from "./finish_mint.js";
+import { terminalSafe } from "../printable.js";
+import { connectMintBlock, finishMint, writeAheadOf } from "./finish_mint.js";
 import { writeLines } from "./context.js";
 /** Poll failures in a row (a deploy, a blip) before the wait gives up on the service. */
 const MAX_TRANSIENT = 3;
@@ -77,6 +78,22 @@ function errorBlock(ctx, code, what, why, fixLabel, fixes) {
         ...(fixLabel === undefined || fixes === undefined ? {} : { fixLabel, fixes }),
     }, ctx.colour);
 }
+/**
+ * prc1 S9(b), DX-7 on connect's path: an unreachable device service names the host it tried, the variable by NAME (never its value),
+ * and says to retry once, then check the network. The device's own block otherwise, byte-identical.
+ */
+function unreachableBlock(ctx, input, rerun, code, what, why) {
+    if (input.connectPath === undefined)
+        return errorBlock(ctx, code, what, why, DEVICE.retryFix, [rerun]);
+    return renderErrorBlock({
+        kind: "bad",
+        code,
+        what,
+        why: [why, AUTH.unreachableTried(terminalSafe(new URL(input.endpoint).host))],
+        fixLabel: AUTH.unreachableFix,
+        fixes: [rerun],
+    }, ctx.colour);
+}
 /** The static waiting block (plan decision 4A): URL accent, code strong, the rest muted. */
 function waitingBlock(ctx, grant) {
     const expiresAt = new Date(ctx.now().getTime() + grant.expiresInS * 1000);
@@ -101,7 +118,9 @@ export async function deviceCredential(ctx, input, deps = {}) {
     if (discovery.kind !== "ok") {
         writeLines(ctx.stderr, [
             "",
-            ...errorBlock(ctx, "SIGNIN_SERVICE_NOT_FOUND", SIGNIN.noServerWhat, discovery.kind === "unreachable" ? SIGNIN.noServerUnreachableWhy : SIGNIN.noServerMalformedWhy, DEVICE.retryFix, [rerun]),
+            ...(discovery.kind === "unreachable"
+                ? unreachableBlock(ctx, input, rerun, "SIGNIN_SERVICE_NOT_FOUND", SIGNIN.noServerWhat, SIGNIN.noServerUnreachableWhy)
+                : errorBlock(ctx, "SIGNIN_SERVICE_NOT_FOUND", SIGNIN.noServerWhat, SIGNIN.noServerMalformedWhy, DEVICE.retryFix, [rerun])),
         ]);
         return { kind: "failed" };
     }
@@ -127,7 +146,7 @@ export async function deviceCredential(ctx, input, deps = {}) {
             writeLines(ctx.stderr, ["", ...errorBlock(ctx, "SIGNIN_CODE_REFUSED", DEVICE.refusedWhat, DEVICE.refusedWhy, DEVICE.retryFix, [rerun])]);
             return { kind: "failed" };
         case "unreachable":
-            writeLines(ctx.stderr, ["", ...errorBlock(ctx, "SIGNIN_UNREACHABLE", DEVICE.unreachableWhat, DEVICE.unreachableWhy, DEVICE.retryFix, [rerun])]);
+            writeLines(ctx.stderr, ["", ...unreachableBlock(ctx, input, rerun, "SIGNIN_UNREACHABLE", DEVICE.unreachableWhat, DEVICE.unreachableWhy)]);
             return { kind: "failed" };
         case "malformed":
             writeLines(ctx.stderr, ["", ...errorBlock(ctx, "SIGNIN_ANSWER_UNUSABLE", DEVICE.malformedWhat, DEVICE.malformedWhy, SIGNIN.malformedFix, [rerun])]);
@@ -161,7 +180,7 @@ export async function deviceCredential(ctx, input, deps = {}) {
                 writeLines(ctx.stderr, ["", ...errorBlock(ctx, "SIGNIN_CODE_INVALID", DEVICE.invalidWhat, DEVICE.invalidWhy, DEVICE.retryFix, [rerun])]);
                 return { kind: "failed" };
             case "unreachable":
-                writeLines(ctx.stderr, ["", ...errorBlock(ctx, "SIGNIN_UNREACHABLE", DEVICE.unreachableWhat, DEVICE.unreachableWhy, DEVICE.retryFix, [rerun])]);
+                writeLines(ctx.stderr, ["", ...unreachableBlock(ctx, input, rerun, "SIGNIN_UNREACHABLE", DEVICE.unreachableWhat, DEVICE.unreachableWhy)]);
                 return { kind: "failed" };
             case "malformed":
                 writeLines(ctx.stderr, ["", ...errorBlock(ctx, "SIGNIN_ANSWER_UNUSABLE", DEVICE.malformedWhat, DEVICE.malformedWhy, SIGNIN.malformedFix, [rerun])]);
@@ -179,6 +198,12 @@ export async function deviceCredential(ctx, input, deps = {}) {
         return { kind: "declined" };
     }
     if (minted.kind !== "ok") {
+        // T10 (B5, DX-7): connect's path names the recovery for the failures it can; every other caller keeps today's block.
+        const connectBlock = input.connectPath === undefined ? null : connectMintBlock(minted, input.connectPath, input.endpoint, ctx.now());
+        if (connectBlock !== null) {
+            writeLines(ctx.stderr, ["", ...renderErrorBlock(connectBlock, ctx.colour)]);
+            return { kind: "failed" };
+        }
         writeLines(ctx.stderr, [
             "",
             ...errorBlock(ctx, minted.kind === "refused" && minted.error === "rate_limited" ? "MINT_RATE_LIMITED" : "MINT_FAILED", AUTH.mintFailedWhat, minted.kind === "unreachable"
@@ -200,7 +225,10 @@ export async function deviceCredential(ctx, input, deps = {}) {
         // The approver is not necessarily the person at this terminal: the question is never skipped (A4 §3).
         confirm: "always",
         ticket: { account: polled.account, orgName: polled.orgName },
-        rerun,
+        // T10: connect's own command on connect's path; the device's `connect --device` line everywhere else (unchanged).
+        rerun: input.connectPath?.rerun ?? rerun,
+        ...(input.connectPath === undefined ? {} : { connectPath: input.connectPath }),
+        ...writeAheadOf(input.connectPath),
         ...(input.scope === undefined ? {} : { scope: input.scope }),
         ...(input.hold === undefined ? {} : { hold: input.hold }),
     });

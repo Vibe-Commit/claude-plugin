@@ -12,13 +12,17 @@
 import { ERRORS, STATUS } from "../copy/index.js";
 import { authCommandFor } from "../install.js";
 import { paint, wrap } from "../term.js";
-/** The reason lines for a sync answer that STOPPED the write, or `null` when the kind has no reason line of its own. */
-export function stoppedSyncReason(ctx, result) {
+/**
+ * The reason lines for a sync answer that STOPPED the write, or `null` when the kind has no reason line of its own.
+ * `rerun` is the command a 401 names: `auth` for every verb that renews (`status`, `off`), `connect` on connect's own path (T10, 4.12).
+ */
+export function stoppedSyncReason(ctx, result, rerun) {
     if (result.kind === "rejected") {
         return wrap(STATUS.pendingRejectedValue(Math.max(1, result.pendingRejected ?? 0)), 2).map((line) => paint(ctx.colour, "muted", line));
     }
     if (result.kind === "unauthorized") {
-        return [paint(ctx.colour, "muted", `  ${ERRORS.authFatal}`), `    ${paint(ctx.colour, "accent", authCommandFor(ctx.env, ctx.selfPath))}`];
+        const fix = rerun ?? authCommandFor(ctx.env, ctx.selfPath);
+        return [paint(ctx.colour, "muted", `  ${ERRORS.authFatal}`), `    ${paint(ctx.colour, "accent", fix)}`];
     }
     return null;
 }

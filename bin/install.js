@@ -27,6 +27,7 @@
 import { accessSync, chmodSync, constants, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { gitProbe } from "./git.js";
+import { terminalSafe } from "./printable.js";
 /** The command name D55 kept. */
 const BIN = "vibecommit";
 /**
@@ -61,8 +62,11 @@ export function installChannel(env, selfPath) {
     if (classifyInstall(env, selfPath).kind === "ours")
         return { kind: "npm", command: BIN };
     if (existsSync(join(dirname(dirname(self)), PLUGIN_BUNDLE_PIN))) {
-        // Quoted only when it has to be: a plugin cache path can hold a space.
-        return { kind: "plugin", command: /[\s"'$`\\]/.test(self) ? `node "${self.replace(/(["$`\\])/g, "\\$1")}"` : `node ${self}` };
+        // F4 (CR-PRB3): this command is only ever DISPLAYED (every consumer prints it; the hook and config writers take the raw selfPath, and
+        // nothing spawns it), so the path is cleaned here, once, BEFORE the quoting decision and the escape: removing a control character
+        // must not leave a quote or a backslash unbalanced. Quoted only when it has to be: a plugin cache path can hold a space.
+        const shown = terminalSafe(self);
+        return { kind: "plugin", command: /[\s"'$`\\]/.test(shown) ? `node "${shown.replace(/(["$`\\])/g, "\\$1")}"` : `node ${shown}` };
     }
     return { kind: "npm", command: BIN };
 }
@@ -396,5 +400,30 @@ function readIfPresent(path) {
     catch {
         return null;
     }
+}
+/** The quoted binary of one of OUR hook lines, as `hookScript` writes it: `shellQuote`'s grammar, then the hook's name. */
+const OUR_HOOK_BINARY = /'((?:[^']|'\\'')*)' (?:post-commit|post-rewrite)\b/g;
+/**
+ * The binary one of our commit hooks names when it no longer exists and is not `selfPath` (CR-PRB T9a, the stale arm of
+ * the setup predicate's (b)). Our hook bakes in the absolute path and swallows every failure, and `inspectCaptureHooks`
+ * checks the marker only, so a removed binary reads as `on` and links nothing. Read-only. `null` when no hook of ours
+ * names a missing binary.
+ */
+export function staleCommitHookBinary(toplevel, selfPath, resolved) {
+    // `resolved`: the hooks directory the caller already resolved (one git probe per clone, not one per check).
+    const hooksDir = resolved !== undefined ? resolved : resolveHooksDir(toplevel);
+    if (hooksDir === null)
+        return null;
+    for (const name of ["post-commit", "post-rewrite"]) {
+        const text = readIfPresent(join(hooksDir, name));
+        if (text === null || !text.includes(HOOK_MARKER))
+            continue;
+        for (const match of text.matchAll(OUR_HOOK_BINARY)) {
+            const binPath = match[1].replace(/'\\''/g, "'");
+            if (binPath !== selfPath && !existsSync(binPath))
+                return binPath;
+        }
+    }
+    return null;
 }
 //# sourceMappingURL=install.js.map

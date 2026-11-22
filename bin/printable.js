@@ -60,4 +60,12 @@ export function terminalSafe(text, multiline = false) {
     }
     return out;
 }
+/**
+ * N3 (c) (CR-PRB2): the ONE intake predicate for a name the server sends. A name is kept only when printing it changes nothing, so a name
+ * with a control, format or bidi character (or a newline) is dropped everywhere it could be shown, granted or written. Used by the snapshot
+ * parse (`grants_sync.ts`), the stored account state (`consent.ts`) and the joining question (`connect_account.ts`).
+ */
+export function isPrintableName(name) {
+    return terminalSafe(name) === name;
+}
 //# sourceMappingURL=printable.js.map

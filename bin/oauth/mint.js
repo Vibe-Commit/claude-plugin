@@ -72,6 +72,13 @@ export function machineLabel(hostname) {
  * refused before the server touches the table, so a retry cannot leave two live
  * credentials where the user expected one.
  */
+/** A `Retry-After` header as whole seconds (delta-seconds, the form the mint route sends), or null when absent or unusable. */
+function retryAfterSeconds(raw) {
+    if (raw === null || !/^\d+$/.test(raw.trim()))
+        return null;
+    const seconds = Number.parseInt(raw.trim(), 10);
+    return seconds > 0 ? seconds : null;
+}
 export async function requestMint(endpoint, 
 // A session's access token (the loopback path) or a device approval's `vcmt_` ticket (`CR-234`): the
 // route takes either, and this function only ever spends it as the bearer.
@@ -115,7 +122,8 @@ access, label, deps) {
         const error = typeof doc.error === "string" ? doc.error : "";
         if (res.status === 403 && error === "client_not_permitted")
             return { kind: "wrong-client" };
-        return { kind: "refused", status: res.status, error };
+        const retryAfterS = res.status === 429 ? retryAfterSeconds(res.headers.get("retry-after")) : null;
+        return { kind: "refused", status: res.status, error, ...(retryAfterS === null ? {} : { retryAfterS }) };
     }
     if (typeof doc.token !== "string" || !MINTED_SHAPE.test(doc.token))
         return { kind: "malformed" };

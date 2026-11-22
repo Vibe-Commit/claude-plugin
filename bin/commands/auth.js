@@ -52,36 +52,27 @@
  * ⚠ So there is no path on which `CR-226` makes the pre-existing flow worse:
  * every failure lands on the prompt that was the whole verb before it.
  *
- * ## ⭐ Inside a git work tree, a save CONTINUES INTO `connect` (0.6.0, `CR-236`)
+ * ## A save ENDS here: `auth` never continues into `connect` (4.12, ENG-25)
  *
- * `/install` and this verb's own ending used to make a new user run two commands back to back — `auth`,
- * then `connect` — for what is one intent. So on a TERMINAL, inside any git work tree
- * (`resolveProjectKeys(cwd) !== null`, the precondition `connect` checks for itself), a SAVED credential
- * goes straight on into `connect`, which asks its own consent question first, and `auth` returns
- * `connect`'s exit code. The gate (`shouldConnect`) is checked on BOTH save paths — the browser's `saved`
- * result and the TTY paste.
- *
- * ⛔ Never on `--stdin` or a non-TTY: CI must keep exit 0 and never meet a consent refusal. Never on
- * `declined`, an empty paste or a wrong-class paste: nothing was saved. Outside a repo the output and
- * the exit are byte-identical to before — that is the escape hatch for a renewal that should not touch
- * the repo you are standing in.
- *
- * ⛔ **NEVER A SECOND SIGN-IN.** `src/index.ts` hands the chained `connect` NO `browser`, so an `absent`
- * credential falls to its warning and never to a mint; this verb just saved one, so it is not absent.
- * `test/auth-connect-chain.test.ts` brace-matches the inner call to keep it so.
+ * This reverses `CR-236` and D32 · 26A. A save saves or replaces the credential, prints ONE next-step line
+ * and stops. `connect` is the one front door: it signs in if it must and chooses what to capture. So `auth`
+ * takes no `connect` dep, and `test/auth-connect-chain.test.ts` pins that no save reaches one.
  *
  * @provenance vibecommit-mcp src/transport/server.ts — POST /oauth/ingest-credential is the mint route, verified
  * @provenance vibecommit-web app/api/ingest-credentials/route.ts — the dashboard producer the paste path still serves, verified
  */
-import { AUTH, DEVICE, PICKER, URLS } from "../copy/index.js";
+import { AUTH, COMMANDS, DEVICE, PICKER, URLS } from "../copy/index.js";
 import { renderVerbHelp } from "../verb_help.js";
 import { authCommandFor, channelCommand } from "../install.js";
 import { writeLines } from "./context.js";
 import { EXIT } from "../exit.js";
 import { INGEST_TOKEN_PREFIX, IngestCredential, saveCredential } from "../credential.js";
-import { readGrants } from "../consent.js";
+import { isCaptureAllowed, ownerOfSlug, readGrants, readPendingOffer, slugGrantedHere } from "../consent.js";
+import { onceRepoSlug } from "../git.js";
+import { grantedFolders } from "../folder_grants.js";
 import { machineCapture, machineSummary } from "../machine_state.js";
 import { credentialsPath } from "../paths.js";
+import { setupState } from "../setup_state.js";
 import { resolveProjectKeys } from "../project.js";
 import { paint, renderErrorBlock, tildePath, wrap } from "../term.js";
 /**
@@ -195,42 +186,97 @@ export async function auth(ctx, argv, deps = {}) {
     return await saved(ctx, deps, piped);
 }
 /**
- * The one confirmation, whichever path wrote the file — and the chain's single gate.
+ * The line a terminal `auth` that does not chain prints after a save, for the setup state it found (4.12, ENG-25). Pure.
+ * (a) cannot hold right after a save (4.4a's per-caller rule); (b), (c) and (f) can. An `unknown` finding gets the
+ * plain line: no guess about the hooks. The plain line is `PICKER.authStays`, the text `auth` has always printed.
+ */
+export function setupStayLines(finding, summary, connect) {
+    if (finding.kind === "checked" && finding.noAgentHooks)
+        return wrap(AUTH.setupNoAgentHooks(connect), 2);
+    // `repair` is (b) or (c) here: `auth` passes no sync-unauthorized flag, so (e) cannot hold. (b) is the commit hook; (c) an agent.
+    if (finding.kind === "checked" && finding.repair)
+        return wrap(AUTH.setupRepairs(summary, connect), 2);
+    return wrap(PICKER.authStays(summary), 2);
+}
+/**
+ * The setup line for a terminal save on a machine that captures (4.12, ENG-25). Read-only, with no account sync. Inside a git work
+ * tree the commit hook is checked for THAT toplevel, so (b) can hold there; outside one no toplevel is probed.
+ */
+function staysLines(ctx, summary) {
+    const keys = resolveProjectKeys(ctx.cwd);
+    // prc1 W4: only a worktree that capture admits is checked for repair (4.4a). An ungranted repo's hook is not capture's to repair.
+    const admitted = keys !== null && isCaptureAllowed(ctx.home, keys, onceRepoSlug(keys.worktree));
+    const finding = setupState({
+        home: ctx.home,
+        env: ctx.env,
+        selfPath: ctx.selfPath,
+        grantsOn: true,
+        toplevels: keys !== null && admitted ? [keys.worktree] : [],
+        syncUnauthorized: false,
+    });
+    return setupStayLines(finding, summary, channelCommand(ctx.env, ctx.selfPath, COMMANDS.connect));
+}
+/**
+ * The next-step line after a terminal save (4.12, ENG-25, D-SIGNIN). A machine with nothing on, or with setup unfinished,
+ * gets `Next, choose what to capture: <connect>`. A machine that captures gets the stays line, with its repair when a hook needs one.
+ * An unreadable `grants.json` is not "on", so it gets the first line and never a claim that capture is on.
+ */
+function nextLines(ctx, capture) {
+    if (capture.kind === "on")
+        return staysLines(ctx, machineSummary(capture));
+    return wrap(AUTH.setupNoAgentHooks(channelCommand(ctx.env, ctx.selfPath, COMMANDS.connect)), 2);
+}
+/**
+ * The "Earlier sessions … weren't offered" line (4.12, ENG-25, ENG-44): what a `connect` whose sign-in failed left in
+ * `pending_offer`. Built ONLY from the entries still granted: an owner still in `owners`; a repo still granted (listed, or under a
+ * granted owner) and not turned off, and not counted again under a granted owner; a folder still granted. The count goes through
+ * `PICKER.summary`, the formatter `machineSummary` uses, but over these entries and not the whole machine. Null when none is still
+ * granted. Reads only: `auth` never writes or clears `grants.json` (ENG-44).
+ */
+function earlierNotOfferedLine(ctx) {
+    const pending = readPendingOffer(ctx.home);
+    if (pending.length === 0)
+        return null;
+    const read = readGrants(ctx.home);
+    if (read.kind !== "ok")
+        return null;
+    const grants = read.grants;
+    const folders = new Set(grantedFolders(ctx.home));
+    const owners = pending.filter((e) => e.kind === "owner" && grants.owners.includes(e.value)).map((e) => e.value);
+    const granted = new Set(owners);
+    // A repo counts only if the shared check says consent still names it, with no deny list (this file's and the account's) naming it.
+    const repos = pending.filter((e) => e.kind === "repo" && !granted.has(ownerOfSlug(e.value)) && slugGrantedHere(ctx.home, e.value)).length;
+    const folderCount = pending.filter((e) => e.kind === "folder" && folders.has(e.value)).length;
+    // Nothing still granted is no line at all. (`PICKER.summary` returns "0 repos" for zeros, so the count is what is tested.)
+    if (owners.length + repos + folderCount === 0)
+        return null;
+    const summary = PICKER.summary(owners.length, repos, folderCount);
+    return wrap(AUTH.earlierNotOffered(summary, channelCommand(ctx.env, ctx.selfPath, COMMANDS.backfill)), 2);
+}
+/**
+ * The one confirmation, whichever path wrote the file. It prints the saved block, then, on a terminal, one next-step line
+ * (`nextLines`) and any "Earlier sessions" line, and returns EXIT.ok. It never continues into `connect` (4.12).
  *
- * `shouldConnect` is read here, AFTER a save and nowhere else, so `declined`, empty and wrong-class input
- * (which return before this) can never chain. When it holds, the "Next, connect a repository" fix line is
- * dropped — `connect`'s own output follows — and `connect`'s exit code is returned. When it does not, the
- * block and the exit are exactly what they were.
+ * A piped or `--stdin` `auth` prints today's saved block with its next-step fix and nothing else (L10). ⛔ It never clears
+ * `pending_offer` and never writes `grants.json`.
  */
 async function saved(ctx, deps, piped, notes = []) {
-    // 0.7.0, D32 · 26A (supersedes only L6's "outside a repository" clause). Inside a work tree the chain is unchanged (L2).
-    // Outside one, the continuation is the picker flow, and only on a machine that has nothing captured yet; a machine that
-    // already captures prints one line and no picker. ⛔ BOTH of 0.6.0's other guards stay: `piped` (`--stdin`, or no
-    // terminal) NEVER continues, so a CI runner with no grant still saves the credential and exits 0 instead of reaching the
-    // non-terminal refusal and exiting 2; and the continuation gets no `browser` (`index.ts` hands `connect` none), so a
-    // second sign-in cannot start.
-    const inRepo = resolveProjectKeys(ctx.cwd) !== null;
-    const capture = inRepo || piped || deps.connect === undefined ? null : machineCapture(ctx.home);
-    const shouldConnect = !piped && deps.connect !== undefined && (inRepo || capture?.kind === "none");
-    const staysOn = capture?.kind === "on";
+    const capture = piped ? null : machineCapture(ctx.home);
+    const next = capture === null ? [] : ["", ...nextLines(ctx, capture)];
+    const earlier = piped ? null : earlierNotOfferedLine(ctx);
     writeLines(ctx.stdout, [
         ...renderErrorBlock({
             kind: "ok",
             what: AUTH.savedWhat,
             why: [AUTH.savedWhy(tildePath(credentialsPath(ctx.home), ctx.home)), ...notes],
-            ...(shouldConnect || staysOn
-                ? {}
-                : { fixLabel: AUTH.nextLabel, fixes: [channelCommand(ctx.env, ctx.selfPath, AUTH.nextCommand)] }),
+            ...(piped ? { fixLabel: AUTH.nextLabel, fixes: [channelCommand(ctx.env, ctx.selfPath, AUTH.nextCommand)] } : {}),
         }, ctx.colour),
-        ...(capture?.kind === "on" ? ["", ...wrap(PICKER.authStays(machineSummary(capture)), 2)] : []),
+        ...next,
+        ...(earlier === null ? [] : ["", ...earlier]),
     ]);
-    if (shouldConnect && deps.connect !== undefined)
-        return await deps.connect(ctx);
-    // Not chaining (the chained `connect` syncs for itself): this is the only other place a credential is saved, so it is the other
-    // place a new credential row is synced. ⛔ It makes no prompt and prints nothing, so a piped or no-terminal `auth` (which never
-    // continues, D32 guard 1) is as quiet as before; a failure is silent and the exit stays what it was.
-    // ⛔ A piped, `--stdin` or no-terminal `auth` does NOT sync (L10: "with `--stdin`, or with no terminal, it only saves the credential"): a
-    // sync sends this machine's grants, which is more than saving. R3-7 is for a person at a terminal.
+    // The only other place a credential is saved, so the only other place a new credential row is synced. ⛔ Only for a person at a
+    // terminal: a piped or `--stdin` `auth` only saves (L10), and a sync sends this machine's grants, which is more than saving.
+    // It makes no prompt and prints nothing; a failure is silent and the exit stays what it was.
     if (!piped)
         await syncNewCredential(ctx, deps);
     return EXIT.ok;

@@ -107,11 +107,18 @@ export function captureBasis(home, slug) {
         const name = normalizeSlug(slug);
         const owner = ownerOfSlug(name);
         if (read.grants.owners.includes(owner))
-            return { kind: "owner", owner };
+            return { kind: "owner", owner, turnedOff: deniedUnder(home, read.grants, owner) };
         if (read.grants.repos.includes(name))
             return { kind: "repo" };
     }
     return { kind: "clone" };
+}
+/** The distinct repositories under `owner` that the capture decision denies (`isCaptureAllowed`'s deny lists, in one place). */
+function deniedUnder(home, grants, owner) {
+    const account = readAccountState(home);
+    const lists = [grants.excluded, grants.refused, account.refused, account.account?.excluded ?? []];
+    const names = new Set(lists.flat().map(normalizeSlug).filter((name) => !isLocalSlug(name) && ownerOfSlug(name) === owner));
+    return names.size;
 }
 /**
  * The granted folders `status` names as refused: what the target records stopped in the last `sinceMs`, MINUS any folder that is no
