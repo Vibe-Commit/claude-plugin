@@ -32,12 +32,12 @@ export const HELP = {
     short: {
         connect: "Choose which repositories to capture. Signs in if needed.",
         backfill: "Upload earlier sessions still on this machine. Optional.",
-        auth: "Renew or replace this machine's credential.",
+        auth: "Sign in again, or replace this machine's credential.",
         status: "Show what is captured and when it last uploaded.",
         scan: "List repositories coding agents ran in. Uploads nothing.",
         why: "Show the conversation behind the commit that changed a line.",
         report: "Show this repository's capture coverage.",
-        off: "Stop capturing for this repo.",
+        off: "Stop capturing a repository: this one, or one you name.",
         finalize: "Close a finished session so its last commits can be recorded.",
     },
     /** The top-level help's two channel lines (CEO-13): the command is passed through `channelCommand`, so a plugin install prints its own. */
@@ -48,10 +48,9 @@ export const HELP = {
     commands: {
         // `CR-216/U2`. FIRST in the list by habit, not by sequence: that "nothing for `connect` to use until
         // this has run" reason has been false since `CR-226` (`connect` signs in itself on a machine with no
-        // credential). `connect` is the golden path; this verb renews or replaces the credential, and on a terminal it
-        // then continues into `connect` — inside a git work tree, or (0.7.0, D32) outside one on a machine that captures
-        // nothing yet. With `--stdin` or no terminal it saves the credential and stops there.
-        auth: "Renew or replace this machine's credential. On a terminal it then goes on to connect: in a git repo, or on a machine that captures nothing yet. Otherwise it only saves the credential.",
+        // credential). `connect` is the golden path. This verb saves or replaces the credential and stops (4.12).
+        // DRAFT copy (CLI UX PR-C): the plan gives the short line only; this long line is ours.
+        auth: "Sign in again, or replace this machine's credential. It saves the credential and then prints the next step. It does not choose what to capture: that is connect's job.",
         // 0.7.0 (D34): from any folder. A repo with a remote is chosen in the picker; a repo with no remote keeps the old flow.
         connect: "Choose the repositories to capture, from any folder, and connect them. On a machine with no credential it signs you in after you say yes, unless you choose g, which signs in first to read your account's grants.",
         // `D33 · 27A`. A public verb so an AI agent can list capturable repos without entering a consent
@@ -62,7 +61,8 @@ export const HELP = {
         // `D14`/`D15`. Offered by `connect` too. Asks first (default N) and says what it will not do.
         backfill: "Upload earlier coding-agent sessions still on this machine, for the repositories you chose. Asks first; no commit links.",
         status: "Show whether capture is on for this repo, or for this machine outside a repo, and when it last succeeded.",
-        off: "Stop capturing for this repo.",
+        // 4.15 (T15): the approved help line, verbatim. The same sentence as `HELP.short.off`.
+        off: "Stop capturing a repository: this one, or one you name.",
         // VERBATIM-APPROVED (D61 §PS6). Any reword needs a new claims-register row.
         why: "Show the conversation turns recorded against the commit that last changed this line.",
         // FB4 (review finding 7, plan 4.3): the approved text. The coverage is the whole repository, so no window is named (4.16).
@@ -81,17 +81,20 @@ export const HELP = {
      */
     verbs: {
         connect: {
-            usage: "vibecommit connect [--device] [--sign-in] [--typed]",
+            usage: "vibecommit connect [owner/repo | owner/]... [--device] [--sign-in] [--no-backfill] [--typed]",
             options: [
                 ["--device", "Sign in with a code approved on another device, for a machine with no browser."],
+                // T7 (4.9, DX-12 as amended by ENG-16): the amended line. DX-12's own "Send nothing written before this run" overclaimed (a session
+                // open before the run can upload from its first byte after a restart), so this one says only what the run does.
+                ["--no-backfill", "This run sends no check and offers no earlier sessions."],
                 ["--sign-in", "Sign in through the browser before connecting."],
                 ["--typed", "Use the typed prompt even on a terminal, for a screen reader."],
             ],
             exits: [
-                ["0", "Done."],
-                ["1", "Failed, or a replacement credential was declined."],
+                ["0", "Done, or nothing changed (q, Esc, an empty typed answer, or a No)."],
+                ["1", "Failed, cancelled with Ctrl+C, or a replacement credential was declined."],
                 ["2", "Bad arguments, or no person at a terminal to answer the consent question."],
-                ["3", "Not connected: this machine's credential is not accepted."],
+                ["3", "No credential could be saved, or this machine's credential is not accepted."],
             ],
         },
         auth: {
@@ -119,10 +122,12 @@ export const HELP = {
         backfill: {
             usage: "vibecommit backfill",
             options: [],
+            // DRAFT copy (CLI UX PR-C prc1): the options line for a verb with no flags of its own. `--no-color` and `-h` are accepted (W9).
+            noOptions: "None of its own. Only the global flags: `--no-color` turns off colour, and `-h` prints this help.",
             exits: [
                 ["0", "Done, declined at the question, or interrupted with Ctrl+C."],
                 ["1", "The server stopped the run, could not be reached or refused this machine's credential, or it could not run. Nothing already sent is lost; run it again to resume."],
-                ["2", "No terminal, or an argument was given."],
+                ["2", "No terminal, or an argument it does not take."],
                 ["3", "Not connected."],
                 ["4", "Nothing to upload."],
             ],
@@ -135,6 +140,18 @@ export const HELP = {
                 ["1", "Failed."],
                 ["2", "Bad arguments."],
                 ["3", "Not connected."],
+            ],
+        },
+        // T15 (CLI UX PR-B), D-OFFHELP: the shared screen. Row wording is DRAFT; the usage line and the one-name rule are the plan's.
+        off: {
+            usage: "vibecommit off [owner/repo]",
+            options: [],
+            // DRAFT copy (CLI UX PR-B, T15): 4.15's "takes exactly one name", said where the options would be; the usage line shows the name is optional inside a repo.
+            noOptions: "None. Its one argument is a repository, as owner/repo; inside a repo it can be left out.",
+            exits: [
+                ["0", "Stopped, or nothing to do."], // DRAFT copy (CLI UX PR-B, T15): the row wording.
+                ["1", "Failed."], // DRAFT copy (CLI UX PR-B, T15): the row wording.
+                ["2", "Bad arguments, including owner/ (use the picker)."], // DRAFT copy (CLI UX PR-B, T15): the row wording.
             ],
         },
         why: {
@@ -163,16 +180,18 @@ export const HELP = {
             ],
         },
         finalize: {
-            usage: "vibecommit finalize --session <id> | --latest [--force]",
+            usage: "vibecommit finalize [--session <id> | --latest] [--force]",
+            note: "With no option, closes the one recent session, or lists them to choose from.",
             options: [
                 ["--session", "The session to close."],
                 ["--latest", "The most recent session, when only one is recent."],
                 ["--force", "Skip the check that the transcript has stopped changing. Only for a session that is over."],
             ],
+            // DRAFT copy (CLI UX PR-B): rows 0, 1 and 2 are DX-15's wording, with the detail the old rows carried kept. Rows 3 and 5 are unchanged.
             exits: [
-                ["0", "Closed: the server confirmed the last turn is recorded."],
-                ["1", "Not confirmed closed: not a git repository, a transcript that cannot be read, a credential that is no longer accepted, or a delivery that failed."],
-                ["2", "Nothing was sent: bad arguments, an unknown or still-running session, or several recent sessions for --latest."],
+                ["0", "Closed (the server confirmed the last turn is recorded), or nothing closed (Enter at the list)."],
+                ["1", "Failed or cancelled (Ctrl+C, ten misses at the list): not a git repository, a transcript that cannot be read, a credential that is no longer accepted, or a delivery that failed."],
+                ["2", "Bad arguments, or several sessions with no terminal. Also an unknown or still-running session, or several recent sessions for --latest."],
                 ["3", "Not connected: this repo is not captured, or this machine has no credential."],
                 ["5", "Delivered, but the server did not confirm it. Treat it as not closed."],
             ],
@@ -274,7 +293,9 @@ export const STATUS = {
         // "Behind" is RECORDED turns not yet sent (firings the hooks wrote that no worker has consumed): not the idle-drain backlog of sessions with no
         // unconsumed firing, which this row does not count, and it includes firings of another server or credential.
         const behind = `${view.sessions} ${view.sessions === 1 ? "session" : "sessions"} with unsent turns, ${size}`;
-        const ack = view.ackAge === null ? "nothing acknowledged yet" : `last acknowledged ${view.ackAge}`;
+        // T17 (4.17): `last acknowledged` is `last confirmed` in every branch below. F-P7-1 (CR-PRB1): the never-confirmed case says
+        // "nothing confirmed yet" too. DRAFT copy (CLI UX PR-B): the plan names the change for the branches, not this one.
+        const ack = view.ackAge === null ? "nothing confirmed yet" : `last confirmed ${view.ackAge}`;
         const why = view.problem === "no_answer"
             ? "the server did not answer"
             : view.problem === "credential"
@@ -296,11 +317,17 @@ export const STATUS = {
     },
     /** The line under a "not running" row. */
     uploadNotRunning: "It retries on your next agent turn.",
-    /** 0.7.0, D6 · 2A: why this repo is on. One row under `repo`, only inside a repo that is on. */
-    basisLabel: "basis",
-    basisOwner: (owner) => `owner grant ${owner}/`,
-    basisRepo: "repo grant",
-    basisClone: "per clone",
+    /** 0.7.0, D6 · 2A: why this repo is on. One row under `repo`, only inside a repo that is on. T17 (4.17): the label is `why on`. */
+    basisLabel: "why on",
+    /**
+     * 7C (Alexander-approved): `all of <owner>/ is on`. P7's T20 ruling (2026-11-22, listed to Alexander for veto): only where that is false,
+     * when repositories under the owner are turned off, it says how many. DRAFT copy (CLI UX PR-C): the `except` variant.
+     */
+    basisOwner: (owner, turnedOff = 0) => turnedOff === 0
+        ? `all of ${owner}/ is on`
+        : `all of ${owner}/ is on except ${turnedOff} ${turnedOff === 1 ? "repo" : "repos"} turned off`,
+    basisRepo: "this repo is on",
+    basisClone: "this clone only",
     /**
      * Slice 2 (S4), brief §3.3: inside a repo that is NOT on, the account may still grant it. The account never admits a repo on
      * its own (R3-22): naming it here is `connect`'s picker, and the action row already offers `connect`.
@@ -340,7 +367,10 @@ export const STATUS = {
     accountLabel: "on account",
     accountNotHere: (connect) => `not on this machine · to capture them here, run: ${connect}`,
     /** Changes queued for the account that no sync has delivered yet. They go out with the next sync; only `connect`, `status`, `off` and a terminal `auth` sync. */
-    pendingLabel: "pending",
+    /** T17 (4.17): the label is `to send`; the value is unchanged. */
+    pendingLabel: "to send",
+    /** T17 (CLI UX PR-B): the refused row keeps today's label. A refused change is not "to send" (4.17 renames only the queued row). Alexander: a better word. */
+    pendingRefusedLabel: "pending",
     pendingValue: (n) => `${n} ${n === 1 ? "change" : "changes"} not yet sent to your account · sent at the next sync`,
     /**
      * VQ's ruling (ii): a queued change the server refused with 400 is kept (a consent statement is never dropped) but a retry
@@ -379,8 +409,8 @@ export const STATUS = {
     dashboardLabel: "dashboard",
     /** `<slug> (git toplevel <path>)` — §10.3's repo row. */
     repoToplevel: (slug, path) => `${slug} (git toplevel ${path})`,
-    /** `4 minutes ago · seq 41`. No turn count — see the module note in status.ts. */
-    lastSuccessValue: (age, seq) => `${age} · seq ${seq}`,
+    /** `4 minutes ago`. T17 (4.17): `seq` is in `--json` only, never on the screen. No turn count — see the module note in status.ts. */
+    lastSuccessValue: (age) => age,
     /**
      * `CR-216/U3` — the one status fault that is invisible from the outside.
      *
@@ -402,12 +432,31 @@ export const STATUS = {
      */
     grantsUnreadable: (connect) => `~/.vibecommit/grants.json can't be read, so capture is stopped on this machine for every repository that has a remote. Fix the file or move it aside, then run \`${connect}\`.`,
     /**
-     * 0.7.0, `SessionStart` (T21). `npm i -g` alone never adds the event to an agent's config, so a 0.6.x machine is
-     * missing it until `connect` runs. Only said on the npm channel: the plugin ships its own `hooks.json`, and its
-     * contract (no `SessionStart`, no git hooks) is unchanged. U10: without `SessionStart` a new granted clone still gets its commit hooks, from the
-     * background upload process the first time it delivers a session to that clone, so the line says "only after its first upload", not "will not".
+     * CR-PRB T9a (plan §4.4a, repair (c)). Replaces the 0.7.0 `SessionStart` line, which named one event. An agent whose hooks
+     * hold some of ours (a release that adds an event leaves every agent short of it, and this line says so) or name a removed
+     * binary. Repairs print a detail line under an unchanged heading; they never change the heading or `--json` (ENG-3).
      */
-    sessionStartMissing: (agents, connect) => `${agents} will add commit hooks to a new clone only after its first upload: VibeCommit's SessionStart hook is not registered there. Run \`${connect}\` to register it.`,
+    agentHooksNeedUpdate: (agent, connect) => `${agent}'s hooks need an update: run ${connect}.`,
+    /** CR-PRB T9a (plan §4.4a, repair (f)). Every installed agent is missing all of ours, so `connect` never reached the agent hooks. */
+    noAgentHooks: (connect) => `No coding agent on this machine has VibeCommit's hooks yet: run ${connect}.`,
+    /** CR-PRB T9a (plan §4.4a, repair (b)'s stale arm, ENG-28). Our commit hook names a binary that no longer exists. */
+    // DRAFT copy (CLI UX PR-B): the n=1 noun is singular ("1 clone"); the plan's sentence is kept for every other count.
+    commitHooksStale: (clones, connect) => clones === 1
+        ? `Commit hooks in 1 clone point at a removed vibecommit: run ${connect}.`
+        : `Commit hooks in ${clones} clones point at a removed vibecommit: run ${connect}.`,
+    /** CR-PRB T9a (plan §4.4a). The predicate could not read this machine's setup. The heading and the exit stay as they are. */
+    setupUnknown: (error) => `Couldn't check this machine's setup: ${error}.`,
+    /**
+     * CR-PRB T9a, branch (a). The heading that replaces "Capture is on" when there is no credential file and no
+     * `VIBECOMMIT_TOKEN` in this shell. DRAFT copy (CLI UX PR-B): the plan does not give the words.
+     */
+    // DRAFT copy (CLI UX PR-B):
+    setupUnfinishedHeading: "Setup isn't finished on this machine.",
+    /** CR-PRB T9a, branch (a)'s `why` line. Verbatim from plan §4.4a. */
+    setupUnfinishedWhy: "No credential file, and VIBECOMMIT_TOKEN is not set in this shell.",
+    /** CR-PRB T9a, branch (a)'s fix line. DRAFT copy (CLI UX PR-B): the plan names the command and not the sentence around it. */
+    // DRAFT copy (CLI UX PR-B):
+    setupUnfinishedFix: (connect) => `Finish it with \`${connect}\`.`,
     /** 0.7.0, D4 · A. A hook the user deleted stays deleted; `connect` is the watched way back. */
     commitHooksOff: (connect) => `Commit hooks are off in this repository: sessions are captured, commits are not linked to them. Run \`${connect}\` here to add them.`,
     commitHooksForeign: (connect) => `This clone has its own commit hook, so VibeCommit's is not installed here. Run \`${connect}\` here to chain it.`,
@@ -438,8 +487,8 @@ export const STATUS = {
      * listed). Nothing else will seal it until a prompt arrives, so the commits made in it cannot be recorded. States the consequence and the command;
      * promises nothing about the commits.
      */
-    openTail: (sessions, finalizeLatest) => `${sessions === 1 ? "1 session has" : `${sessions} sessions have`} ended with the last turn still ` +
-        `open, so commits made in that turn are not recorded. Run \`${finalizeLatest}\` to close it.`,
+    openTail: (sessions, finalize) => `${sessions === 1 ? "1 session has" : `${sessions} sessions have`} ended with the last turn still ` +
+        `open, so commits made in that turn are not recorded. Run \`${finalize}\` to close it.`,
     /**
      * `TODOS[145]` — commits the client has seen and is holding because no turn has closed yet. Normal
      * mid-session; shown as a fact, not as a fault.
@@ -558,8 +607,8 @@ export const STATUS = {
         const who = sessions === 1 ? `session ${namedIds(ids)}` : `${sessions} sessions (${namedIds(ids)})`;
         const commitsClause = commits > 0 ? `, including ${commits} ${commits === 1 ? "commit" : "commits"}` : "";
         const action = sessions === 1
-            ? `If that session is finished, \`${finalizeSession} ${ids[0]}\` tries to send them and, if that works, closes it`
-            : `If a session above is finished, \`${finalizeSession} <id>\` tries to send its bytes and, if that works, closes it`;
+            ? `If that session is finished, run \`${finalizeSession}\`, which tries to send them and, if that works, closes it`
+            : `If a session above is finished, run \`${finalizeSession}\`, which tries to send its bytes and, if that works, closes it`;
         return (
         // M3 (rv-capstep, accepted residual): see live_stuck above; false only for a pinned hold (an older server's approval 403).
         `${BYTE_COUNT.format(bytes)} ${bytes === 1 ? "byte" : "bytes"} held from ${who}${commitsClause}, with no hook in over 30 ` +
@@ -589,6 +638,15 @@ export const STATUS = {
  * protected, private, encrypted*) anywhere on the screen (D65 §DR7).
  */
 export const CONNECT = {
+    /** T7 (4.9): the recap, one line before the URL on a connect ending that turned something on. `summary` is `machineSummary`. */
+    recap: (summary) => `Capture is on for ${summary}.`,
+    /** T7 (4.9, CEO-12): the recap's muted line when `--no-backfill` skipped the offer. */
+    noBackfillRecap: "Earlier sessions were not offered (--no-backfill).",
+    /** T7 (4.9, DX-21, provisional): the Next line on an ending that sent nothing. `statusCommand` goes through `channelCommand`. */
+    nextStep: (statusCommand) => `Next: start a coding-agent session in one of them, then run ${statusCommand} to see it arrive.`,
+    // P7 ruling 2026-11-22 (DX-21); listed for Alexander's veto
+    /** T10 (plan 4.10, DX-21): the Next line on the single-repo `local:` endings, where "one of them" has no antecedent. */
+    nextStepHere: (statusCommand) => `Next: start a coding-agent session here, then run ${statusCommand} to see it arrive.`,
     // --- THE DISCLOSURE (CR-111d). Transcribed from style guide §10.2. ---
     /**
      * ⚠ NOT PARAPHRASED. §10.2's rule 4 — *every noun names something actually
@@ -738,9 +796,40 @@ export const CONNECT = {
      * literally true.
      */
     pickerNonInteractiveWhat: "Choosing repositories needs a person at a terminal.",
+    /** CR-PRB T12 (4.11, DX-2): what a name may be. Verbatim from the plan. */
+    nameWhy: "Name a repository as owner/repo, or every repository of an owner as owner/.",
+    /**
+     * CR-PRB T12 (4.11, DX-5): names with `--typed`. DRAFT copy (CLI UX PR-B): the plan gives the rule and the fix, not the words.
+     */
+    // DRAFT copy (CLI UX PR-B):
+    argsConflictWhat: "`connect` takes names or `--typed`, not both.",
+    // DRAFT copy (CLI UX PR-B):
+    argsConflictWhy: "The names already answer the picker, so the typed prompt has nothing to ask.",
+    // DRAFT copy (CLI UX PR-B):
+    argsConflictFix: "Run it without `--typed`:",
+    /**
+     * CR-PRB ENG-31 (plan 4.5, the piped-output paragraph): stdout is not a terminal, so the consent question cannot be shown. The what
+     * line is the plan's own sentence (verbatim).
+     */
+    outputNotTerminalWhat: "This output isn't a terminal, so the consent question can't be shown.",
+    // DRAFT copy (CLI UX PR-B): the plan gives the what line and the fix's rule, not the why or the label.
+    outputNotTerminalWhy: "The question would be written where nobody can read it.",
+    // DRAFT copy (CLI UX PR-B):
+    outputNotTerminalFix: "Ask the user to run this in a terminal, without redirecting the output:",
     pickerNonInteractiveWhy: "An agent cannot answer it, and standard input is not a terminal, so no repository can be chosen and consent cannot be asked. Nothing was read and nothing was uploaded.",
     pickerNonInteractiveFix: "Ask the user to run this in a terminal:",
-    alreadyConnected: "Capture is already on for this repository.",
+    /**
+     * CR-PRB T11 (plan §4.10, C1 = 3F): the covered repo's line, with its slug. Verbatim from the plan.
+     */
+    alreadyConnected: (slug) => `Capture is already on for ${slug} (this repo).`,
+    /** The local: repo's covered line (no slug to name): today's words, kept on the local: path only. */
+    alreadyConnectedLocal: "Capture is already on for this repository.",
+    /**
+     * CR-PRB T11 (ENG-30): the fix label of the question-free block a non-terminal covered repo prints when a sign-in is needed.
+     * DRAFT copy (CLI UX PR-B): the plan names the command and not the words around it.
+     */
+    // DRAFT copy (CLI UX PR-B):
+    coveredSignInFixLabel: "Finish setup in a terminal:",
     /**
      * 0.7.0. `grants.json` is present and unreadable, which denies this repository whatever consent it has (see
      * `consent.ts`'s `isCaptureAllowed`). Answering the consent prompt could not change that, so `connect` stops
@@ -756,23 +845,26 @@ export const CONNECT = {
      */
     credentialNeededWhat: "This machine has no ingest credential.",
     credentialNeededWhy: "Consent is recorded for this repository, but nothing can be uploaded without a credential for this machine.",
-    /**
-     * `CR-216/U4` REPLACED `export VIBECOMMIT_TOKEN=…` HERE.
-     *
-     * The old line taught the CI escape hatch as the install fix, and it was the
-     * only fix that existed because `credentials.json` had no producer. Following
-     * it repaired exactly one shell: the next terminal, and every `git commit` run
-     * from any other one, was broken again in the same silent way — the hook found
-     * no credential and bound nothing, which the exit contract makes soundless.
-     *
-     * `VIBECOMMIT_TOKEN` is unchanged and still read first (D56, founder call); it
-     * is simply no longer what a stuck human is told to type.
-     */
-    credentialNeededFix: "Save one for this machine, then connect:",
-    credentialNeededCommand: "vibecommit auth",
+    /** T10 (plan 4.12, verbatim): the one warn line before connect signs in again over a 401'd file credential. */
+    noLongerAccepted: "This machine's credential is no longer accepted. Signing in again.",
+    /** T10 (plan 4.12, verbatim): the line after a faulty file's block, before connect replaces it inline. */
+    replacingIt: "Replacing it.",
+    /** T10 (plan 4.4a, verbatim): q/Esc on a machine whose credential file is faulty. `connect` goes through channelCommand. */
+    faultyFileQuit: (connect) => `No changes. This machine's credential file can't be used: run ${connect} and press Enter to replace it.`,
+    /** DRAFT copy (CLI UX PR-C): the label over `vibecommit connect --device` when sign-in by code needs a terminal. The plan names the command, not the label. */
+    // DRAFT copy (CLI UX PR-C): "Run this in a terminal:"
+    deviceNeedsTerminalFix: "Run this in a terminal:",
+    /** The label over connect's failed-sign-in fixes (`connect`, `connect --device`). Replaces "Save one for this machine, then connect:". */
+    // DRAFT copy (CLI UX PR-C): "Sign in again, in a browser or with a code:"
+    signInFailedFix: "Sign in again, in a browser or with a code:",
     // --- The ending (CR-025). Style guide §10.2's last three lines. ---
     /** `Capture is on for <repo>. Nothing else to do.` */
     doneForRepo: (repo) => `Capture is on for ${repo}. Nothing else to do.`,
+    /**
+     * DRAFT copy (CLI UX PR-B, 4.8 / DX-21): the first sentence of the sent-nothing ending. `doneForRepo` ends "Nothing else to do.", which
+     * the sent-nothing ending cannot say beside its "Next:" line, so this is the same sentence without that clause.
+     */
+    capturedForRepoNothingSent: (repo) => `Capture is on for ${repo}.`,
     stopLabel: "To stop",
     /**
      * No transcript to record. ONE state — `CR-112` (W8) owns the five-absence
@@ -782,6 +874,10 @@ export const CONNECT = {
     noTranscriptWhat: "No recent Claude Code session was found for this repository.",
     noTranscriptWhy: "Consent is recorded, but nothing was sent as a check: connect looks only at Claude Code sessions from the last 30 minutes. Capture starts on its own the next time Claude Code runs here.",
     noTranscriptFix: "Nothing to fix. Start a session, then check:",
+    /** Plan 4.8 (ENG-16), verbatim: a transcript that exists but is too old. One muted line, never the no-session block. */
+    staleTranscript: (age) => `Your latest session here was last active ${age}, so nothing was sent as a check.`,
+    /** DRAFT copy (CLI UX PR-B), Codex rvprb #3: the check was due, but capture was turned off for this repo while sign-in waited. */
+    checkWithheld: "Nothing was sent as a check: capture is off for this repository now.",
     /**
      * The generic hold line (A78): the server answered the test capture with an older server's approval 403. It is a
      * HOLD, not a failure: the offset holds and the bytes stay on disk, so exit 0 and no word about why. `warn`, never `bad`.
@@ -820,9 +916,15 @@ export const COMMIT_HOOK = {
     installed: (repo) => `Commit capture is on for this clone (${repo}). Commits are recorded as they happen, including ones made by \`make\`, \`gh\`, an alias or a script.`,
     chained: (repo) => `Commit capture is on for this clone (${repo}). You already had a \`post-commit\` hook — it was kept and still runs first; ours runs after it.`,
     already: "Commit capture was already on for this clone.",
-    perClone: (connect) => `Run \`${connect}\` in each clone you want commits recorded for — git hooks are per-clone, not per-account.`,
+    // DRAFT copy (CLI UX PR-B): npm channel only, D-PERCLONE's rule (plan ~145) and the `sessionStartMissing` words. SessionStart and the
+    // first upload both go through `installOnce`, which refuses a foreign hook and a redirected hooks dir, so the sentence names both.
+    // The plugin installs no git hooks (`installOnce` returns early there), so its line names the command to run in the other clone.
+    perCloneNpm: "A later granted clone gets its commit hook from SessionStart or its first upload, unless it has a hook of its own or a core.hooksPath.",
+    perClonePlugin: (connect) => `The plugin adds no git hooks by itself: run \`${connect}\` in another clone to record its commits there.`,
     hooksPathWhat: "Commit capture could NOT be installed for this clone.",
     hooksPathWhy: (configured) => `This repository sets \`core.hooksPath\` to ${configured}, so git ignores \`.git/hooks\` entirely and a hook installed there would never run. Transcript capture is unaffected; only commit observation is.`,
+    // DRAFT copy (CLI UX PR-B): the cause for a clone whose `.git/hooks` fails access(W_OK | X_OK) (4.4a). It goes into failedWhy below.
+    hooksDirUnwritable: "the .git/hooks folder is not writable",
     hooksPathFixLabel: "Fix, either one:",
     hooksPathFixUnset: "git config --unset core.hooksPath",
     hooksPathFixManual: (postCommit) => `or add \`${postCommit}\` to your existing post-commit hook`,
@@ -843,6 +945,14 @@ export const COMMIT_HOOK = {
  * written and where is durable; how the credential got there is another unit's
  * copy, in another unit's strings.
  */
+/**
+ * T8b (4.2): the setup report's beat and its commit-hooks row. The beat is the plan's (`Setting up capture...`, overwritten once with
+ * `done`); the row's words are the plan's (`3 clones, 1 of them after your own hook`).
+ */
+export const SETUP = {
+    beat: "Setting up capture...",
+    commitRow: (clones, chained) => `${clones} ${clones === 1 ? "clone" : "clones"}${chained > 0 ? `, ${chained} of them after your own hook` : ""}`,
+};
 export const AGENT_HOOKS = {
     installed: (agent, path) => `Session capture is on for ${agent}. Registered Stop, PreCompact and SessionEnd in ${path}.`,
     already: (agent, path) => `Session capture was already on for ${agent}; refreshed the command in ${path}.`,
@@ -861,6 +971,18 @@ export const AGENT_HOOKS = {
     refusedFix: (path, connect) => `fix the problem with ${path} named above, then run \`${connect}\` again`,
     failedWhat: (agent) => `Session capture could NOT be set up for ${agent}.`,
     failedWhy: (path, why) => `Writing ${path} failed: ${why}. Commit capture and any agent already configured are unaffected.`,
+    // T8 (4.2): the setup report. The outcome words and the notes are the plan's; the failed fix is the plan's line.
+    rowAdded: "added",
+    rowAlready: "already set up",
+    rowFailed: "failed, see below",
+    rowRefused: "refused, see below",
+    keptOnce: "Hooks you already had were kept and still run.",
+    failedFix: (connect) => `Fix its permissions, then run ${connect}.`,
+    /** The "Capture is on" proof, naming only the agents that were set up (DX-13). `names` is "Claude Code, Codex or Cursor" style. */
+    proof: (names, claude) => `The next ${names} session in any of them is captured.${claude ? ' In Claude Code, its first reply then shows "VibeCommit captured this session."' : ""}`,
+    /** `status`'s warn row for an installed agent whose config cannot be written (ENG-17): the directory fails W_OK | X_OK. DRAFT copy. */
+    unwritableWhat: (agent) => `Session capture cannot be updated for ${agent}.`,
+    unwritableWhy: (path) => `The folder that holds ${path} is not writable, so this machine cannot register capture there.`,
 };
 export const PATH_CLASH = {
     foreignWhat: "Another program owns the `vibecommit` command.",
@@ -958,8 +1080,13 @@ export const SIGNIN = {
     malformedWhat: "The sign-in service returned an unexpected answer.",
     malformedWhy: "The response was not in the form this version can use. No session was stored.",
     malformedFix: "Report this, with the command you ran:",
-    /** A session already exists, so sign-in is a no-op. */
+    /** A session already exists, so sign-in is a no-op. The standalone `connect --sign-in` says this (it is the whole step there). */
     alreadySignedIn: "Already signed in on this machine.",
+    /**
+     * P7 ruling (2026-11-22): the same reused session as the first half of a MINT (`browserCredential`, on connect's path and on auth's).
+     * There "Already signed in" lands right after connect's "…Signing in again." and reads as a contradiction; this says what happens.
+     */
+    reusedForMint: "Using this machine's existing sign-in; no browser is needed.",
     // --- `authorizedAccessToken`'s last two outcomes — `CR-086`, W9. ---
     /**
      * ⚠ THE COPY THIS OBJECT DEFERRED BY TASK NUMBER, now written by the first
@@ -1072,6 +1199,13 @@ export const SCAN = {
  * `folder not recorded` is a transcript that records none.
  */
 export const BACKFILL = {
+    /** T7 (4.9): the offer inside `connect`. The standalone `vibecommit backfill` keeps its own words (`offerHeading`, `question`, `declined`). */
+    offerHeadingOptional: "Optional: upload earlier sessions too",
+    /** T7 (4.9): the note inside `connect`: it says that answering No changes nothing about capture. */
+    uploadNoteOptional: ["They upload one at a time, without commit links.", "Capture is already on; answering No changes nothing about that."],
+    questionOptional: (sessions) => sessions === 1 ? "Upload this earlier session too? [y/N] " : `Upload these ${sessions} earlier sessions too? [y/N] `,
+    /** T7 (4.9, D-NOUPLOAD): a true decline inside `connect`. It replaces "Nothing was uploaded", which was false after a test capture. */
+    declinedOptional: (backfill) => `Skipped. Earlier sessions stay on this machine; run ${backfill} any time to upload them.`,
     /**
      * Inside `connect` the repos are the ones it just showed, so "these"; run on its own there is no "these", so it names whose
      * they are (VQ, PR 5 review).
@@ -1185,7 +1319,8 @@ export const BACKFILL = {
     credentialStoppedWhy: "Nothing already sent is lost, and a re-run offers the sessions not yet uploaded.",
     credentialStoppedFixLabel: "Renew it, then run backfill again:",
     usageWhat: "That is not something `vibecommit backfill` understands.",
-    usageWhy: "Nothing was read and nothing was uploaded. `backfill` takes no arguments.",
+    // DRAFT copy (CLI UX PR-C prc1, W9's rule): the global flags (`--no-color`, `-h`) are accepted, so "no arguments" alone is not true.
+    usageWhy: "Nothing was read and nothing was uploaded. `backfill` takes no arguments of its own.",
 };
 /**
  * `vibecommit connect` from any folder — the picker, the grant block, the hooks step and the endings (0.7.0, PR 3).
@@ -1210,8 +1345,6 @@ export const PICKER = {
     labelFolders: "folders",
     /** The folder grant line (R7 · D9): the one claim about who can read a folder's sessions. */
     folderPrivate: "(private to you)",
-    questionGrantFolders: "Upload transcripts from these folders?",
-    questionGrantMixed: "Upload transcripts from these repositories and folders?",
     questionStopFolders: "Stop capturing these folders?",
     questionStopMixed: "Stop capturing these repositories and folders?",
     /** After a folder grant (R3 · R7), once, under "Capture is on": which folders, and who can read what they capture. */
@@ -1247,10 +1380,12 @@ export const PICKER = {
     notOn: (token) => `${token} (not on)`,
     /** The empty screen (D12 · 6A): a new laptop, no agent session on disk at all. */
     emptyNone: "No coding-agent sessions were found on this machine.",
-    emptyExpected: "That's expected on a new machine. Type the owners or repos to capture; every clone of them is captured once Claude Code, Codex or Cursor runs in it.",
-    emptyType: "Type owner/ or owner/repo, for example alexvibecommit/.",
+    emptyExpected: 
+    // P7 ruling (2026-11-22): with the empty screen's separate Codex trust line removed (4bfd207), the limit is in the claim itself.
+    "That's expected on a new machine. Type the owners or repos to capture. Every clone of them is captured once Claude Code, Codex or Cursor runs in it; Codex runs new hooks only after you trust them.",
+    emptyType: "Type owner/ or owner/repo, for example your-org/.",
     /** Sessions exist but none could be listed (the `Not listed here:` block is not empty): scan's own wording. */
-    emptyListable: "Type owner/ or owner/repo, for example alexvibecommit/, to capture a repository that is not listed.",
+    emptyListable: "Type owner/ or owner/repo, for example your-org/, to capture a repository that is not listed.",
     /** The checklist (D28). */
     hint: "↑↓ move · space select · enter continue · q quit · t type names instead",
     hintTyped: (connectTyped) => `Screen reader? Run: ${connectTyped}`,
@@ -1273,9 +1408,25 @@ export const PICKER = {
     chooseTyped: (connect) => `Choose by typing below, or widen the window and run ${connect}.`,
     /** q or Esc (4.4): nothing changed, and the machine is not capturing. */
     noChangesPlain: "No changes.",
+    /** CR-PRB T12 (4.11): a name that is already on. Verbatim from the plan. */
+    namedAlreadyOn: (name) => `${name} is already on.`,
     /** The enter-with-nothing lines (D5). */
     nothingGranted: (connect) => `Nothing granted. Run \`${connect}\` again any time.`,
     noChanges: (summary) => `No changes. Capture stays on for ${summary}.`,
+    /** CR-PRB T9b-2b (plan §4.4a, 4.4 table): the q/Esc line when branch (a) holds. Verbatim from the plan. */
+    quitUnfinished: (connect) => `No changes. Setup isn't finished on this machine: run ${connect} and press Enter.`,
+    /** CR-PRB T9b-2b (plan §4.4a): the q/Esc line when only a repair holds. Verbatim from the plan; never a bare "Capture stays on". */
+    quitRepair: (summary, connect) => `No changes. Capture stays on for ${summary}. Some hooks need an update: run ${connect} and press Enter.`,
+    /**
+     * CR-PRB T9b-2b: the count line when Enter with nothing new finishes setup (2B). Verbatim from the plan.
+     */
+    enterFinishes: "Nothing new chosen. Enter finishes setting up this machine.",
+    /**
+     * CR-PRB T9b-2b: the 4.4a line on the endings of a removals-only yes, an `n` (3E) and the `local:` path, when branch (a) holds.
+     * DRAFT copy (CLI UX PR-B): the plan gives the sentence only inside the q/Esc line, so this is that sentence without its lead.
+     */
+    // DRAFT copy (CLI UX PR-B):
+    endingUnfinished: (connect) => `Setup isn't finished on this machine: run ${connect} and press Enter.`,
     cancelled: "Cancelled. Nothing was changed.",
     /** The grant block (D7 · 3A). */
     chose: "You chose:",
@@ -1283,11 +1434,43 @@ export const PICKER = {
     labelRepos: "repos",
     labelTurnOn: "turn on",
     labelStop: "stop",
-    ownerHere: (count) => `(${count} here, and later clones)`,
+    /** DX-11 (plan 4.8): the owner row says a grant covers repos cloned later, on every path. Verbatim. */
+    ownerHere: (count) => `${count} ${count === 1 ? "repo" : "repos"} here, and any you clone later`,
+    ownerNoClone: "no clone here yet; any you clone later",
+    /** Plan 4.8 (3E): each stop row carries this when the change also adds something. Verbatim. */
+    stopOnEither: "(stops on either answer)",
     noCloneHere: "(no clone here yet)",
-    questionGrant: "Upload transcripts from these repositories?",
+    /**
+     * Plan 4.8: the upload question. `target` names what the change adds: one item by its slug, owner or folder label, more by a
+     * count (`grantTarget*`). Verbatim for the one-repo and folder-label cases in the plan; the counts are DRAFT.
+     */
+    questionGrant: (target) => `Start uploading sessions from ${target}?`,
+    /** DRAFT copy (CLI UX PR-B): the count forms of the question's target (plan 4.8: "more as these N repositories / folders"). */
+    grantTargetRepos: (count) => `these ${count} repositories`,
+    grantTargetFolders: (count) => `these ${count} folders`,
+    /**
+     * DRAFT copy (CLI UX PR-C, T20 sweep): several additions that include an OWNER. An owner is every repository under it, including
+     * later clones, so it has no count: "these 2 repositories" for `acme/` plus one repo would be false.
+     */
+    grantTargetReposUncounted: "these repositories",
+    /** DRAFT copy (CLI UX PR-B): the mixed target has no count, so one repository and one folder never read "these 1 repositories". Same words as the mixed scope sentence. */
+    grantTargetMixed: "these repositories and folders",
+    /** Plan 4.8: the scope sentence, after the `You chose:` rows. The opening sentence is verbatim for repos; folders and mixed are DRAFT. */
+    grantScopeStart: (where) => `Sessions that start in ${where} from now on upload as they run.`,
+    grantScopeWhereRepos: "these repositories",
+    grantScopeWhereFolders: "these folders",
+    grantScopeWhereMixed: "these repositories and folders",
+    /** Plan 4.8 (CEO-12), verbatim: the check line, when the in-repo test capture will run. */
+    grantScopeCheck: (agent, activity) => `Your latest ${agent} session in this repo (${activity}) is also sent now, as a check.`,
+    /** The check's age, as the copy says it: "active 4 minutes ago", and "active just now" for a session under a minute old. */
+    activeAgo: (age) => (age === "just now" ? "active just now" : `active ${age}`),
+    /** Plan 4.8 (CEO-12), verbatim: the last sentence of the scope, with the check ("Other sessions…") or without it. */
+    grantScopeEndChecked: "Other sessions that ended earlier are a separate, optional step.",
+    grantScopeEnd: "Sessions that ended earlier are a separate, optional step.",
     questionStop: "Stop capturing these repositories?",
     stopped: "Stopped capturing the repositories above.",
+    /** Plan 4.8 (3E), verbatim: a No still writes the stops; `names` lists what was stopped. */
+    stoppedOnNo: (names) => `Stopped capturing ${names}. Nothing new was turned on.`,
     /** "1 owner and 2 repos" — the on-now summary of Enter-with-grants, `auth`'s one line and the status heading. */
     summary: (owners, repos, folders = 0) => {
         const o = `${owners} ${owners === 1 ? "owner" : "owners"}`;
@@ -1315,6 +1498,7 @@ export const PICKER = {
     hooksFailedFixLabel: "Where the hook could not be written, try again:",
     /** "Capture is on" (D18 · 12A, D19 · 13A). */
     onFor: (summary) => `Capture is on for ${summary} on this machine.`,
+    // T8: the proof is built by `AGENT_HOOKS.proof`, from the agents that were set up. This string is kept for its other callers.
     onProof: "The next Claude Code, Codex or Cursor session in any of them is captured. In Claude Code, its first reply then shows \"VibeCommit captured this session.\"",
     stopOne: "To stop one repo, run inside it:",
     onNewLaptop: (names) => `Capture is on for ${names} on this machine.`,
@@ -1378,7 +1562,7 @@ export const PICKER = {
                 : names[0];
         return `Your account also grants ${head}.`;
     },
-    joinQuestion: "Capture those here too?",
+    joinQuestion: "Start uploading sessions from those here too?",
     /**
      * Under "Capture is on" when the sync after `connect`'s writes did not reach the server (VQ, on VT's question). Capture IS on —
      * local grants admit the repo — so this is not a warning; it only tells the truth about the account. Only `connect`, `status` and
@@ -1424,12 +1608,36 @@ export const OFF = {
     notSentStopped: "Stopped here. Your other machines running VibeCommit 0.8.0 or later don't know yet.",
     /** The account already had it turned off (another machine, or the dashboard); this machine now agrees. */
     alreadyOffAccount: "Already off on your account; now off on this machine too.",
+    /** 4.15 (T15): a name the account already turned off. The name is the owner/repo as given (normalised). */
+    nameAlreadyOffAccount: (name) => `${name} is already off on your account.`,
+    /** 4.15 (T15): a name this machine is not capturing. Nothing is written; exit 0. */
+    nameNotOn: (name) => `${name} isn't being captured on this machine.`,
     note: "Sessions already recorded are unaffected.",
+    /** D-OFFBACK (3G, 4.15): the way back, after every success. `command` is `vibecommit connect <owner/repo>`, through `channelCommand`. */
+    wayBack: (command) => `To turn it back on: ${command}`,
+    /** D-OFFBACK: a `local:` clone has no repository name to give, so the way back runs inside it. `command` is `vibecommit connect`. */
+    wayBackLocal: (command) => `To turn it back on, run inside it: ${command}`,
     // `TODOS[184]`. `off` used to ignore `argv` entirely and always run — a stray
     // argument, including `--help`'s own flag landing here by a bug, must never
     // silently revoke consent. Same shape as `AUTH.argvWhat`/`argvWhy`.
     unrecognizedArgWhat: "That is not something `vibecommit off` understands.",
-    unrecognizedArgWhy: "Nothing was changed. `off` takes no arguments.",
+    /** 4.15 / DX-10 (T15): the why line for a refused name, verbatim from the plan. Not on owner/, which has its own why. */
+    unrecognizedArgWhy: "`off` takes at most one repository, as owner/repo.",
+    /** Every `off` refusal says it changed nothing: a refused argument never revokes (TODOS[184]). */
+    nothingChanged: "Nothing was changed.",
+    /** 4.15 Owners (T15): `off owner/` names a whole owner, which is removed in the picker. The `what` line names the token (DX-2). DRAFT copy. */
+    ownerWhat: (token) => `\`${token}\` is a whole owner; \`off\` turns off one repository.`,
+    ownerFixLabel: "To stop a whole owner, untick it in the picker:",
+    /** A fix line for `off` on a repository: `vibecommit off <target>`. Printed through `channelCommand` at the call (DX-14). */
+    offCommand: (target) => `vibecommit off ${target}`,
+    /** The placeholder the outside-a-repo why line names: a pattern, not a fix line. Printed through `channelCommand` (DX-14). */
+    nameCommandPattern: "vibecommit off owner/repo",
+    /** DRAFT copy (CLI UX PR-B, T15): the second line of the outside-a-repo refusal. `command` goes through `channelCommand` (DX-14). */
+    outsideRepoWhy: (command) => `Or name the repository from any folder: \`${command}\`.`,
+    /** DRAFT copy (CLI UX PR-B, T15): the unreadable-file block for a name. It is true with zero or more clones revoked. */
+    namedGrantsUnreadableWhy: (revoked) => revoked
+        ? "Capture is already stopped for this repository while the file can't be read, and the consent of the clones on this machine that name it was withdrawn."
+        : "Capture is already stopped for this repository while the file can't be read.",
 };
 /**
  * `vibecommit why` — `CR-086`, W9.
@@ -2040,14 +2248,30 @@ export const FINALIZE = {
     noRecentSessionFix: "Name a session:",
     severalRecent: "More than one session in this repository is recent.",
     severalRecentFix: "Name one:",
+    // DRAFT copy (CLI UX PR-B): the several-sessions block when stdout is not a terminal (round prb1 #1, ENG-31). Not in the plan's screens.
+    outputNotTerminalWhat: "This output isn't a terminal, so the sessions can't be listed to choose from.",
+    outputNotTerminalWhy: "The list would be written where nobody can read it.",
     /** `finalize --session <id>` for a session that is known, e.g. the one whose delivery just failed. */
     commandSession: (id) => `vibecommit finalize --session ${id}`,
     /** The same with the placeholder, for a fix line written before a session is known. */
     commandSessionAny: "vibecommit finalize --session <id>",
-    /** The command without its id, for a sentence that names the id itself (`status`'s held-idle line). */
-    commandSessionBase: "vibecommit finalize --session",
+    /** The plain command (no option), which `status`'s held-idle line names: the candidates are listed when there are several. */
+    commandSessionBase: "vibecommit finalize",
     commandSessionForce: (id) => `vibecommit finalize --session ${id} --force`,
     recentRow: (id, minutesAgo) => `${id}  (${minutesAgo} min ago)`,
+    /** Plain `finalize` with several sessions on a terminal (screen 4.18). The row is the first 8 characters of the id and a relative age. */
+    pickHeading: "These sessions in this repository can be closed:",
+    // DRAFT copy (CLI UX PR-B, round prb1 #13): an activity age, not an end. The candidates include live and recent sessions, so the row
+    // says when the session was last active. `ago` is relativeAge's phrase, which already ends in "ago".
+    pickRow: (n, shortId, ago) => `${n}  ${shortId}   last active ${ago}`,
+    pickWarning: "Closing one sends what is left and records the commits made in its last turn. Only close a session that is over.",
+    pickPrompt: "Close which? Type a number, or press Enter to close nothing.",
+    promptMark: "> ",
+    /** A number that is not on screen. `token` is what was typed. */
+    noRow: (n) => `${n} (no row ${n})`,
+    notUnderstood: (token) => `Not understood: ${token}. Nothing was closed.`,
+    nothingClosed: "Nothing was closed.",
+    cancelled: "Cancelled. Nothing was closed.",
     unknownSession: (id) => `This repository has no captured session ${id}.`,
     transcriptMissing: (id) => `Could not find the transcript for session ${id}.`,
     stillWriting: "That session's transcript changed a moment ago.",
@@ -2155,6 +2379,15 @@ export const REPLACE = {
      */
     declinedOrphan: "The credential just created is unused. Revoke it in Settings if you want it gone.",
     declinedFix: "Settings:",
+    // DRAFT copy (CLI UX PR-C): ENG-15's warn line on connect's replace. P6 settled the placement; these words are DRAFT for P7.
+    replacedOther: (was, now) => `This machine was signed in as ${was}. You just signed in as ${now}.`,
+    replacedUnknown: (was) => 
+    // P7 ruling (2026-11-22): the missing handle comes from VibeCommit's own sign-in and mint answers, so the line does not name GitHub.
+    `This machine was signed in as ${was}. The sign-in didn't say which account you just signed in as.`,
+    // DRAFT copy (CLI UX PR-C): connect's replace stopped because this machine could not keep a record of the credential (T10 B3).
+    replaceNotRecorded: "Sign-in stopped: this machine couldn't keep a record of the credential it was just given.",
+    /** Verbatim from the plan (4.12, DX-7): the No at the always-asked question after the grants were written. `run` is connect's command. */
+    declinedSavedChoices: (run) => `The new credential was not saved. Your choices are saved; run ${run} to finish setting up.`,
 };
 /**
  * The device sign-in (`CR-234d`, D219, style guide §10.2): the waiting block, its terminal states and the
@@ -2292,11 +2525,36 @@ export const CREDENTIAL = {
     insecureDirWhat: "The folder that holds the credential file is open to other accounts on this machine.",
     insecureDirWhyLabel: "folder",
     insecureDirWhy: "The credential was not read. This folder must be accessible only to its owner.",
+    // DRAFT copy (CLI UX PR-C, T10 B4): the folder cannot be written. The fix is the folder's own chmod, as the insecure block's is.
+    unwritableWhat: "The folder that holds the credential cannot be written to.",
+    // P7 ruling (2026-11-22): "user on this computer", not "account", which reads as the VibeCommit or GitHub account.
+    unwritableWhy: "A credential is saved there after sign-in, so nothing was minted or sent. If another user on this computer owns the folder, that user or an administrator must change it.",
+    unwritableFix: "Make the folder writable by you, then run the command again:",
     unreadableWhat: "The credential file could not be read.",
     unreadableWhy: "It exists but does not contain a credential in the expected form.",
     /** `CR-216/U4`. Was "Replace it by reconnecting:" — see `wrongClassFix` above. */
     unreadableFix: "Replace it:",
     unreadableCommand: "vibecommit auth",
+    // prc1 S1/S8 (P7 ruling, 2026-11-22): something other than a file is where the credential is saved. Replacing it does not help (the
+    // save would fail on the same path), so the fix moves it aside and names no verb.
+    notAFileWhat: "The credential's path is not a file.",
+    notAFileWhy: "Something other than a file, such as a folder, is where the credential is saved, so no new credential can be saved there.",
+    notAFileFix: "Move it aside, then run the command again.",
+    // prc1 S3 (P7 ruling, 2026-11-22): the record of credentials waiting to be revoked cannot be read, so no new credential is made. The
+    // claim is this command's own: hooks still upload with whatever credential exists, so it does not say "nothing is sent" or "uploaded".
+    queueUnreadableWhat: "The record of credentials waiting to be revoked could not be read.",
+    queueUnreadableWhy: "A new credential is made only when this record can be kept, so none was made.",
+    queueUnreadableFix: "Check that file, then run the command again.",
+    // prc1 S3 (P7 ruling, 2026-11-22): the record is at its cap, and a new credential would have nowhere to be recorded. "Each … command you
+    // run" is cli.ts's verb-start retry: every verb except `scan`, `--help`/`-h` and a save-only `auth`, and never a hook.
+    queueFullWhat: (max) => `This machine already has ${max} credentials waiting to be revoked.`,
+    queueFullWhy: "No new credential is made until some of them are revoked. Each vibecommit command you run that contacts the server tries them again first.",
+    /** P7 ruling (2026-11-22, the agent-ready contract §5: every new refusal has a fix). Over `vibecommit status`, which retries at its start. */
+    queueFullFix: "Try them again now:",
+    // prc1 S5 (P7 ruling, 2026-11-22): another process holds the record's lock past the bound. Nothing is minted; a retry is the fix.
+    queueBusyWhat: "The record of credentials waiting to be revoked is in use by another vibecommit command.",
+    queueBusyWhy: "A new credential is made only when this record is free, so none was made.",
+    queueBusyFix: "Run the command again in a moment.",
 };
 /**
  * `vibecommit auth` — `CR-216/U2`, D206.
@@ -2323,6 +2581,12 @@ export const AUTH = {
     savedWhy: (path) => `Written to ${path}, mode 0600.`,
     nextLabel: "Next, connect a repository:",
     nextCommand: "vibecommit connect",
+    /** Plan 4.12 (ENG-25), (f): no agent holds any of our hooks. Verbatim. */
+    setupNoAgentHooks: (connect) => `Next, choose what to capture: ${connect}`,
+    /** Plan 4.12 (ENG-25), (c): some hooks need an update. Verbatim. */
+    setupRepairs: (summary, connect) => `Capture stays on for ${summary} on this machine. Some hooks need an update: run ${connect} and press Enter.`,
+    /** Plan 4.12 (ENG-25, ENG-2): a `connect` whose sign-in failed left its earlier sessions in `pending_offer`. Verbatim. */
+    earlierNotOffered: (summary, backfill) => `Earlier sessions from ${summary} weren't offered: run ${backfill} to upload them.`,
     emptyWhat: "No credential was given.",
     emptyWhy: "Nothing was read, so nothing was written.",
     /**
@@ -2332,7 +2596,7 @@ export const AUTH = {
      */
     mintFix: (url) => `Mint one at ${url}, then run either:`,
     /**
-     * The two ways to hand it over: piped (a script or an agent), or typed at a terminal. `--stdin` never continues into `connect`
+     * The two ways to hand it over: piped (a script or an agent), or typed at a terminal. `--stdin` never opens a browser
      * (D32 guard 1). `auth` is `authCommandFor(env, selfPath)`: a plugin-only machine has no `vibecommit` on PATH, so the line names
      * `node <path> auth` there (README, "Keeping a machine connected"), and handing it `vibecommit auth` would be a new wrong output.
      */
@@ -2356,7 +2620,9 @@ export const AUTH = {
     mintFailedWhat: "No credential was created through the browser.",
     /** `not-authorized`, or a 401 that survived one refresh. */
     mintSessionWhy: "The sign-in on this machine could not be used to create one. It may have ended or been revoked. Nothing was written.",
-    mintNotMemberWhy: "The account that signed in is not a member of the workspace its sign-in names. Nothing was written.",
+    mintNotMemberWhy: 
+    // P7 ruling (2026-11-22): "organization", not the retired "workspace" (0.15.0, T41a/T41c).
+    "The account that signed in is not a member of the organization its sign-in names. Nothing was written.",
     mintRateLimitedWhy: "Too many credentials were created for this account in the last hour. Nothing was written.",
     mintRefusedWhy: "The service refused the request. Nothing was written.",
     mintUnreachableWhy: "The service did not answer. Nothing was written.",
@@ -2368,6 +2634,21 @@ export const AUTH = {
     pasteInsteadLabel: "Paste one instead. Create it here, then paste it below:",
     /** `R5`/`8A`: the mint came back unusable (the probe of the NEW credential was refused). */
     mintUnconfirmedWhy: "The service created a credential and then refused it. Nothing was written.",
+    // --- T10 B5 (plan 4.12, DX-7): connect's recovery line per failure. Only on connect's path. ---
+    /** DRAFT copy (CLI UX PR-C, DX-7). `requestMint` does not carry the server's retry time, so the plan's fallback is the line. */
+    rateLimitedWait: "Wait up to an hour. A retry before then fails the same way.",
+    /** DRAFT copy (CLI UX PR-C prc1, S9(c)): the server's own retry time, as a clock reading (local time). Before it a retry fails the same way. */
+    rateLimitedAt: (time) => `Wait until ${time}. A retry before then fails the same way.`,
+    /** DRAFT copy (CLI UX PR-C, DX-7): the command comes AFTER the wait, never before it. */
+    rateLimitedAgain: "Run the command again after that:",
+    /** DRAFT copy (CLI UX PR-C, DX-7). The refusal does not carry the account, so the line names the account that signed in. */
+    notMemberFix: "Ask an owner of the organization to add the account that signed in.",
+    /** DRAFT copy (CLI UX PR-C, DX-7): names the host it tried and the override variable by NAME, never by value. */
+    unreachableTried: (host) => `It tried ${host}. VIBECOMMIT_MCP_URL, if it is set, must point at the service.`,
+    /** DRAFT copy (CLI UX PR-C, DX-7): retry once, then the network. */
+    unreachableFix: "Run the command again once. If it fails the same way, check the network:",
+    /** Verbatim from the plan (4.12, DX-7): a failed browser sign-in on connect's path, once the grants were written. */
+    savedChoicesWhy: "Your choices are saved; nothing uploads until sign-in finishes.",
 };
 /**
  * The Node floor (D57 plan §DX11). `NODE_FLOOR_TEXT` and the running version are
@@ -2501,6 +2782,11 @@ export const REDACTION = {
 /** Commands the copy points at. One definition, so a rename cannot half-land. */
 export const COMMANDS = {
     connect: "vibecommit connect",
+    /**
+     * Plan 4.12 (verbatim): connect's sign-in by code. Named after a failed browser sign-in on connect's path (row 5), by the
+     * no-terminal sign-in block, and by `--device` without a terminal. Always through channelCommand.
+     */
+    connectDevice: "vibecommit connect --device",
     /** `D33 · 27A`. */
     scan: "vibecommit scan",
     /** `D14`/`D15`. */
@@ -2516,7 +2802,9 @@ export const COMMANDS = {
     signIn: "vibecommit connect --sign-in",
     status: "vibecommit status",
     /** `TODOS[146]`. */
-    finalize: "vibecommit finalize --latest",
+    finalize: "vibecommit finalize",
+    /** `TODOS[146]`. The `--latest` form, for the fix lines that name it (`FINALIZE_NEEDS_TARGET`). */
+    finalizeLatest: "vibecommit finalize --latest",
     /**
      * `CR-108`. The ARGUMENT SHAPE, shown once so the usage error and the retry
      * fix line cannot drift apart — the same convention `why` uses.

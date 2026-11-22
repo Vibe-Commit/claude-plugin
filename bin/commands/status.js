@@ -24,11 +24,12 @@
  * invented here: `CR-112` (W8) owns the five-absence grammar as one set, and
  * adding a variant now is what that task exists to prevent.
  */
-import { AGENT_HOOKS, COMMANDS, FINALIZE, HELP, OFF, STATUS, URLS, relativeAge } from "../copy/index.js";
+import { AGENT_HOOKS, ARGS, COMMANDS, FINALIZE, OFF, STATUS, URLS, relativeAge } from "../copy/index.js";
 import { renderVerbHelp } from "../verb_help.js";
+import { shownToken } from "../args.js";
 import { authCommandFor, channelCommand } from "../install.js";
 import { credentialFingerprint, ingestUrl } from "../post.js";
-import { GrantsUnreadableError, excludeSlug, grantsUnreadable, isCaptureAllowed, isLocalSlug, normalizeSlug, ownerOfSlug, readAccountState, readAllowList, readGrants, revokeProject, } from "../consent.js";
+import { GrantsUnreadableError, excludeSlug, grantsUnreadable, isCaptureAllowed, isLocalSlug, normalizeSlug, ownerOfSlug, readAccountState, slugGrantedHere, readAllowList, readGrants, revokeProject, } from "../consent.js";
 import { queueGrantOps } from "../grants_sync.js";
 import { fetchCaptureRoute } from "../capture_route.js";
 import { endDateText, endingSoon, metaFor } from "../credential_meta.js";
@@ -44,11 +45,12 @@ import { uploaderJson, uploaderRows, uploaderView } from "../uploader_view.js";
 import { commitsWaitingForRepo, heldAtEndForRepo, inferredUnacknowledgedForRepo, lastReceiptForRepo, lastSendForRepo, leanHeldForRepo, leanSessionsForRepo, openTailForRepo, stuckForRepo, stoppedForRepo, stuckSpoolLinesForRepo, writtenOffForRepo, } from "../state.js";
 import { LABEL_GUTTER, WRAP_COLUMNS, glyph, labelled, paint, renderErrorBlock, tildePath, truncatePath, wrap, } from "../term.js";
 import { credentialProblem, credentialProblemBlock, rejectedCredentialBlock } from "./credential_problem.js";
-import { captureBasis } from "../machine_state.js";
+import { captureBasis, machineCapture } from "../machine_state.js";
 import { accountRowsFor, machineStatus } from "./status_machine.js";
 import { writeFailure, writeLines } from "./context.js";
 import { stoppedSyncReason } from "./sync_reason.js";
-import { hookStateLines } from "./status_hooks.js";
+import { agentConfigWarnLines, codexHooksHere, hookStateLines, setupUnfinished, setupUnfinishedJson, setupUnfinishedLines } from "./status_hooks.js";
+import { setupState } from "../setup_state.js";
 import { syncForVerb } from "../grants_verb.js";
 /** §10.3 indents the gutter rows four columns under the state line. */
 const ROW_INDENT = 4;
@@ -123,6 +125,18 @@ export function status(ctx, argv = [], sync = { kind: "skipped" }, route = null)
     // ⛔ THE GATE IS `isCaptureAllowed` (0.7.0): the same decision the hooks make, so `status` cannot say "on" over a
     // clone the hook is refusing (an excluded slug, an unreadable `grants.json`) or "off" over one it is admitting.
     const on = isCaptureAllowed(ctx.home, keys, onceRepoSlug(projectKey));
+    // CR-PRB T9a (plan §4.4a): the one setup predicate. Its commit-hook check (b) looks at this clone only when this repo is on.
+    const setup = setupState({
+        home: ctx.home,
+        env: ctx.env,
+        selfPath: ctx.selfPath,
+        // #15 (CR-PRB1): an admitted clone is captured even when grants.json is unreadable (`isCaptureAllowed`), so its checks still run.
+        grantsOn: on || machineCapture(ctx.home).kind === "on",
+        toplevels: on ? [projectKey] : [],
+        syncUnauthorized: false,
+    });
+    // Branch (a) only: the heading says setup is unfinished. Repairs never change it (ENG-3).
+    const unfinished = on && setupUnfinished(setup);
     // ⛔ `ok` IS A HEALTH CLAIM, NOT ONLY A CONSENT ONE (`CR-228`, `TODOS[142]`).
     // The line beside the glyph is consent state and stays so; the glyph is what a
     // user reads as "fine". It printed `ok` over a session that had written off
@@ -184,7 +198,8 @@ export function status(ctx, argv = [], sync = { kind: "skipped" }, route = null)
     // from what the hook last heard (`X-Credential-Expires`), so it is as fresh as the last capture.
     const endsAt = fingerprint === null ? null : endingSoon(metaFor(ctx.home, fingerprint), ctx.now().getTime());
     const endsText = endsAt === null ? null : endDateText(endsAt);
-    const kind = on &&
+    const kind = !unfinished &&
+        on &&
         stopped === null &&
         endsText === null &&
         writtenOff.gaps === 0 &&
@@ -198,7 +213,8 @@ export function status(ctx, argv = [], sync = { kind: "skipped" }, route = null)
     // Slice 2 (S4): not on here, but the last synced account state grants it. One answer for the text row and the `--json` basis.
     const accountOnly = !on && grantedOnAccountOnly(ctx.home, resolveRepoSlug(projectKey));
     const lines = [
-        `  ${paint(ctx.colour, kind, glyph(ctx.colour, kind))} ${paint(ctx.colour, "strong", on ? STATUS.onForRepo : STATUS.offForRepo)}`,
+        `  ${paint(ctx.colour, kind, glyph(ctx.colour, kind))} ${paint(ctx.colour, "strong", unfinished ? STATUS.setupUnfinishedHeading : on ? STATUS.onForRepo : STATUS.offForRepo)}`,
+        ...(unfinished ? setupUnfinishedLines(ctx) : []),
         labelled(ROW_INDENT, STATUS.repoLabel, repoValue(ctx, projectKey)),
         ...(on
             ? [labelled(ROW_INDENT, STATUS.basisLabel, basisValue(ctx, projectKey))]
@@ -216,7 +232,7 @@ export function status(ctx, argv = [], sync = { kind: "skipped" }, route = null)
     // files rather than a lookup (`lastSendForRepo`).
     const lastSend = lastSendForRepo(ctx.home, projectKey);
     if (lastSend !== null) {
-        lines.push(labelled(ROW_INDENT, STATUS.lastSuccessLabel, STATUS.lastSuccessValue(relativeAge(lastSend.at, ctx.now().getTime()), lastSend.seq)));
+        lines.push(labelled(ROW_INDENT, STATUS.lastSuccessLabel, STATUS.lastSuccessValue(relativeAge(lastSend.at, ctx.now().getTime()))));
     }
     // U7 (plan §3.8): the background uploader, machine-wide, computed from firing logs against ledgers and the worker's lock, never from its own claim.
     const upload = uploaderView(ctx.home, ctx.env, ctx.now().getTime());
@@ -263,6 +279,8 @@ export function status(ctx, argv = [], sync = { kind: "skipped" }, route = null)
             // one. D98 detection 3 holds the key set; this key is a contract change and
             // `json-read-verbs.test.ts` records it as one.
             credential: load.kind === "ok" ? load.credential.source : null,
+            // CR-PRB T9a (DX-1): present only when branch (a) holds. Every other key, and the exit, are unchanged.
+            ...setupUnfinishedJson(ctx, setup),
             // `CR-228`. Always an object, zeros included: unlike `last_send`, "nothing
             // written off" is a measured answer and not an absence. ⛔ A contract
             // change, recorded in `json-read-verbs.test.ts` beside `credential`'s.
@@ -394,9 +412,11 @@ export function status(ctx, argv = [], sync = { kind: "skipped" }, route = null)
         lines.push("", ...wrap(STATUS.grantsUnreadable(channelCommand(ctx.env, ctx.selfPath, COMMANDS.connect)), 2));
     }
     // 0.7.0, `SessionStart`: a missing registration (npm channel only), commit hooks that are off, or `core.hooksPath`.
-    lines.push(...hookStateLines(ctx, projectKey, on));
-    // Codex runs no user-level hook until the user trusts it. Said, never detected (VQ + Alexander, 2026-10-24).
-    if (on)
+    lines.push(...hookStateLines(ctx, setup, on));
+    // T8 (4.2, DX-13): an agent config this installer refuses or cannot write (outside the 4.4a predicate).
+    lines.push(...agentConfigWarnLines(ctx));
+    // Codex runs no user-level hook until the user trusts it. T8 (D-CODEX): said only where Codex hooks exist on this machine.
+    if (on && codexHooksHere(ctx))
         lines.push("", ...wrap(AGENT_HOOKS.codexTrust, 2));
     lines.push("", ...actionLines(ctx, on));
     writeLines(ctx.stdout, lines);
@@ -455,7 +475,7 @@ function grantedOnAccountOnly(home, slug) {
 /** The `basis` row's value (D6): which of the three reasons admits this repo. */
 function basisValue(ctx, projectKey) {
     const basis = captureBasis(ctx.home, resolveRepoSlug(projectKey));
-    return basis.kind === "owner" ? STATUS.basisOwner(basis.owner) : basis.kind === "repo" ? STATUS.basisRepo : STATUS.basisClone;
+    return basis.kind === "owner" ? STATUS.basisOwner(basis.owner, basis.turnedOff) : basis.kind === "repo" ? STATUS.basisRepo : STATUS.basisClone;
 }
 /** The `--json` spelling of the same three reasons. */
 function basisKind(ctx, projectKey) {
@@ -493,22 +513,25 @@ function actionLines(ctx, on) {
  * coupling. If a second global flag is ever added at `index.ts`'s site, add it here too.
  */
 const OFF_RECOGNIZED_GLOBAL_FLAGS = ["--no-color"];
-function offLocal(ctx, argv) {
-    // `TODOS[184]`. `off` used to take no `argv` at all, so EVERY trailing token — including `--help`
-    // landing here by accident — silently revoked consent (measured on 0.4.3 and 0.4.4 alike). `--help`/
-    // `-h` print help and change nothing; any other argument is refused the same way, also changing
-    // nothing — a revoke must never run on an argument this verb did not parse.
+function offLocal(ctx, argv, checkName) {
+    // `TODOS[184]`. `off` used to take no `argv` at all, so EVERY trailing token — including `--help` landing here by accident —
+    // silently revoked consent. `--help`/`-h` print the shared screen and change nothing; any other flag is refused, also changing
+    // nothing: a revoke must never run on an argument this verb did not parse. T15 (4.15): one bare token is a repository name.
     if (argv.includes("--help") || argv.includes("-h")) {
-        writeLines(ctx.stdout, [HELP.commands.off]);
+        const helpVerb = "off"; // an identifier, not a literal, at the writer: `copy-inline-literals` follows argument positions
+        writeLines(ctx.stdout, renderVerbHelp(helpVerb));
         return { kind: "exit", code: EXIT.ok };
     }
-    // `--no-color` is a global flag 0.4.4's `off` (which parsed no argv at all) tolerated by construction;
-    // every OTHER argument (including `--json`, which `off` has no mode for) still refuses.
+    // `--no-color` is a global flag 0.4.4's `off` (which parsed no argv at all) tolerated by construction.
     const rest = argv.filter((arg) => !OFF_RECOGNIZED_GLOBAL_FLAGS.includes(arg));
-    if (rest.length > 0) {
-        writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", code: "UNRECOGNIZED_ARGUMENT", what: OFF.unrecognizedArgWhat, why: [OFF.unrecognizedArgWhy] }, ctx.colour));
+    if (rest.some((arg) => arg.startsWith("-"))) {
+        writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", code: "UNRECOGNIZED_ARGUMENT", what: OFF.unrecognizedArgWhat, why: [OFF.unrecognizedArgWhy, OFF.nothingChanged] }, ctx.colour));
         return { kind: "exit", code: EXIT.usage };
     }
+    if (rest.length >= 2)
+        return refuseSeveralNames(ctx, rest, checkName);
+    if (rest.length === 1)
+        return offNamed(ctx, rest[0], checkName);
     const keys = resolveProjectKeys(ctx.cwd);
     if (keys === null) {
         // D31 · 25B. Outside a work tree there is no repository to turn off, and the picker is where an owner or
@@ -517,7 +540,7 @@ function offLocal(ctx, argv) {
             kind: "bad",
             code: "OFF_NEEDS_REPO",
             what: OFF.outsideRepoWhat,
-            why: [],
+            why: [OFF.outsideRepoWhy(channelCommand(ctx.env, ctx.selfPath, OFF.nameCommandPattern))],
             fixLabel: OFF.outsideRepoFixLabel,
             fixes: [channelCommand(ctx.env, ctx.selfPath, COMMANDS.connect)],
         }, ctx.colour));
@@ -539,6 +562,7 @@ function offLocal(ctx, argv) {
         writeLines(ctx.stdout, [
             ...wrap(changed ? OFF.done : OFF.alreadyOff, 2),
             ...wrap(OFF.note, 2),
+            ...wrap(OFF.wayBackLocal(channelCommand(ctx.env, ctx.selfPath, COMMANDS.connect)), 2),
         ]);
         return { kind: "exit", code: EXIT.ok };
     }
@@ -579,37 +603,123 @@ function offLocal(ctx, argv) {
             return { kind: "exit", code: EXIT.failure };
         }
     }
-    return { kind: "slug", slug, changed, recorded, accountWasOff };
+    return { kind: "slug", slug, changed, recorded, accountWasOff, named: false };
+}
+/** The repositories on this machine whose clone's consent names this slug (`git.ts`'s remote, read from each clone's common dir). */
+function clonesOfSlug(home, slug) {
+    return Object.keys(readAllowList(home)).filter((other) => {
+        const otherSlug = remoteSlugOfCommonDir(other);
+        return otherSlug !== null && normalizeSlug(otherSlug) === slug;
+    });
+}
+/** The refusal block for `off`, printed on stderr, exit 2. Nothing else is read or written before it. */
+function refuseOff(ctx, block) {
+    writeLines(ctx.stderr, renderErrorBlock(block, ctx.colour));
+    return { kind: "exit", code: EXIT.usage };
+}
+/** DX-10 (T15): two or more names. The fix is the command with the first well-formed repository given, else `--help`. */
+function refuseSeveralNames(ctx, names, checkName) {
+    const first = names.map((name) => checkName(name)).find((check) => check.ok && check.kind === "repo");
+    const fix = first?.ok === true ? OFF.offCommand(first.key) : ARGS.helpCommand("off");
+    return refuseOff(ctx, {
+        kind: "bad",
+        code: "UNRECOGNIZED_ARGUMENT",
+        what: ARGS.unrecognizedWhat(shownToken(names[1]), "off"),
+        why: [OFF.unrecognizedArgWhy, OFF.nothingChanged],
+        fixLabel: first?.ok === true ? ARGS.fixLabelCorrected : ARGS.fixLabel,
+        fixes: [channelCommand(ctx.env, ctx.selfPath, fix)],
+    });
+}
+/** One name: an owner is refused with its own code (DX-5); a refused name names the token and offers its fix target; an accepted repository is turned off by slug. */
+function offNamed(ctx, token, checkName) {
+    const check = checkName(token);
+    if (check.ok && check.kind === "owner") {
+        return refuseOff(ctx, {
+            kind: "bad",
+            code: "OFF_OWNER_NEEDS_PICKER",
+            what: OFF.ownerWhat(shownToken(token)),
+            why: [OFF.nothingChanged],
+            fixLabel: OFF.ownerFixLabel,
+            fixes: [channelCommand(ctx.env, ctx.selfPath, COMMANDS.connect)],
+        });
+    }
+    if (!check.ok) {
+        return refuseOff(ctx, {
+            kind: "bad",
+            code: "UNRECOGNIZED_ARGUMENT",
+            what: ARGS.unrecognizedWhat(shownToken(token), "off"),
+            why: [OFF.unrecognizedArgWhy, OFF.nothingChanged],
+            fixLabel: check.target === null ? ARGS.fixLabel : ARGS.fixLabelCorrected,
+            fixes: [channelCommand(ctx.env, ctx.selfPath, check.target === null ? ARGS.helpCommand("off") : OFF.offCommand(check.target))],
+        });
+    }
+    const slug = check.key;
+    const matched = clonesOfSlug(ctx.home, slug);
+    const accountWasOff = readAccountState(ctx.home).account?.excluded.includes(slug) === true;
+    // "On" is decided before anything is written: a clone whose consent names the repository, or the grants. Nothing on: nothing to undo.
+    const wasOn = matched.length > 0 || slugGrantedHere(ctx.home, slug);
+    // The same condition as the in-repo path (an unreadable file may hold exclusions we cannot see, so it is not "not on").
+    if (!wasOn && !accountWasOff && !grantsUnreadable(ctx.home)) {
+        writeLines(ctx.stdout, wrap(OFF.nameNotOn(slug), 2));
+        return { kind: "exit", code: EXIT.ok };
+    }
+    let changed = false;
+    for (const other of matched)
+        changed = revokeProject(ctx.home, other) || changed;
+    let recorded = false;
+    try {
+        changed = excludeSlug(ctx.home, slug) || changed;
+        recorded = true;
+    }
+    catch (error) {
+        if (!(error instanceof GrantsUnreadableError))
+            throw error;
+        // The same block as the in-repo path, with the words true from anywhere: the fix names the slug, and the exit is 1 (failed), not 2.
+        writeLines(ctx.stderr, renderErrorBlock({
+            kind: "bad",
+            code: "GRANTS_UNREADABLE",
+            what: OFF.grantsUnreadableWhat,
+            why: [OFF.namedGrantsUnreadableWhy(matched.length > 0)],
+            fixLabel: OFF.grantsUnreadableFixLabel,
+            fixes: [channelCommand(ctx.env, ctx.selfPath, OFF.offCommand(slug))],
+        }, ctx.colour));
+        return { kind: "exit", code: EXIT.failure };
+    }
+    return { kind: "slug", slug, changed, recorded, accountWasOff, named: true };
+}
+/** D-OFFBACK (3G): the way back after every success, through `channelCommand`, so a plugin install names its own command. */
+function wayBackLines(ctx, slug) {
+    return wrap(OFF.wayBack(channelCommand(ctx.env, ctx.selfPath, `${COMMANDS.connect} ${slug}`)), 2);
+}
+/** The words for a machine with no credential (and for `off()`): the name's own lines, or the in-repo ones. */
+function localWords(local) {
+    if (local.named && local.accountWasOff)
+        return OFF.nameAlreadyOffAccount(local.slug);
+    return local.changed ? OFF.doneSlug(local.slug) : OFF.alreadyOff;
 }
 /** `off`, local only: no credential means no account to tell, and its words are the 0.7.0 ones byte for byte. */
 export function off(ctx, argv = []) {
-    const local = offLocal(ctx, argv);
+    // The synchronous form has no name checker (it would need the picker, which is loaded only by `offVerb`), so a name is refused here.
+    const local = offLocal(ctx, argv, () => ({ ok: false, target: null }));
     if (local.kind === "exit")
         return local.code;
-    writeLines(ctx.stdout, [
-        ...wrap(local.changed ? OFF.doneSlug(local.slug) : OFF.alreadyOff, 2),
-        ...wrap(OFF.note, 2),
-    ]);
+    writeLines(ctx.stdout, [...wrap(localWords(local), 2), ...wrap(OFF.note, 2), ...wayBackLines(ctx, local.slug)]);
     return EXIT.ok;
 }
 /**
  * The real `off` (slice 2, S4, brief §2 and §5): the local turn-off first, then — on a machine that has a credential — the
  * exclusion is queued for the account and synced once (3 s, silent on failure; a failed write stays queued and is retried by
- * the next verb). What it says depends on how far the account got:
- *
- *   - synced:  "…and on your other machines once they sync." plus, if any of them have not caught up, how many keep capturing
- *   - not:     the local line, and "Stopped here. Your other machines don't know yet; it will retry."
- *
- * A machine with no credential (never connected, or a pre-0.8.0 per-clone consent only) has no account, and says what 0.7.0 said.
+ * the next verb). T15: the same, from any folder, when the person names the repository.
  */
 export async function offVerb(ctx, argv, deps) {
-    const local = offLocal(ctx, argv);
+    const { checkName } = await import("../picker.js");
+    const local = offLocal(ctx, argv, checkName);
     if (local.kind === "exit")
         return local.code;
-    const { slug, changed, recorded, accountWasOff } = local;
+    const { slug, changed, recorded, accountWasOff, named } = local;
     const hasCredential = loadCredential({ env: ctx.env, home: ctx.home }).kind !== "absent";
     if (!hasCredential) {
-        writeLines(ctx.stdout, [...wrap(changed ? OFF.doneSlug(slug) : OFF.alreadyOff, 2), ...wrap(OFF.note, 2)]);
+        writeLines(ctx.stdout, [...wrap(localWords(local), 2), ...wrap(OFF.note, 2), ...wayBackLines(ctx, slug)]);
         return EXIT.ok;
     }
     // Queued BEFORE the sync, so a sync that cannot happen (offline, a first sync waiting for a terminal) loses nothing.
@@ -618,7 +728,10 @@ export async function offVerb(ctx, argv, deps) {
     const sync = await syncForVerb(ctx, false, deps);
     const synced = sync.kind === "ran" && sync.result.kind === "synced" ? sync.result : null;
     const lines = [];
-    if (!changed) {
+    if (named && accountWasOff) {
+        lines.push(...wrap(OFF.nameAlreadyOffAccount(slug), 2));
+    }
+    else if (!changed) {
         lines.push(...wrap(OFF.alreadyOff, 2));
     }
     else if (accountWasOff) {
@@ -642,6 +755,7 @@ export async function offVerb(ctx, argv, deps) {
             lines.push(...(stoppedSyncReason(ctx, sync.result) ?? []));
     }
     lines.push(...wrap(OFF.note, 2));
+    lines.push(...wayBackLines(ctx, slug));
     writeLines(ctx.stdout, lines);
     return EXIT.ok;
 }

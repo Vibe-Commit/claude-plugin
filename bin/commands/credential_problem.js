@@ -3,10 +3,13 @@
  *
  * `connect` used to fall through to "This machine has no ingest credential." for a wrong-class,
  * unreadable or insecure file: false, and the real fix (`chmod 600`, or `auth`) was one line away.
- * It still never MINTS over a fault (D206 §5) — it only names the fault correctly.
+ * This module only names the fault. T10 (CLI UX PR-C, plan 4.12) reverses D206 §5 for `connect`: at a terminal it then replaces a
+ * wrong-class or unreadable FILE inline (`replaceInline`), printing the block without its fix line. An insecure file and an env token
+ * keep their fix (a `chmod`, and `auth`).
  */
 import { COMMANDS, CREDENTIAL, REJECTED } from "../copy/index.js";
 import { metaFor } from "../credential_meta.js";
+import { terminalSafe } from "../printable.js";
 import { renderErrorBlock, truncatePath } from "../term.js";
 /**
  * The three credential problems that are worth four different fixes on an
@@ -44,7 +47,8 @@ export function credentialProblemBlock(load, authCommand = COMMANDS.auth) {
                 // the file does not clear a folder that other accounts can enter (the user would loop on this block).
                 what: load.target === "directory" ? CREDENTIAL.insecureDirWhat : CREDENTIAL.insecureFileWhat,
                 why: [
-                    `${load.target === "directory" ? CREDENTIAL.insecureDirWhyLabel : CREDENTIAL.insecureFileWhyLabel} ${truncatePath(load.path, 60)}`,
+                    // W1 (prc1): the path is sanitised before it is shortened, so no control byte from a HOME path reaches the terminal.
+                    `${load.target === "directory" ? CREDENTIAL.insecureDirWhyLabel : CREDENTIAL.insecureFileWhyLabel} ${truncatePath(terminalSafe(load.path), 60)}`,
                     `${CREDENTIAL.insecureFileModeLabel} ${load.mode}`,
                     load.target === "directory" ? CREDENTIAL.insecureDirWhy : CREDENTIAL.insecureFileWhy,
                 ],
@@ -56,7 +60,7 @@ export function credentialProblemBlock(load, authCommand = COMMANDS.auth) {
                 kind: "bad",
                 code: "CREDENTIAL_FILE_UNREADABLE",
                 what: CREDENTIAL.unreadableWhat,
-                why: [`${CREDENTIAL.insecureFileWhyLabel} ${truncatePath(load.path, 60)}`, CREDENTIAL.unreadableWhy],
+                why: [`${CREDENTIAL.insecureFileWhyLabel} ${truncatePath(terminalSafe(load.path), 60)}`, CREDENTIAL.unreadableWhy],
                 fixLabel: CREDENTIAL.unreadableFix,
                 fixes: [authCommand],
             };

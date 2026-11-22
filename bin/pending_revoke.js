@@ -40,7 +40,8 @@ import { writeFileAtomic } from "./atomic_write.js";
 import { IngestCredential, INGEST_TOKEN_PREFIX } from "./credential.js";
 import { LEASE_MS, leased, readPendingRevokes, readQueue } from "./pending_revoke_file.js";
 import { REVOKE_TIMEOUT_MS, selfRevokeOutcome } from "./oauth/retire.js";
-import { credentialsPath, pendingRevokePath, rootDir } from "./paths.js";
+import { claimPath } from "./hooks/fire_lock.js";
+import { credentialsPath, pendingRevokeLockPath, pendingRevokePath, rootDir } from "./paths.js";
 import { isAllowedIngestUrl } from "./post.js";
 export { readPendingRevokes } from "./pending_revoke_file.js";
 /** More rows than `g` can produce in earnest: past it `g` refuses rather than drop one. */
@@ -63,27 +64,61 @@ function writeRows(home, rows) {
     chmodSync(rootDir(home), 0o700);
     writeFileAtomic(pendingRevokePath(home), `${JSON.stringify({ revokes: rows }, null, 2)}\n`, 0o600);
 }
+/** prc1 S5: how long a write waits for the record's lock. A holder keeps it for milliseconds, so a longer wait means a dead or wedged one. */
+export const RECORD_LOCK_WAIT_MS = 2_000;
+/** A holder's own staleness bound, written into the lock by `claimPath`: a lock older than this may be reclaimed. Above the wait. */
+const RECORD_LOCK_STALE_MS = 3_000;
+const RECORD_LOCK_POLL_MS = 20;
 /**
- * Write the row for a credential that has just been made. Never overwrites a file it cannot read, never drops a row.
- * `lease: true` is `g` holding the credential at its y/N: the row carries `{ pid, lease_until }` (30 minutes) so another verb's retry
- * leaves it alone while it is kept; every other writer (a test, an orphaned row) has no lease and is retried at once.
+ * prc1 S5: run `body` holding the record's cross-process lock, or return `null` when it is not taken within `RECORD_LOCK_WAIT_MS`.
+ * The lock is `claimPath` (`hooks/fire_lock.ts`): a `link()`-atomic create, so two processes cannot both hold it. Every read-modify-write
+ * of the record goes through here. Without it, two processes that read one snapshot and each append their row would both rename, and the
+ * later rename drops the earlier row (a credential made and never recorded). Reads take no lock: the record is replaced by an atomic rename.
  */
+export function withRecordLock(home, body) {
+    const path = pendingRevokeLockPath(home);
+    const deadline = Date.now() + RECORD_LOCK_WAIT_MS;
+    for (;;) {
+        const claim = claimPath(path, RECORD_LOCK_STALE_MS);
+        if (claim !== null) {
+            try {
+                return body();
+            }
+            finally {
+                claim.release();
+            }
+        }
+        if (Date.now() >= deadline)
+            return null;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, RECORD_LOCK_POLL_MS);
+    }
+}
+export function recordGate(home) {
+    const queue = readQueue(home);
+    if (queue.kind === "refused")
+        return { kind: "refused", read: queue.read, path: pendingRevokePath(home) };
+    return { kind: "open", rows: queue.kind === "ok" ? queue.rows : [] };
+}
 export function addPendingRevoke(home, credential, endpoint, now, options = {}) {
     try {
         const token = credential.expose();
         if (!token.startsWith(INGEST_TOKEN_PREFIX))
             return { kind: "failed" };
-        const queue = readQueue(home);
-        if (queue.kind === "refused")
-            return { kind: "refused", read: queue.read };
-        const rows = queue.kind === "ok" ? queue.rows : [];
-        if (rows.some((row) => row.token === token))
+        // prc1 S5: the read AND the write are one step under the lock. A lock not taken in time is a record failure: nothing is written.
+        const outcome = withRecordLock(home, () => {
+            const gate = recordGate(home);
+            if (gate.kind === "refused")
+                return { kind: "refused", read: gate.read };
+            const rows = gate.rows;
+            if (rows.some((row) => row.token === token))
+                return { kind: "written" };
+            if (rows.length >= MAX_ROWS)
+                return { kind: "full" };
+            const lease = options.lease === true ? { pid: process.pid, lease_until: new Date(now.getTime() + LEASE_MS).toISOString() } : null;
+            writeRows(home, [...rows, { token, minted_at: now.toISOString(), origin: new URL(endpoint).origin, lease }]);
             return { kind: "written" };
-        if (rows.length >= MAX_ROWS)
-            return { kind: "full" };
-        const lease = options.lease === true ? { pid: process.pid, lease_until: new Date(now.getTime() + LEASE_MS).toISOString() } : null;
-        writeRows(home, [...rows, { token, minted_at: now.toISOString(), origin: new URL(endpoint).origin, lease }]);
-        return { kind: "written" };
+        });
+        return outcome ?? { kind: "failed" };
     }
     catch {
         return { kind: "failed" };
@@ -96,10 +131,12 @@ export function removePendingRevoke(home, token) {
 /** Give the row up to the retry: `g` is no longer holding the credential, so the next verb may revoke it. Re-reads before it writes. */
 export function releaseLease(home, token) {
     try {
-        const queue = readQueue(home);
-        if (queue.kind !== "ok" || !queue.rows.some((row) => row.token === token && row.lease !== null))
-            return;
-        writeRows(home, queue.rows.map((row) => (row.token === token ? { ...row, lease: null } : row)));
+        withRecordLock(home, () => {
+            const queue = readQueue(home);
+            if (queue.kind !== "ok" || !queue.rows.some((row) => row.token === token && row.lease !== null))
+                return;
+            writeRows(home, queue.rows.map((row) => (row.token === token ? { ...row, lease: null } : row)));
+        });
     }
     catch {
         /* the lease runs out by itself */
@@ -119,12 +156,15 @@ export function holdsRow(home, token) {
 }
 function removeRows(home, tokens) {
     try {
-        const queue = readQueue(home);
-        if (queue.kind !== "ok")
-            return;
-        const rows = queue.rows.filter((row) => !tokens.has(row.token));
-        if (rows.length !== queue.rows.length)
-            writeRows(home, rows);
+        // A lock not taken leaves the row: the next verb's retry settles it (a kept credential's row is dropped there by its token).
+        withRecordLock(home, () => {
+            const queue = readQueue(home);
+            if (queue.kind !== "ok")
+                return;
+            const rows = queue.rows.filter((row) => !tokens.has(row.token));
+            if (rows.length !== queue.rows.length)
+                writeRows(home, rows);
+        });
     }
     catch {
         /* the row stays; the next verb retries */

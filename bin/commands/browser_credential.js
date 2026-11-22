@@ -27,20 +27,25 @@
  * nothing to use — `connect` gates on `absent`, and `auth` is the verb a user
  * types precisely to replace what is there.
  */
+import { lstatSync } from "node:fs";
 import { hostname as osHostname } from "node:os";
 import { headlessReason } from "../device_mode.js";
-import { channelCommand, resolveOnPath } from "../install.js";
-import { AUTH, COMMANDS, SIGNIN } from "../copy/index.js";
-import { loadCredential } from "../credential.js";
+import { authCommandFor, channelCommand, resolveOnPath } from "../install.js";
+import { AUTH, COMMANDS, CREDENTIAL, SIGNIN } from "../copy/index.js";
+import { credentialFolderWritable, loadCredential } from "../credential.js";
 import { EXIT } from "../exit.js";
 import { mcpUrl } from "../oauth/discovery.js";
 import { machineLabel } from "../oauth/mint.js";
 import { loadSession } from "../oauth/session.js";
 import { authorizedAccessToken, HTTP_TIMEOUT_MS, mintWithSession, openBrowser as platformOpenBrowser, signIn, } from "../oauth/signin.js";
-import { paint, renderErrorBlock, wrap } from "../term.js";
+import { credentialsPath } from "../paths.js";
+import { MAX_ROWS, recordGate, withRecordLock } from "../pending_revoke.js";
+import { paint, renderErrorBlock, truncatePath, wrap } from "../term.js";
+import { terminalSafe } from "../printable.js";
+import { credentialProblemBlock } from "./credential_problem.js";
 import { writeLines } from "./context.js";
 import { deviceCredential } from "./device_credential.js";
-import { finishMint } from "./finish_mint.js";
+import { connectMintBlock, finishMint, writeAheadOf } from "./finish_mint.js";
 import { probeCredential } from "./probe.js";
 // `finishMint` and its types moved to `finish_mint.ts` (`CR-234d`) so the device flow can share them without
 // a cycle. Re-exported here because this is where every caller and test has always found them.
@@ -51,6 +56,27 @@ function scopeOf(options) {
         ...(options.scope === undefined ? {} : { scope: options.scope }),
         ...(options.hold === undefined ? {} : { hold: options.hold }),
     };
+}
+/**
+ * The sign-in options that are connect's own (plan 4.12 row 5, DX-7), for every sign-in `browserCredential` starts on connect's path: the
+ * saved-choices line, the host it tried, and the device fix. Absent for every other caller, byte-identical.
+ */
+function connectSignInOf(options, endpoint) {
+    if (options.connectPath === undefined)
+        return {};
+    return {
+        ...(options.connectPath.grantsWritten === true ? { savedChoices: true } : {}),
+        connectHost: new URL(endpoint).host,
+        onConnectPath: true,
+    };
+}
+/** `connect`'s re-run line, passed to `finishMint` only when `connect` is the caller (exactOptionalPropertyTypes). */
+function rerunOf(options) {
+    return options.connectPath === undefined ? {} : { rerun: options.connectPath.rerun };
+}
+/** `connect`'s path, handed down to the device flow only when set (exactOptionalPropertyTypes). */
+function connectPathOf(options) {
+    return options.connectPath === undefined ? {} : { connectPath: options.connectPath };
 }
 /** `signInBeat`'s sentinel for "no browser, go to the device flow". Never an exit code a verb returns. */
 export const NO_BROWSER = -1;
@@ -71,14 +97,14 @@ export async function signInBeat(ctx, options) {
             })
             : null;
         if (live === null || live.kind !== "expired") {
-            writeLines(ctx.stdout, wrap(SIGNIN.alreadySignedIn, 2));
+            writeLines(ctx.stdout, wrap(options.forMint === true ? SIGNIN.reusedForMint : SIGNIN.alreadySignedIn, 2));
             return EXIT.ok;
         }
         // The refresh grant was refused: the session is over. Sign in again below.
     }
     const endpoint = mcpUrl(ctx.env);
     if (endpoint === null) {
-        writeLines(ctx.stderr, signInError(ctx, options.retry, "SIGNIN_SERVICE_NOT_FOUND", SIGNIN.noServerWhat, SIGNIN.noServerRefusedWhy));
+        writeLines(ctx.stderr, signInError(ctx, options.retry, "SIGNIN_SERVICE_NOT_FOUND", SIGNIN.noServerWhat, SIGNIN.noServerRefusedWhy, undefined, options.savedChoices === true, null, options.onConnectPath === true));
         return EXIT.failure;
     }
     const outcome = await signIn({
@@ -109,37 +135,48 @@ export async function signInBeat(ctx, options) {
     }
     if (outcome.kind === "no-browser")
         return NO_BROWSER;
-    writeLines(ctx.stderr, ["", ...signInFailure(ctx, options.retry, outcome)]);
+    writeLines(ctx.stderr, ["", ...signInFailure(ctx, options.retry, outcome, options.savedChoices === true, options.connectHost ?? null, options.onConnectPath === true)]);
     return EXIT.failure;
 }
-/** §13.6's shape for a sign-in failure. One renderer, six outcomes. */
-function signInFailure(ctx, retry, outcome) {
+/** §13.6's shape for a sign-in failure. One renderer, six outcomes. `savedChoices`: connect's grants are already written (T10 DX-7). */
+function signInFailure(ctx, retry, outcome, savedChoices, connectHost, onConnectPath) {
+    const failure = (code, what, why, fixLabel) => signInError(ctx, retry, code, what, why, fixLabel, savedChoices, null, onConnectPath);
+    // DX-7 (T10, connect's path only): an unreachable sign-in service names the host it tried, the variable by name, and says to retry
+    // once, then check the network. Every other caller keeps the block above, byte-identical.
+    const unreachable = (code, what, why, fixLabel) => connectHost === null
+        ? failure(code, what, why, fixLabel)
+        : signInError(ctx, retry, code, what, why, AUTH.unreachableFix, savedChoices, AUTH.unreachableTried(connectHost), onConnectPath);
     switch (outcome.kind) {
         case "no-server":
-            return signInError(ctx, retry, "SIGNIN_SERVICE_NOT_FOUND", SIGNIN.noServerWhat, outcome.detail === "unreachable"
-                ? SIGNIN.noServerUnreachableWhy
-                : SIGNIN.noServerMalformedWhy, SIGNIN.noServerFix);
+            if (outcome.detail === "unreachable") {
+                return unreachable("SIGNIN_SERVICE_NOT_FOUND", SIGNIN.noServerWhat, SIGNIN.noServerUnreachableWhy, SIGNIN.noServerFix);
+            }
+            return failure("SIGNIN_SERVICE_NOT_FOUND", SIGNIN.noServerWhat, SIGNIN.noServerMalformedWhy, SIGNIN.noServerFix);
         case "denied":
-            return signInError(ctx, retry, "SIGNIN_DENIED", SIGNIN.deniedWhat, SIGNIN.deniedWhy, SIGNIN.deniedFix);
+            return failure("SIGNIN_DENIED", SIGNIN.deniedWhat, SIGNIN.deniedWhy, SIGNIN.deniedFix);
         case "timeout":
-            return signInError(ctx, retry, "SIGNIN_TIMED_OUT", SIGNIN.timeoutWhat, SIGNIN.timeoutWhy, SIGNIN.timeoutFix);
+            // prc1 S9(b): a loopback timeout shares this renderer, so connect's path gets DX-7's unreachable recovery (host, name, retry once).
+            return unreachable("SIGNIN_TIMED_OUT", SIGNIN.timeoutWhat, SIGNIN.timeoutWhy, SIGNIN.timeoutFix);
         case "rejected":
-            return signInError(ctx, retry, "SIGNIN_CLIENT_REFUSED", SIGNIN.rejectedWhat, SIGNIN.rejectedWhy, SIGNIN.rejectedFix);
+            return failure("SIGNIN_CLIENT_REFUSED", SIGNIN.rejectedWhat, SIGNIN.rejectedWhy, SIGNIN.rejectedFix);
         case "unreachable":
-            return signInError(ctx, retry, "SIGNIN_UNREACHABLE", SIGNIN.unreachableWhat, SIGNIN.unreachableWhy, SIGNIN.unreachableFix);
+            return unreachable("SIGNIN_UNREACHABLE", SIGNIN.unreachableWhat, SIGNIN.unreachableWhy, SIGNIN.unreachableFix);
         case "malformed":
-            return signInError(ctx, retry, "SIGNIN_ANSWER_UNUSABLE", SIGNIN.malformedWhat, SIGNIN.malformedWhy, SIGNIN.malformedFix);
+            return failure("SIGNIN_ANSWER_UNUSABLE", SIGNIN.malformedWhat, SIGNIN.malformedWhy, SIGNIN.malformedFix);
     }
 }
-function signInError(ctx, retry, code, what, why, fixLabel = SIGNIN.noServerFix) {
+function signInError(ctx, retry, code, what, why, fixLabel = SIGNIN.noServerFix, savedChoices = false, extraWhy = null, onConnectPath = false) {
     return renderErrorBlock({
         kind: "bad",
         code,
         what,
-        why: [why],
+        // T10 (DX-7): on connect's path, once the grants are written, a failed sign-in says what it left behind (the saved choices).
+        why: [why, ...(extraWhy === null ? [] : [extraWhy]), ...(savedChoices ? [AUTH.savedChoicesWhy] : [])],
         fixLabel,
         fixes: [
             channelCommand(ctx.env, ctx.selfPath, retry === "auth" ? COMMANDS.auth : retry === "connect" ? COMMANDS.connect : COMMANDS.signIn),
+            // Plan 4.12 row 5: connect's path also names the device flow (no browser here). Absent otherwise: byte-identical.
+            ...(onConnectPath && retry === "connect" ? [channelCommand(ctx.env, ctx.selfPath, COMMANDS.connectDevice)] : []),
         ],
     }, ctx.colour);
 }
@@ -151,11 +188,20 @@ function signInError(ctx, retry, code, what, why, fixLabel = SIGNIN.noServerFix)
  * capture) and a confirmation here would be a second one.
  */
 export async function browserCredential(ctx, retry, deps = {}, options = {}) {
+    // ⛔ T10 (B4, plan 4.12) and prc1 S1/S8: the state a new credential would be saved into must be sound BEFORE the session, the
+    // browser or the device code. Every caller, auth included: a credential the server creates and this machine cannot save is a live
+    // credential nobody holds. The same check `connect` makes at its top (`signInPreflight`).
+    const fixCommand = options.connectPath?.rerun ?? authCommandFor(ctx.env, ctx.selfPath);
+    const stateDir = stateDirPreflight(ctx.home);
+    if (stateDir.kind === "refused") {
+        writeLines(ctx.stderr, ["", ...renderErrorBlock(stateDir.block, ctx.colour)]);
+        return { kind: "failed" };
+    }
     // Resolved ONCE and handed to both halves, so the session and the credential
     // cannot come from two different servers.
     const endpoint = mcpUrl(ctx.env);
     if (endpoint === null) {
-        writeLines(ctx.stderr, signInError(ctx, retry, "SIGNIN_SERVICE_NOT_FOUND", SIGNIN.noServerWhat, SIGNIN.noServerRefusedWhy));
+        writeLines(ctx.stderr, signInError(ctx, retry, "SIGNIN_SERVICE_NOT_FOUND", SIGNIN.noServerWhat, SIGNIN.noServerRefusedWhy, undefined, options.connectPath?.grantsWritten === true, null, options.connectPath !== undefined));
         return { kind: "failed" };
     }
     const fetchImpl = deps.fetch ?? fetch;
@@ -170,27 +216,40 @@ export async function browserCredential(ctx, retry, deps = {}, options = {}) {
             who: await probeCredential(ctx, loaded.credential, fetchImpl, { record: false }),
         }
         : null;
+    // ⛔ prc1 S3 (P6's condition 3): a mint that will HOLD its credential (connect's replace, `writeAhead`; `g`, `hold`) needs a record it
+    // can be written to. connect's 401 replace is known only after the probe above, so the queue is checked HERE, after the probe and before
+    // any browser or device open: refused, nothing is requested. A mint that holds nothing (auth, connect's first sign-in) does not depend
+    // on the record; connect's top checks the queue for its own mint paths (S8).
+    if (options.connectPath?.writeAhead !== undefined || options.hold !== undefined) {
+        const queue = queuePreflight(ctx.home, { fixCommand, statusCommand: channelCommand(ctx.env, ctx.selfPath, COMMANDS.status) });
+        if (queue.kind === "refused") {
+            writeLines(ctx.stderr, ["", ...renderErrorBlock(queue.block, ctx.colour)]);
+            return { kind: "failed" };
+        }
+    }
     // ⛔ DEVICE MODE (`CR-234d`, plan item 7). By request (`--device`), or because this machine has no browser
     // of its own: an SSH session, or a Linux box with no display. The loopback sign-in would open a browser
     // nobody can see and wait out its deadline, so the machine asks for a code instead. The prefilled link is
     // opened only where a browser plausibly exists — `--device` on a desktop — never on a headless box.
     const headless = headlessReason(ctx.env, deps.platform ?? process.platform);
     if (options.device === true || headless !== null) {
-        return await deviceCredential(ctx, { endpoint, prior, openLink: headless === null, ...scopeOf(options) }, deps);
+        return await deviceCredential(ctx, { endpoint, prior, openLink: headless === null, ...scopeOf(options), ...connectPathOf(options) }, deps);
     }
     const signedIn = await signInBeat(ctx, {
         ...deps,
         retry,
+        forMint: true,
         // 2(a): ask the authorize page to bind the org the old credential belongs to. Only on a 200 —
         // an org the server would not vouch for is not worth asking for.
         ...(prior?.who.kind === "ok" ? { orgId: prior.who.orgId } : {}),
+        ...connectSignInOf(options, endpoint),
         // A browser that cannot be opened is a headless machine the check above did not recognise: go to
         // the device flow rather than print a URL and wait for a callback nobody can make.
         fallbackToDevice: true,
         openBrowser: deps.openBrowser ?? ((url) => canOpenBrowser(ctx.env, deps.platform ?? process.platform) && platformOpenBrowser(url)),
     });
     if (signedIn === NO_BROWSER) {
-        return await deviceCredential(ctx, { endpoint, prior, openLink: false, ...scopeOf(options) }, deps);
+        return await deviceCredential(ctx, { endpoint, prior, openLink: false, ...scopeOf(options), ...connectPathOf(options) }, deps);
     }
     if (signedIn !== EXIT.ok) {
         return { kind: "failed" };
@@ -212,7 +271,8 @@ export async function browserCredential(ctx, retry, deps = {}, options = {}) {
     // fresh sign-in and one more mint. Nothing else does: a `busy` lock or an
     // unreachable server is not fixed by a browser.
     if (outcome.kind === "not-authorized" && outcome.authorized.kind === "expired") {
-        if ((await signInBeat(ctx, { ...deps, retry, replace: true })) !== EXIT.ok) {
+        // prc1 S9(a): the retry is the same connect sign-in as the first call, with the same recovery lines (saved choices, host, device).
+        if ((await signInBeat(ctx, { ...deps, retry, forMint: true, ...connectSignInOf(options, endpoint), replace: true })) !== EXIT.ok) {
             return { kind: "failed" };
         }
         outcome = await mint();
@@ -225,13 +285,121 @@ export async function browserCredential(ctx, retry, deps = {}, options = {}) {
             endpoint,
             fetch: fetchImpl,
             // The block guards a re-auth that lands in a DIFFERENT workspace. The device flow passes
-            // "always" — there the approver is not the person at this terminal.
-            confirm: "on-replace",
+            // "always" — there the approver is not the person at this terminal. T10 (plan 4.12): `connect`
+            // over a 401'd or faulty FILE credential asks ALWAYS, because `on-replace` asks only when the old
+            // credential probed ok (`finish_mint.ts` `askUnnamed`), and a 401'd one never did.
+            confirm: options.connectPath?.replacing === true ? "always" : "on-replace",
+            ...rerunOf(options),
+            ...connectPathOf(options),
+            ...writeAheadOf(options.connectPath),
             ...scopeOf(options),
         });
     }
-    writeLines(ctx.stderr, ["", ...renderErrorBlock({ kind: "bad", code: mintCode(outcome), what: AUTH.mintFailedWhat, why: [mintWhy(outcome)] }, ctx.colour)]);
+    // T10 (B5, DX-7): connect's path names the recovery for the failures it can (rate limited, not a member, unreachable). Every other
+    // caller prints today's block.
+    const connectBlock = options.connectPath === undefined ? null : connectMintBlock(outcome, options.connectPath, endpoint, ctx.now());
+    writeLines(ctx.stderr, [
+        "",
+        ...renderErrorBlock(connectBlock ?? { kind: "bad", code: mintCode(outcome), what: AUTH.mintFailedWhat, why: [mintWhy(outcome)] }, ctx.colour),
+    ]);
     return { kind: "failed" };
+}
+/**
+ * prc1 S1/S3/S8 (P6's split, 2026-11-22): the checks a sign-in makes before anything is requested, minted or opened. ONE predicate for
+ * each, used by `browserCredential` and by `connect`'s top, never duplicated.
+ *   - `stateDirPreflight`, for EVERY sign-in: `~/.vibecommit` writable (B4), and the credential path absent or a regular file (S1: a
+ *     directory or other non-file there cannot be saved over, and a read error is the unreadable fault, never "absent").
+ *   - `queuePreflight`, for a mint that may have to be recorded: the pending-revoke record passes `recordGate` (the SAME predicate
+ *     `addPendingRevoke` records with) and has room (S3).
+ *   - `signInPreflight`, `connect`'s top (S8): the first always, the second when that run can mint (`queue: true`).
+ * `fixCommand` is the verb a fix names (connect's own command on connect's path, `auth`'s otherwise). `statusCommand` is THIS install's
+ * `vibecommit status` (`channelCommand`), the full record's fix: `status` retries the waiting revokes at its start (cli.ts).
+ */
+export function signInPreflight(home, options) {
+    const stateDir = stateDirPreflight(home);
+    if (stateDir.kind === "refused" || !options.queue)
+        return stateDir;
+    return queuePreflight(home, options);
+}
+/** prc1 S1/S8: `~/.vibecommit` writable, and the credential path absent or a regular file. For every sign-in. */
+export function stateDirPreflight(home) {
+    const folder = credentialFolderWritable(home);
+    if (folder.kind === "unwritable")
+        return { kind: "refused", block: folderUnwritableErrorBlock(folder.path) };
+    const credential = credentialsPath(home);
+    let isFile = true;
+    try {
+        isFile = lstatSync(credential).isFile();
+    }
+    catch (error) {
+        // ENOENT: nothing saved yet, which is the normal first sign-in. Any other error is not a file this check can vouch for.
+        isFile = error.code === "ENOENT";
+    }
+    if (!isFile)
+        return { kind: "refused", block: notAFileErrorBlock(credential) };
+    return { kind: "ok" };
+}
+/** prc1 S3: the pending-revoke record passes `recordGate` (the record predicate) and has room. For a mint that may be recorded. */
+export function queuePreflight(home, fixes) {
+    // prc1 S5: read under the record's lock, so the preflight and the write see the same record. A lock not taken in time refuses too.
+    const gate = withRecordLock(home, () => recordGate(home));
+    if (gate === null)
+        return { kind: "refused", block: queueBusyErrorBlock() };
+    if (gate.kind === "refused") {
+        if (gate.read.kind === "insecure-file")
+            return { kind: "refused", block: credentialProblemBlock(gate.read, fixes.fixCommand) };
+        return { kind: "refused", block: queueUnreadableErrorBlock(gate.path) };
+    }
+    if (gate.rows.length >= MAX_ROWS)
+        return { kind: "refused", block: queueFullErrorBlock(fixes.statusCommand) };
+    return { kind: "ok" };
+}
+function folderUnwritableErrorBlock(path) {
+    return {
+        kind: "bad",
+        code: "CREDENTIAL_FOLDER_UNWRITABLE",
+        what: CREDENTIAL.unwritableWhat,
+        why: [`${CREDENTIAL.insecureDirWhyLabel} ${truncatePath(terminalSafe(path), 60)}`, CREDENTIAL.unwritableWhy],
+        fixLabel: CREDENTIAL.unwritableFix,
+        fixes: [COMMANDS.chmodDirectory],
+    };
+}
+function notAFileErrorBlock(path) {
+    return {
+        kind: "bad",
+        code: "CREDENTIAL_FILE_UNREADABLE",
+        what: CREDENTIAL.notAFileWhat,
+        why: [`${CREDENTIAL.insecureFileWhyLabel} ${truncatePath(terminalSafe(path), 60)}`, CREDENTIAL.notAFileWhy],
+        fixLabel: CREDENTIAL.notAFileFix,
+    };
+}
+function queueUnreadableErrorBlock(path) {
+    return {
+        kind: "bad",
+        code: "PENDING_REVOKE_UNREADABLE",
+        what: CREDENTIAL.queueUnreadableWhat,
+        why: [`${CREDENTIAL.insecureFileWhyLabel} ${truncatePath(terminalSafe(path), 60)}`, CREDENTIAL.queueUnreadableWhy],
+        fixLabel: CREDENTIAL.queueUnreadableFix,
+    };
+}
+function queueBusyErrorBlock() {
+    return {
+        kind: "bad",
+        code: "PENDING_REVOKE_BUSY",
+        what: CREDENTIAL.queueBusyWhat,
+        why: [CREDENTIAL.queueBusyWhy],
+        fixLabel: CREDENTIAL.queueBusyFix,
+    };
+}
+function queueFullErrorBlock(statusCommand) {
+    return {
+        kind: "bad",
+        code: "PENDING_REVOKE_FULL",
+        what: CREDENTIAL.queueFullWhat(MAX_ROWS),
+        why: [CREDENTIAL.queueFullWhy],
+        fixLabel: CREDENTIAL.queueFullFix,
+        fixes: [statusCommand],
+    };
 }
 /**
  * Is there anything on this machine that could open a URL? `openBrowser` reports `true` once `spawn` returns,

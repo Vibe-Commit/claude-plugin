@@ -11,13 +11,87 @@ function workspaceQuestion(scope) {
 import { isAffirmative } from "../consent.js";
 import { authCommandFor } from "../install.js";
 import { CONNECT, REPLACE, RETIRE, AUTH } from "../copy/index.js";
-import { loadedFingerprints, recordCredentialMeta } from "../credential_meta.js";
+import { loadedFingerprints, metaFor, recordCredentialMeta } from "../credential_meta.js";
 import { saveCredential } from "../credential.js";
 import { REVOKE_TIMEOUT_MS, retireCredential, selfRevokeCredential, selfRevokeOutcome } from "../oauth/retire.js";
+import { terminalSafe } from "../printable.js";
 import { credentialFingerprint } from "../post.js";
 import { paint, labelled, renderErrorBlock, truncateMiddle, wrap, WRAP_COLUMNS, LABEL_GUTTER } from "../term.js";
 import { writeLines } from "./context.js";
 import { probeCredential } from "./probe.js";
+/**
+ * T10 (B5, DX-7): `connect`'s recovery line for the mint failures that have one (rate limited, not a member, unreachable). Only
+ * `connect` passes a `connectPath`. For every other caller, and for the failures this does not name, the caller prints its own block,
+ * byte-identical to today's. The rate-limit line uses the server's `Retry-After` when the mint answer carries one (prc1 S9(c)), else the
+ * plan's "up to an hour". The not-a-member line names no account: the server's refusal carries none.
+ */
+export function connectMintBlock(outcome, connectPath, endpoint, now) {
+    if (outcome.kind === "refused" && outcome.error === "rate_limited") {
+        // prc1 S9(c): the server's own retry time when it sent one (a clock reading, local time), else the plan's fallback.
+        const wait = outcome.retryAfterS === undefined
+            ? AUTH.rateLimitedWait
+            : AUTH.rateLimitedAt(clockReading(new Date(now.getTime() + outcome.retryAfterS * 1000)));
+        return {
+            kind: "bad",
+            code: "MINT_RATE_LIMITED",
+            what: AUTH.mintFailedWhat,
+            why: [AUTH.mintRateLimitedWhy, wait],
+            fixLabel: AUTH.rateLimitedAgain,
+            fixes: [connectPath.rerun],
+        };
+    }
+    if (outcome.kind === "refused" && outcome.error === "not_a_member") {
+        return { kind: "bad", code: "MINT_NOT_A_MEMBER", what: AUTH.mintFailedWhat, why: [AUTH.mintNotMemberWhy], fixLabel: AUTH.notMemberFix };
+    }
+    if (outcome.kind === "unreachable" || (outcome.kind === "refused" && outcome.status >= 500)) {
+        return {
+            kind: "bad",
+            code: "MINT_FAILED",
+            what: AUTH.mintFailedWhat,
+            // A 5xx is an ANSWER (the service refused), so it keeps `auth`'s refused sentence; only no answer at all is "did not answer" (T20
+            // sweep, CL-C F4). The recovery line is DX-7's for both: retry once, then the network.
+            why: [
+                outcome.kind === "unreachable" ? AUTH.mintUnreachableWhy : AUTH.mintRefusedWhy,
+                AUTH.unreachableTried(terminalSafe(new URL(endpoint).host)),
+            ],
+            fixLabel: AUTH.unreachableFix,
+            fixes: [connectPath.rerun],
+        };
+    }
+    return null;
+}
+/** `14:32`, local time, 24-hour: an absolute clock reading, never "in 5 minutes" (the waiting block's convention, device_credential.ts). */
+function clockReading(date) {
+    const two = (n) => String(n).padStart(2, "0");
+    return `${two(date.getHours())}:${two(date.getMinutes())}`;
+}
+/** `connect`'s write-ahead row, handed to `finishMint` only when set (exactOptionalPropertyTypes). */
+export function writeAheadOf(connectPath) {
+    return connectPath?.writeAhead === undefined ? {} : { writeAhead: connectPath.writeAhead };
+}
+/** The row a credential was written under goes once the credential is revoked cleanly, by the hold (`g`) or the write-ahead (connect). */
+function releaseRow(input, minted) {
+    input.hold?.release(minted);
+    input.writeAhead?.release(minted);
+}
+/** GitHub's own limit on a handle. A longer one is cut in the middle (§13.4), so no row passes 80 columns. */
+const HANDLE_MAX = 39;
+/**
+ * ENG-15 (T10; placement settled with P6, the words are DRAFT for P7). On `connect`'s replace, the first line of the confirmation
+ * names the handle this machine was signed in as and the one just signed in. One warn block. Nothing is printed when the old handle
+ * is unknown, or when both are known and equal (case-insensitive). Handles only, never an organization (T41c).
+ */
+function replacedWarnLines(ctx, was, now) {
+    if (was === null)
+        return [];
+    if (now !== null && now.toLowerCase() === was.toLowerCase())
+        return [];
+    const old = `@${truncateMiddle(terminalSafe(was), HANDLE_MAX)}`;
+    const what = now === null
+        ? REPLACE.replacedUnknown(old)
+        : REPLACE.replacedOther(old, `@${truncateMiddle(terminalSafe(now), HANDLE_MAX)}`);
+    return renderErrorBlock({ kind: "warn", what, why: [] }, ctx.colour);
+}
 /**
  * Everything between "the server minted a credential" and "this machine has it" — shared by the
  * loopback flow now and the device flow in slice 2 (eng review D1 = B, the smaller arrangement).
@@ -42,6 +116,12 @@ export async function finishMint(ctx, input) {
         // A 404 (`unknown`) is a server with no revoke route: the credential may still be live, so it is NOT "revoked" ("0.8.0 truth fixes" F7).
         return { kind: "unrecorded", revoked: revoked.kind === "retired" || revoked.kind === "gone" };
     }
+    // ⛔ WRITE-AHEAD (T10 B3): the row exists before the probe and before the question. If it cannot be written, revoke in memory and
+    // return `unrecorded`, as `hold` does: the caller prints it (`printUnrecorded`) and exits. Nothing is kept.
+    if (input.writeAhead !== undefined && !input.writeAhead.record(minted, input.endpoint)) {
+        const revoked = await selfRevokeOutcome(input.endpoint, minted, { fetch: input.fetch, timeoutMs: REVOKE_TIMEOUT_MS });
+        return { kind: "unrecorded", revoked: revoked.kind === "retired" || revoked.kind === "gone" };
+    }
     const fresh = await probeCredential(ctx, minted, input.fetch, { record: false });
     if (fresh.kind === "unauthorized") {
         writeLines(ctx.stderr, ["", ...renderErrorBlock({ kind: "bad", code: "MINT_FAILED", what: AUTH.mintFailedWhat, why: [AUTH.mintUnconfirmedWhy] }, ctx.colour)]);
@@ -59,15 +139,23 @@ export async function finishMint(ctx, input) {
     // No prior (or an env credential) means nothing to move from, so an unanswered probe still saves.
     const unconfirmed = fresh.kind !== "ok";
     const askUnnamed = input.confirm === "on-replace" && priorOk && unconfirmed;
+    // What the confirmation shows. The probe's answer, else (A4 §3) the ticket's own account and workspace, else the mint's facts. P6
+    // (prc1 S2) withdrew ENG-15's ticket→facts fallback: on connect's path the question is reached only with a fresh ok probe.
     const shown = fresh.kind === "ok"
         ? { account: fresh.account, orgName: fresh.orgName }
         : input.confirm === "always"
             ? { account: input.ticket?.account ?? null, orgName: input.ticket?.orgName ?? null }
             : { account: facts.account, orgName: null };
-    if (input.confirm === "always" && unconfirmed && shown?.orgName == null) {
+    // ENG-15: the handle this machine's sidecar names for the credential being replaced. `prior` is FILE-only (`browser_credential.ts`),
+    // so an environment credential, which is never `prior`, has none and prints no line.
+    const replacedAccount = input.connectPath?.replacing === true && prior !== null ? (metaFor(ctx.home, credentialFingerprint(prior.credential))?.account ?? null) : null;
+    // ⛔ FAIL CLOSED (prc1 S2, plan 4.12 :1113): on connect's REPLACE (the 401 and faulty-file cases) a probe that did not answer saves
+    // nothing, the device flow included. connect's first sign-in (no credential) and `auth` keep today's rule: the `shown.orgName == null`
+    // exception (A4 §3) for the device flow, and for the loopback the rule that a first sign-in has nothing to move away from.
+    if (input.confirm === "always" && unconfirmed && (input.connectPath?.replacing === true || shown?.orgName == null)) {
         const revoked = await selfRevokeCredential(input.endpoint, minted, { fetch: input.fetch });
         if (revoked.kind === "retired")
-            input.hold?.release(minted);
+            releaseRow(input, minted);
         writeLines(ctx.stderr, [
             "",
             ...renderErrorBlock({
@@ -88,7 +176,8 @@ export async function finishMint(ctx, input) {
         const room = WRAP_COLUMNS - 2 - LABEL_GUTTER;
         writeLines(ctx.stdout, [
             "",
-            labelled(2, REPLACE.accountLabel, truncateMiddle(shown?.account == null ? REPLACE.accountUnavailable : `@${shown.account}`, room)),
+            ...replacedWarnLines(ctx, replacedAccount, shown?.account ?? null),
+            labelled(2, REPLACE.accountLabel, truncateMiddle(shown?.account == null ? REPLACE.accountUnavailable : `@${terminalSafe(shown.account)}`, room)),
             ...(crossOrg && prior?.who.kind === "ok" ? [labelled(2, REPLACE.replacesLabel, REPLACE.replacesValue)] : []),
             "",
             ...wrap(REPLACE.routing, 2),
@@ -111,18 +200,29 @@ export async function finishMint(ctx, input) {
             // "retired" leaves it live, and the sentence says where to remove it.
             const revoked = await selfRevokeCredential(input.endpoint, minted, { fetch: input.fetch });
             if (revoked.kind === "retired")
-                input.hold?.release(minted);
+                releaseRow(input, minted);
+            // T10 (B5, DX-7): a No after the grants were written is not "the approval is discarded": the choices were saved.
+            const declined = input.connectPath?.grantsWritten === true ? REPLACE.declinedSavedChoices(input.connectPath.rerun) : REPLACE.declined;
             writeLines(ctx.stdout, [
                 "",
-                ...wrap(answer === null ? REPLACE.cancelled : REPLACE.declined, 2),
+                // Ctrl+C after the grants were written gets the same true line as a No: the choices WERE saved (T20 sweep, CL-C F5).
+                ...wrap(answer === null && input.connectPath?.grantsWritten !== true ? REPLACE.cancelled : declined, 2),
                 ...wrap(revoked.kind === "retired" ? REPLACE.declinedRevoked : REPLACE.declinedOrphan, 2),
             ]);
             return { kind: "declined" };
         }
     }
+    // ⛔ S6 (prc1): a lost hold saves nothing. The lease can run out during a long question, and another verb's retry then settles the
+    // row: this is the not-recorded path (`unrecorded`), and the credential is revoked in memory.
+    if (input.writeAhead?.holds !== undefined && input.writeAhead.holds(minted) !== "held") {
+        const revoked = await selfRevokeOutcome(input.endpoint, minted, { fetch: input.fetch, timeoutMs: REVOKE_TIMEOUT_MS });
+        return { kind: "unrecorded", revoked: revoked.kind === "retired" || revoked.kind === "gone" };
+    }
     // y — or no question was called for. A held credential (`g`) is NOT written here: the caller writes it after ITS yes.
     if (input.hold === undefined)
         saveCredential(ctx.home, minted);
+    // Kept: the row goes only AFTER the save (T10 B3). A save that throws leaves the row, so the credential stays recorded.
+    input.writeAhead?.release(minted);
     recordCredentialMeta(ctx.home, credentialFingerprint(minted), {
         expires_at: fresh.kind === "ok" ? fresh.expiresAt ?? facts.expiresAt : facts.expiresAt,
         credential_id: fresh.kind === "ok" ? fresh.credentialId : facts.credentialId,

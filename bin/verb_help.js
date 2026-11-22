@@ -23,15 +23,22 @@ function table(rows) {
     }
     return out;
 }
+/** The options line when a verb takes no flags: its own sentence when it has one (`off`, 4.15), else the shared one (`backfill`). */
+function noOptionsText(help) {
+    return "noOptions" in help && typeof help.noOptions === "string" ? help.noOptions : HELP.noOptions;
+}
 export function renderVerbHelp(verb) {
     const help = HELP.verbs[verb];
+    // A verb whose usage needs a sentence beside it (`finalize`: what it does with no option) carries it as `note`.
+    const note = "note" in help ? help.note : undefined;
     return [
         ...wrap(HELP.commands[verb], 2),
         "",
         ...wrap(`${USAGE.usageLabel} ${help.usage}`, 2),
+        ...(note === undefined ? [] : ["", ...wrap(note, 2)]),
         "",
         ...wrap(HELP.optionsLabel, 2),
-        ...(help.options.length === 0 ? wrap(HELP.noOptions, 4) : table(help.options)),
+        ...(help.options.length === 0 ? wrap(noOptionsText(help), 4) : table(help.options)),
         "",
         ...wrap(HELP.exitCodesLabel, 2),
         ...table(help.exits),

@@ -63,6 +63,13 @@ export function pendingRevokePath(home) {
     return join(rootDir(home), "pending-revoke.json");
 }
 /**
+ * prc1 S5: the cross-process lock every WRITE of the pending-revoke record takes (`pending_revoke.ts`'s `withRecordLock`). Beside the
+ * record, in the same 0700 folder. A read never takes it: the record is replaced by an atomic rename, so a reader sees a whole file.
+ */
+export function pendingRevokeLockPath(home) {
+    return join(rootDir(home), "pending-revoke.lock");
+}
+/**
  * The HUMAN lane's signed-in session — `CR-084d`. Mode 0600, enforced on read by
  * the same `readSecretFile` the ingest credential goes through.
  *

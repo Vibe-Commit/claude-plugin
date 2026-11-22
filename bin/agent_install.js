@@ -38,9 +38,9 @@
  * the config file — is the evidence, because the file's absence is the ordinary
  * first-install case and is exactly what this function is for.
  */
-import { existsSync } from "node:fs";
+import { accessSync, constants, existsSync } from "node:fs";
 import { dirname } from "node:path";
-import { hookCommand, writeAgentHooks, } from "./agent_hooks.js";
+import { hasRegistration, hookCommand, mergeHookDocument, readAgentConfig, registrationStale, writeAgentHooks, } from "./agent_hooks.js";
 import { DIALECTS } from "./agents/registry.js";
 import { HOOK_EVENTS } from "./agents/types.js";
 /** Every event this client registers, in one agent's own vocabulary. */
@@ -81,5 +81,40 @@ export function installAgentHooks(home, env, binPath) {
             install: writeAgentHooks(path, dialect.hookConfig.shape, registrationsFor(dialect, binPath)),
         };
     });
+}
+/** The verdict for every agent that is on this machine (`agentPresent`). An agent that is not here has no verdict. */
+export function agentHookVerdicts(home, env, binPath) {
+    return DIALECTS.filter((dialect) => agentPresent(dialect, home, env)).map((dialect) => verdictFor(dialect, home, env, binPath));
+}
+function verdictFor(dialect, home, env, binPath) {
+    const path = dialect.hookConfig.path(home, env);
+    const shape = dialect.hookConfig.shape;
+    const registrations = registrationsFor(dialect, binPath);
+    const read = readAgentConfig(path);
+    if (read.kind === "refused")
+        return { kind: "refused", agentId: dialect.id, path, why: read.why };
+    const raw = read.kind === "ok" ? read.raw : null;
+    const merged = mergeHookDocument(raw, shape, registrations, existsSync);
+    if (merged.kind === "refused")
+        return { kind: "refused", agentId: dialect.id, path, why: merged.why };
+    const held = registrations.filter((registration) => hasRegistration(raw, shape, registration)).length;
+    return {
+        kind: "readable",
+        agentId: dialect.id,
+        path,
+        ours: held === 0 ? "none" : held === registrations.length ? "all" : "some",
+        stale: registrations.some((registration) => registrationStale(raw, shape, registration)),
+        unwritable: unwritableDir(dirname(read.target)),
+    };
+}
+/** The directory itself when a write into it would fail, else `null`. The temp file and the rename live there (`writeAgentHooks`). */
+function unwritableDir(dir) {
+    try {
+        accessSync(dir, constants.W_OK | constants.X_OK);
+        return null;
+    }
+    catch {
+        return dir;
+    }
 }
 //# sourceMappingURL=agent_install.js.map

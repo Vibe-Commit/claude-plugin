@@ -18,6 +18,7 @@
 import { EXIT } from "../exit.js";
 import { AGENT_HOOKS, COMMANDS, PICKER, STATUS, URLS, relativeAge } from "../copy/index.js";
 import { emitJson } from "../json.js";
+import { terminalSafe } from "../printable.js";
 import { credentialProblemBlock } from "./credential_problem.js";
 import { authCommandFor, channelCommand } from "../install.js";
 import { loadCredential } from "../credential.js";
@@ -28,6 +29,8 @@ import { uploaderJson, uploaderRows, uploaderView } from "../uploader_view.js";
 import { LABEL_GUTTER, WRAP_COLUMNS, glyph, labelled, paint, tildePath, truncatePath, wrap } from "../term.js";
 import { writeFailure, writeLines } from "./context.js";
 import { readAccountView } from "../grants_verb.js";
+import { setupState } from "../setup_state.js";
+import { agentConfigWarnLines, codexHooksHere, hookStateLines, setupUnfinished, setupUnfinishedJson, setupUnfinishedLines } from "./status_hooks.js";
 /** §10.3 indents the gutter rows four columns under the state line. */
 const ROW_INDENT = 4;
 /** `rows` on the label gutter: the first carries the label, the rest hang under it. Values wrap at 80 columns. */
@@ -95,12 +98,13 @@ const UNDECIDED_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 function accountRows(ctx, view) {
     const out = [];
     if (view.notHere.length > 0) {
-        out.push(...rows(STATUS.accountLabel, view.notHere));
+        // #7 (round prb1, W8): the server's names, printed as the terminal's text.
+        out.push(...rows(STATUS.accountLabel, view.notHere.map((name) => terminalSafe(name))));
         out.push(...wrap(STATUS.accountNotHere(channelCommand(ctx.env, ctx.selfPath, COMMANDS.connect)), ROW_INDENT + LABEL_GUTTER));
     }
     const retrying = view.pending - view.pendingRejected;
     if (view.pendingRejected > 0)
-        out.push(...sentenceRow(STATUS.pendingLabel, STATUS.pendingRejectedValue(view.pendingRejected)));
+        out.push(...sentenceRow(STATUS.pendingRefusedLabel, STATUS.pendingRejectedValue(view.pendingRejected)));
     if (retrying > 0)
         out.push(...sentenceRow(view.pendingRejected > 0 ? "" : STATUS.pendingLabel, STATUS.pendingValue(retrying)));
     return out;
@@ -118,8 +122,12 @@ export function accountRowsFor(ctx, sync) {
     const view = readAccountView(ctx.home, capture.kind === "on" ? capture.perClone.flatMap((c) => (c.slug === null ? [] : [normalizeSlug(c.slug)])) : [], sync);
     return view === null ? [] : accountRows(ctx, view);
 }
-export function machineStatus(ctx, argv, sync = { kind: "skipped" }) {
+export function machineStatus(ctx, argv, sync = { kind: "skipped" }, deps) {
     const capture = machineCapture(ctx.home);
+    // CR-PRB T9a (plan §4.4a). Machine-level status names no clone, so it passes no toplevels and never evaluates (b) (ENG-29).
+    const setup = setupState({ home: ctx.home, env: ctx.env, selfPath: ctx.selfPath, grantsOn: capture.kind === "on", toplevels: [], syncUnauthorized: false }, deps);
+    // Branch (a) only: the heading says setup is unfinished. Repairs never change it (ENG-3).
+    const unfinished = setupUnfinished(setup);
     // Slice 2 (S4). `null` when `grants.json` is unreadable: the pending queue is unknowable, so no account rows.
     const view = capture.kind === "unreadable"
         ? null
@@ -170,13 +178,20 @@ export function machineStatus(ctx, argv, sync = { kind: "skipped" }) {
             last_send: last === null ? null : { at_ms: last.at, seq: last.seq },
             dashboard: URLS.dashboard,
             credential: load.kind === "ok" ? load.credential.source : null,
+            // CR-PRB T9a (DX-1): present only when branch (a) holds.
+            ...setupUnfinishedJson(ctx, setup),
         });
         return on ? EXIT.ok : EXIT.notConnected;
     }
     // `ok` only when something is on; `warn` for "nothing is" and for an unreadable file (§13.2 glyph).
-    const kind = capture.kind === "on" ? "ok" : "warn";
-    const heading = capture.kind === "on" ? PICKER.onFor(machineSummary(capture)) : STATUS.offMachine;
+    const kind = capture.kind === "on" && !unfinished ? "ok" : "warn";
+    const heading = unfinished
+        ? STATUS.setupUnfinishedHeading
+        : capture.kind === "on"
+            ? PICKER.onFor(machineSummary(capture))
+            : STATUS.offMachine;
     const lines = [`  ${paint(ctx.colour, kind, glyph(ctx.colour, kind))} ${paint(ctx.colour, "strong", heading)}`];
+    lines.push(...(unfinished ? setupUnfinishedLines(ctx) : []));
     if (capture.kind === "unreadable") {
         lines.push("", ...wrap(STATUS.grantsUnreadable(channelCommand(ctx.env, ctx.selfPath, COMMANDS.connect)), 2));
     }
@@ -199,12 +214,16 @@ export function machineStatus(ctx, argv, sync = { kind: "skipped" }) {
         lines.push(...undecidedRows(ctx));
     if (capture.kind === "none" && view !== null)
         lines.push(...accountRows(ctx, view));
+    // Repairs (c) and (f), and the predicate's `unknown`. Machine-level, so no (b) line (none was evaluated).
+    lines.push(...hookStateLines(ctx, setup, capture.kind === "on"));
+    // T8 (4.2, DX-13): an agent config this installer refuses or cannot write (outside the 4.4a predicate).
+    lines.push(...agentConfigWarnLines(ctx));
     if (last !== null)
         lines.push(labelled(ROW_INDENT, STATUS.lastSuccessLabel, relativeAge(last.at, nowMs)));
     lines.push(...uploaderRows(upload, nowMs, ROW_INDENT));
     lines.push(labelled(ROW_INDENT, STATUS.dashboardLabel, paint(ctx.colour, "accent", URLS.dashboard)));
-    // Codex runs no user-level hook until the user trusts it. Said, never detected (VQ + Alexander, 2026-10-24).
-    if (capture.kind === "on")
+    // Codex runs no user-level hook until the user trusts it. T8 (D-CODEX): said only where Codex hooks exist on this machine.
+    if (capture.kind === "on" && codexHooksHere(ctx))
         lines.push("", ...wrap(AGENT_HOOKS.codexTrust, 2));
     const pairs = [
         [STATUS.changeLabel, channelCommand(ctx.env, ctx.selfPath, COMMANDS.connect)],

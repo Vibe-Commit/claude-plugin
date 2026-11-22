@@ -34,7 +34,7 @@
 import { lstatSync, realpathSync } from "node:fs";
 import { basename, isAbsolute } from "node:path";
 import { admitsTranscript, agentIsolatesRecords, DIALECTS } from "../agents/registry.js";
-import { BACKFILL, COMMANDS, SCAN, URLS, shortDate } from "../copy/index.js";
+import { BACKFILL, COMMANDS, CONNECT, SCAN, URLS, shortDate } from "../copy/index.js";
 import { captureStanding, grantsUnreadable, hasAnyConsent, isCaptureAllowed } from "../consent.js";
 import { folderStandingOf } from "../folder_grants.js";
 import { loadCredential } from "../credential.js";
@@ -372,9 +372,12 @@ export function renderOffer(plan, options) {
     const pathOf = (dir) => truncatePath(tildePath(dir, home), pathCap);
     const longestPath = Math.max(0, ...folders.flatMap((rows) => rows.map((row) => pathOf(row.dir).length)));
     const column = Math.max(ROW_INDENT + slugWidth + COLUMN_GAP, FOLDER_INDENT + longestPath + 2);
+    // T7 (4.9): inside `connect` (`standalone: false`) the offer is the optional one: its own heading and note. Standalone is unchanged.
+    const inConnect = options.standalone === false;
     const lines = [""];
-    if (plan.repos.length > 0)
-        lines.push(...wrap(BACKFILL.offerHeading(plan.repos.length, options.standalone !== false), 2), "");
+    if (plan.repos.length > 0) {
+        lines.push(...(inConnect ? [`  ${paint(colour, "strong", BACKFILL.offerHeadingOptional)}`] : wrap(BACKFILL.offerHeading(plan.repos.length, true), 2)), "");
+    }
     for (const [index, repo] of plan.repos.entries()) {
         lines.push(`${" ".repeat(ROW_INDENT)}${paint(colour, "text", `${truncateMiddle(repo.slug, slugWidth).padEnd(column - ROW_INDENT)}${countsOf(repo)}`)}`);
         for (const row of folders[index]) {
@@ -403,7 +406,7 @@ export function renderOffer(plan, options) {
     const notOffered = notOfferedLines(plan, colour, home);
     if (notOffered.length > 0)
         lines.push("", ...notOffered);
-    lines.push("", ...BACKFILL.uploadNote.map((line) => `  ${line}`), "");
+    lines.push("", ...(inConnect ? BACKFILL.uploadNoteOptional : BACKFILL.uploadNote).map((line) => `  ${line}`), "");
     return lines;
 }
 // ---------------------------------------------------------------------------
@@ -763,7 +766,9 @@ function interruption(deps) {
  * Ask, then upload. Everything `backfill` and `connect` share. `connect` calls it AFTER its own grant y/N and its
  * "Capture is on" block (through `backfillForConnect`), and chooses its closing URL from `end`.
  */
-export async function runBackfill(ctx, deps = {}) {
+export async function runBackfill(ctx, deps = {}, 
+/** The global flags the run was given, as the retry line repeats them (N4, round prb2). `backfill` passes what its argv holds. */
+flags = {}) {
     const stop = (exit, end, uploaded = 0) => ({ exit, end, uploaded });
     // Not connected is a fact about the machine, so it is answered first; then the terminal (nothing to ask on).
     const load = loadCredential({ env: ctx.env, home: ctx.home });
@@ -781,6 +786,20 @@ export async function runBackfill(ctx, deps = {}) {
     if (load.kind !== "ok") {
         writeLines(ctx.stderr, credentialProblem(load, ctx.colour, authCommandFor(ctx.env, ctx.selfPath)));
         return stop(EXIT.notConnected, "refused");
+    }
+    // CLI UX PR-B round prb1 #1 (ENG-31; P6's scope ruling): a terminal stdin with a PIPED stdout refuses before the offer and its question,
+    // with the same predicate `connect` uses. Nothing is uploaded, and the fix is the command as typed, `--no-color` included (N4). A piped
+    // stdin keeps the BACKFILL_NEEDS_TTY refusal below, exactly as it was.
+    if (ctx.stdinIsTty && ctx.stdout.isTTY !== true) {
+        writeLines(ctx.stderr, renderErrorBlock({
+            kind: "bad",
+            code: "CONSENT_NEEDS_TTY",
+            what: CONNECT.outputNotTerminalWhat,
+            why: [CONNECT.outputNotTerminalWhy],
+            fixLabel: CONNECT.outputNotTerminalFix,
+            fixes: [channelCommand(ctx.env, ctx.selfPath, [COMMANDS.backfill, ...(flags.noColor === true ? ["--no-color"] : [])].join(" "))],
+        }, ctx.colour));
+        return stop(EXIT.usage, "refused");
     }
     if (!ctx.stdinIsTty) {
         writeLines(ctx.stderr, renderErrorBlock({
@@ -812,6 +831,9 @@ export async function runBackfill(ctx, deps = {}) {
     }
     const plan = planBackfill(ctx, deps.scanMachine ?? scanMachine);
     if (plan.total === 0) {
+        // T7 (4.9): inside `connect` nothing-to-offer is silent: the ending is the same as a run with nothing to offer (the recap and URL).
+        if (deps.fromConnect === true)
+            return stop(EXIT.empty, "nothing");
         const notes = notOfferedLines(plan, ctx.colour, ctx.home);
         writeLines(ctx.stdout, ["", ...wrap(BACKFILL.nothingToUpload, 2), ...(notes.length > 0 ? ["", ...notes] : [])]);
         return stop(EXIT.empty, "nothing");
@@ -826,7 +848,8 @@ export async function runBackfill(ctx, deps = {}) {
     try {
         let answer;
         try {
-            answer = await ctx.ask(`  ${paint(ctx.colour, "text", BACKFILL.question(plan.total))}`);
+            const question = deps.fromConnect === true ? BACKFILL.questionOptional(plan.total) : BACKFILL.question(plan.total);
+            answer = await ctx.ask(`  ${paint(ctx.colour, "text", question)}`);
         }
         catch {
             // Ctrl+C at the question rejects the prompt. Capture is on, so this is a stop and not a failure.
@@ -834,7 +857,9 @@ export async function runBackfill(ctx, deps = {}) {
             return stop(EXIT.ok, "interrupted");
         }
         if (!/^\s*y(es)?\s*$/i.test(answer)) {
-            writeLines(ctx.stdout, ["", ...wrap(BACKFILL.declined(channelCommand(ctx.env, ctx.selfPath, COMMANDS.backfill)), 2)]);
+            const backfillCommand = channelCommand(ctx.env, ctx.selfPath, COMMANDS.backfill);
+            const declined = deps.fromConnect === true ? BACKFILL.declinedOptional(backfillCommand) : BACKFILL.declined(backfillCommand);
+            writeLines(ctx.stdout, ["", ...wrap(declined, 2)]);
             return stop(EXIT.ok, "declined");
         }
         return await upload(ctx, plan, { url, credential: load.credential }, deps, signal);
@@ -924,7 +949,7 @@ async function upload(ctx, plan, connection, deps, signal) {
         // Overwrite the `…` line in place on a terminal; elsewhere it stays and the result prints beneath it.
         ctx.stdout.write(slowShown && ctx.colour ? `\r${line}\n` : `${slowShown ? "\n" : ""}${line}\n`);
         if (tally.stopped)
-            return stopRun(ctx, plan, uploaded, tally);
+            return stopRun(ctx, plan, uploaded, tally, deps.fromConnect === true);
     }
     const clean = held === 0 && failed === 0;
     const summary = BACKFILL.summary(uploaded, plan.total, skipped, held, failed);
@@ -942,7 +967,7 @@ async function upload(ctx, plan, connection, deps, signal) {
  * A server `later` ended the run, the server could not be reached, or the credential was refused: the resume fix goes last
  * (§13.6). ⛔ The block states only what landed: `uploaded` is sessions the server took.
  */
-function stopRun(ctx, plan, uploaded, tally) {
+function stopRun(ctx, plan, uploaded, tally, fromConnect) {
     const notUploaded = plan.total - uploaded;
     const block = tally.rejected
         ? renderErrorBlock({
@@ -951,7 +976,8 @@ function stopRun(ctx, plan, uploaded, tally) {
             what: BACKFILL.credentialStoppedWhat,
             why: [BACKFILL.credentialStoppedWhy],
             fixLabel: BACKFILL.credentialStoppedFixLabel,
-            fixes: [authCommandFor(ctx.env, ctx.selfPath), channelCommand(ctx.env, ctx.selfPath, COMMANDS.backfill)],
+            // W7 (P6 review, #7): inside connect's run the remedy is connect's (it re-signs in); the standalone verb keeps auth's.
+            fixes: [fromConnect ? connectCommandFor(ctx.env, ctx.selfPath) : authCommandFor(ctx.env, ctx.selfPath), channelCommand(ctx.env, ctx.selfPath, COMMANDS.backfill)],
         }, ctx.colour)
         : renderErrorBlock({
             kind: "warn",
@@ -1015,11 +1041,12 @@ export async function backfill(ctx, argv = [], deps = {}) {
         writeLines(ctx.stdout, renderVerbHelp(helpVerb));
         return EXIT.ok;
     }
-    if (argv.length > 0) {
+    // T22 (CLI UX PR-B): `--no-color` is the global flag, accepted everywhere by the shared check (`src/args.ts`). Any other argument refuses.
+    if (argv.some((arg) => arg !== "--no-color")) {
         writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", code: "UNRECOGNIZED_ARGUMENT", what: BACKFILL.usageWhat, why: [BACKFILL.usageWhy] }, ctx.colour));
         return EXIT.usage;
     }
-    const result = await runBackfill(ctx, deps);
+    const result = await runBackfill(ctx, deps, { noColor: argv.includes("--no-color") });
     if (result.end === "uploaded" || result.end === "interrupted") {
         writeLines(ctx.stdout, ["", `  ${paint(ctx.colour, "accent", result.uploaded > 0 ? URLS.conversations : URLS.dashboard)}`]);
     }

@@ -34,7 +34,8 @@
  *
  * @provenance vibecommit-mcp src/oauth/ingest_credential.ts — wire contract, retyped
  */
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, statSync, } from "node:fs";
+import { accessSync, chmodSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, readFileSync, statSync, } from "node:fs";
+import { dirname } from "node:path";
 import { inspect } from "node:util";
 import { writeFileAtomic } from "./atomic_write.js";
 import { headerSafe } from "./header_safety.js";
@@ -98,24 +99,59 @@ export class IngestCredential {
  * that already existed.
  */
 export function readSecretFile(home, path) {
+    // prb-S1 (plan 4.12): ONLY ENOENT is "absent". Every other failure is a fault at the path it names: the old catch-all made an EACCES,
+    // an EISDIR or an ELOOP look like "not connected", and `connect` then minted over a credential it could not read, with no replace hold.
+    const fault = (error, at) => error.code === "ENOENT" ? { kind: "absent" } : { kind: "unreadable", path: at };
+    const dir = rootDir(home);
+    let dirMode;
     try {
-        const dir = rootDir(home);
-        const dirMode = statSync(dir).mode & 0o777;
-        if ((dirMode & 0o077) !== 0) {
-            return { kind: "insecure-file", path: dir, mode: dirMode.toString(8).padStart(3, "0"), target: "directory" };
-        }
-        // `lstat`, not `stat`: `stat` follows a symlink and would report the
-        // TARGET's mode, so a link to an attacker-owned 0600 file would pass a
-        // check that exists to establish who can read this one.
-        const mode = lstatSync(path).mode & 0o777;
-        if ((mode & 0o077) !== 0) {
-            return { kind: "insecure-file", path, mode: mode.toString(8).padStart(3, "0"), target: "file" };
-        }
+        dirMode = statSync(dir).mode & 0o777;
+    }
+    catch (error) {
+        return fault(error, dir);
+    }
+    if ((dirMode & 0o077) !== 0) {
+        return { kind: "insecure-file", path: dir, mode: dirMode.toString(8).padStart(3, "0"), target: "directory" };
+    }
+    // `lstat`, not `stat`: `stat` follows a symlink and would report the
+    // TARGET's mode, so a link to an attacker-owned 0600 file would pass a
+    // check that exists to establish who can read this one.
+    let mode;
+    try {
+        mode = lstatSync(path).mode & 0o777;
+    }
+    catch (error) {
+        return fault(error, path);
+    }
+    if ((mode & 0o077) !== 0) {
+        return { kind: "insecure-file", path, mode: mode.toString(8).padStart(3, "0"), target: "file" };
+    }
+    try {
         return { kind: "ok", raw: readFileSync(path, "utf8") };
     }
+    catch (error) {
+        return fault(error, path);
+    }
+}
+/**
+ * T10 (B4, plan 4.12 and ENG-15): is `~/.vibecommit` writable? `finishMint` saves AFTER the server has created the credential, so an
+ * unwritable folder would leave a live credential that was never saved. This is checked before any mint or browser open. A folder that does not exist yet is checked at its nearest existing ancestor, which is
+ * where it will be created.
+ */
+export function credentialFolderWritable(home) {
+    let target = rootDir(home);
+    while (!existsSync(target)) {
+        const parent = dirname(target);
+        if (parent === target)
+            break;
+        target = parent;
+    }
+    try {
+        accessSync(target, fsConstants.W_OK | fsConstants.X_OK);
+        return { kind: "ok" };
+    }
     catch {
-        // ENOENT is the overwhelmingly common case — not connected yet.
-        return { kind: "absent" };
+        return { kind: "unwritable", path: rootDir(home) };
     }
 }
 /**

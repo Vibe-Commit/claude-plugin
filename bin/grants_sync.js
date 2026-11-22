@@ -35,6 +35,7 @@
  * says nothing.
  */
 import { EMPTY_GRANTS, GrantsUnreadableError, isLocalSlug, normalizeOwner, normalizeSlug, readAccountState, readGrants, updateGrants, writeAccountState, } from "./consent.js";
+import { isPrintableName } from "./printable.js";
 import { MAX_ERROR_BODY_BYTES, readCappedJson } from "./post.js";
 import { CLIENT_VERSION, CLIENT_VERSION_HEADER } from "./version.js";
 export const GRANTS_PATH = "/ingest/v1/grants";
@@ -71,6 +72,10 @@ function normalizedList(value, normalize) {
     }
     return out;
 }
+/** N3 (c) (CR-PRB2): a name the server sends that is not printable is dropped; the rest of the list is kept. */
+function printableOnly(list) {
+    return list === null ? null : list.filter(isPrintableName);
+}
 /** The account state in a sync or GET body, or `null` if it is not what the contract says. Schema 1 only. */
 function parseSnapshot(body) {
     if (body === null || typeof body !== "object" || Array.isArray(body))
@@ -80,9 +85,9 @@ function parseSnapshot(body) {
         return null;
     if (typeof o.epoch !== "number" || !Number.isSafeInteger(o.epoch) || o.epoch < 0)
         return null;
-    const owners = normalizedList(o.owners, normalizeOwner);
-    const repos = normalizedList(o.repos, normalizeSlug);
-    const excluded = normalizedList(o.excluded, normalizeSlug);
+    const owners = printableOnly(normalizedList(o.owners, normalizeOwner));
+    const repos = printableOnly(normalizedList(o.repos, normalizeSlug));
+    const excluded = printableOnly(normalizedList(o.excluded, normalizeSlug));
     if (owners === null || repos === null || excluded === null)
         return null;
     return { epoch: o.epoch, owners, repos, excluded };

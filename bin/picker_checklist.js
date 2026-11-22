@@ -187,7 +187,7 @@ export function step(model, previous, key, options = {}) {
 function stepKey(model, previous, key, 
 /**
  * `g` is a key only where the picker offered it (no credential, a terminal, a browser); anywhere else it does nothing.
- * `enterFinishesSetup` (4.4a) is OFF and nothing in this PR turns it on: Enter with nothing new then finishes setup.
+ * `enterFinishesSetup` (4.4a, 2B): Enter with nothing new finishes setup (the picker turns it on when a setup predicate holds).
  */
 options = {}) {
     // A sentence lasts until the next key (4.4): the key clears it.
@@ -493,7 +493,10 @@ export function renderFrame(model, state, options) {
     // The footer (4.1, 4.13a): the legend is the frame's last block, with the count line under it; the g line (where offered) is last.
     out.push("");
     out.push(paint(colour, "text", `  ${PICKER.hint}`));
-    out.push(paint(colour, "strong", `  ${state.notice ?? countLine(model, state)}`));
+    // 2B: with nothing new chosen and setup unfinished, the count line says Enter finishes setup (verbatim from the plan).
+    const count = countLine(model, state);
+    const finishLine = options.enterFinishesSetup === true && count === PICKER.countNone ? PICKER.enterFinishes : count;
+    out.push(paint(colour, "strong", `  ${state.notice ?? finishLine}`));
     if (options.offerAccount === true)
         out.push(...wrap(PICKER.gLine, 2, 2, width).map((l) => paint(colour, "muted", l)));
     // ⛔ One line is one terminal row: a line wider than the window would wrap and leave debris on the next redraw (ENG-33).
@@ -569,7 +572,7 @@ export function runChecklist(model, options, deps) {
         };
         const draw = () => {
             const columns = options.columns?.();
-            const lines = renderFrame(model, state, { colour: options.colour, nowMs: options.nowMs, typedCommand: options.typedCommand, offerAccount: options.offerAccount, columns });
+            const lines = renderFrame(model, state, { colour: options.colour, nowMs: options.nowMs, typedCommand: options.typedCommand, offerAccount: options.offerAccount, enterFinishesSetup: options.enterFinishesSetup, columns });
             // The static block goes out with the FIRST frame, once: it is never erased (`drawn` counts the frame only).
             const header = !headerWritten && options.headerPrinted !== true ? `${checklistHeader(model, options.colour, options.typedCommand, columns).join("\n")}\n` : "";
             headerWritten = true;
@@ -614,7 +617,7 @@ export function runChecklist(model, options, deps) {
             if (finished)
                 return;
             try {
-                const result = step(model, state, keyOf(str, key), { offerAccount: options.offerAccount === true });
+                const result = step(model, state, keyOf(str, key), { offerAccount: options.offerAccount === true, enterFinishesSetup: options.enterFinishesSetup === true });
                 if (result.kind === "state") {
                     const before = state;
                     state = result.state;

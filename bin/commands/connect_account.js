@@ -6,7 +6,7 @@
  * ```
  *   changeOps(change, covered)          the account writes a picker change means, for the pending queue
  *   splitAccountExclusions(change, …)   a repo the account turned off is a `turn on`, not an add
- *   joiningMachine(ctx, …)              screen 2: "Your account also grants … Capture those here too?"
+ *   joiningMachine(ctx, …)              screen 2: "Your account also grants … Start uploading sessions from those here too?"
  *   mintForG(ctx, …)                    `g`: sign in (the credential held in MEMORY behind a write-ahead row), then read the account's grants
  *   commitG(ctx, g)                     the yes: credentials.json, then the row's deletion
  *   settleG(ctx, deps, g)               the ONE finally: a run that did not commit revokes what `g` made and clears its row
@@ -22,23 +22,24 @@
  * from the `auth` chain (which has no browser, and always leaves a credential).
  */
 import { PICKER, REPLACE } from "../copy/index.js";
-import { isAffirmative, normalizeOwner, normalizeSlug, ownerOfSlug, readAccountState, holdsAny, updateGrants, writeAccountState, } from "../consent.js";
+import { isAffirmative, normalizeOwner, normalizeSlug, ownerOfSlug, readAccountState, readPendingOffer, holdsAny, updateGrants, writeAccountState, } from "../consent.js";
 import { existsSync } from "node:fs";
 import { saveCredential } from "../credential.js";
 import { stoppedSyncReason } from "./sync_reason.js";
 import { EXIT } from "../exit.js";
 import { fetchAccountGrants, GRANTS_VERB_BODY_BYTES } from "../grants_sync.js";
 import { readAccountView, syncForVerb } from "../grants_verb.js";
-import { authCommandFor, channelCommand, connectCommandFor } from "../install.js";
+import { channelCommand, connectCommandFor } from "../install.js";
 import { COMMANDS } from "../copy/index.js";
 import { addPendingRevoke, holdsRow, removePendingRevoke, revokeHeld } from "../pending_revoke.js";
-import { readPerClone } from "../machine_state.js";
+import { machineCapture, readPerClone } from "../machine_state.js";
 import { credentialsPath } from "../paths.js";
 import { ingestUrl } from "../post.js";
 import { paint, renderErrorBlock, wrap } from "../term.js";
 import { askOrCancel, savedBlock } from "./connect.js";
 import { credentialProblemBlock } from "./credential_problem.js";
 import { writeLines } from "./context.js";
+import { isPrintableName, terminalSafe } from "../printable.js";
 /**
  * The account writes a picker change means, in the order they should be queued. A re-include is `include` (the account's
  * exclusion lifts) and, unless an owner grant already covers the repo, `grant` (it is named on this machine from now on) —
@@ -89,13 +90,17 @@ export async function joiningMachine(ctx, deps, answers,
 /** The first-sync line was already printed in this run: the sync after "y" does not print it again. */
 firstSyncSaid = false) {
     const view = readAccountView(ctx.home, readPerClone(ctx.home).flatMap((clone) => (clone.slug === null ? [] : [clone.slug])), { kind: "skipped" });
-    const names = view === null ? [] : view.notHere;
+    // #7 (round prb1, W8): a name the server sends with a terminal control in it is not a GitHub name. It is skipped, never shown and never
+    // granted, so no later screen that prints grants.json (the picker, `off`, the stop lines) can print it raw either.
+    const names = (view === null ? [] : view.notHere).filter(isPrintableName);
     if (names.length === 0)
         return { names: [], cancelled: false, sync: null };
+    // #7 (CR-PRB1): the names are the server's text. Each one is printed through terminalSafe, one line each (a newline in a name would split it).
+    const shown = names.map((name) => terminalSafe(name));
     writeLines(ctx.stdout, [
         "",
-        ...wrap(PICKER.joinAlso(names.join("\n")), 2),
-        ...(names.length > 3 ? names.map((name) => `    ${name}`) : []),
+        ...wrap(PICKER.joinAlso(shown.join("\n")), 2),
+        ...(names.length > 3 ? shown.map((name) => `    ${name}`) : []),
     ]);
     const answer = await askOrCancel(ctx, `  ${paint(ctx.colour, "text", PICKER.joinQuestion)} ${paint(ctx.colour, "muted", answers)} `);
     if (answer === null || !isAffirmative(answer)) {
@@ -105,6 +110,7 @@ firstSyncSaid = false) {
     const owners = names.filter((name) => name.endsWith("/")).map((name) => normalizeOwner(name.slice(0, -1)));
     const repos = names.filter((name) => !name.endsWith("/")).map(normalizeSlug);
     try {
+        // ⛔ #6 (ENG-26, 4.13): the joined names join `pending_offer` in the SAME write as the grants, so a run that stops here still offers them.
         updateGrants(ctx.home, (g) => {
             const nextOwners = [...new Set([...g.owners, ...owners])];
             return {
@@ -112,6 +118,12 @@ firstSyncSaid = false) {
                 owners: nextOwners,
                 repos: [...new Set([...g.repos, ...repos.filter((slug) => !nextOwners.includes(ownerOfSlug(slug)))])],
             };
+        }, {
+            pending_offer: [
+                ...readPendingOffer(ctx.home),
+                ...owners.map((value) => ({ kind: "owner", value })),
+                ...repos.map((value) => ({ kind: "repo", value })),
+            ],
         });
     }
     catch {
@@ -138,7 +150,8 @@ export function accountNoteLines(ctx, sync) {
         return [];
     if (sync.kind === "ran") {
         // A 400 and a 401 have their own lines, shared with `off` (`sync_reason.ts`, hook-safe).
-        const reason = stoppedSyncReason(ctx, sync.result);
+        // T10 (plan 4.12): this is connect's own sync reason (only connect's picker reads it), so a 401 names connect, which signs in inline.
+        const reason = stoppedSyncReason(ctx, sync.result, connectCommandFor(ctx.env, ctx.selfPath));
         if (reason !== null)
             return reason;
     }
@@ -194,6 +207,50 @@ export function commitG(ctx, g, save = saveCredential) {
     return "committed";
 }
 /**
+ * The write-ahead hold for a credential the person has not yet said yes to (plan 4.12 T10, Amendment 1): `g`'s, and connect's replace.
+ * ONE implementation. The row is written the moment the token is handed over (`addPendingRevoke`, with this process's 30-minute lease,
+ * so another verb's retry leaves it alone while the question is open) and removed once the credential is kept or cleanly revoked
+ * (`removePendingRevoke`). `refusal()` says why a row could not be written; `origin()` is the origin the row records.
+ *
+ * This is the ONLY module that writes a pending-revoke row (`connect-g-lifecycle.test.ts` pins it).
+ */
+export function writeAheadHold(ctx) {
+    let refused = null;
+    let mintedOrigin = "";
+    const hold = {
+        record: (credential, endpoint) => {
+            const added = addPendingRevoke(ctx.home, credential, endpoint, ctx.now(), { lease: true });
+            if (added.kind === "written")
+                mintedOrigin = new URL(endpoint).origin;
+            else
+                refused = added;
+            return added.kind === "written";
+        },
+        release: (credential) => removePendingRevoke(ctx.home, credential.expose()),
+        // prc1 S6: the same answer `commitG` gets (`holdsRow`), handed to finish_mint, which never imports pending_revoke.
+        holds: (credential) => holdsRow(ctx.home, credential.expose()),
+    };
+    return { hold, refusal: () => refused, origin: () => mintedOrigin };
+}
+/**
+ * The print for a credential that was made but could not be recorded (`unrecorded`): the same block `g` gives, shared with connect's
+ * replace (Amendment 1). The exit is the caller's. ⛔ NEVER "Cancelled. Nothing was changed.": a credential WAS made. It was revoked in
+ * memory (`declinedRevoked`), or it could not be and may still be live (`declinedOrphan` says where to revoke it).
+ */
+export function printUnrecorded(ctx, refusal, revoked, options) {
+    const read = refusal !== null && refusal.kind === "refused" ? refusal.read : null;
+    if (read !== null && read.kind === "insecure-file") {
+        writeLines(ctx.stderr, ["", ...renderErrorBlock(credentialProblemBlock(read, options.rerun), ctx.colour)]);
+    }
+    else if (options.which === "g") {
+        writeLines(ctx.stdout, ["", ...wrap(PICKER.gNotRecorded, 2).map((line) => paint(ctx.colour, "muted", line))]);
+    }
+    else {
+        writeLines(ctx.stdout, ["", ...wrap(REPLACE.replaceNotRecorded, 2).map((line) => paint(ctx.colour, "muted", line))]);
+    }
+    writeLines(ctx.stdout, wrap(revoked ? REPLACE.declinedRevoked : REPLACE.declinedOrphan, 2).map((line) => paint(ctx.colour, "muted", line)));
+}
+/**
  * `g`: sign in through `deps.browser` (the credential beat, behind its own gate: no credential, a terminal, a browser), then ONE
  * `GET` of the account's grants — a pure read that marks nothing as synced.
  *
@@ -210,35 +267,23 @@ export function commitG(ctx, g, save = saveCredential) {
 export async function mintForG(ctx, options, deps, account) {
     if (deps.browser === undefined)
         return { kind: "exit", code: EXIT.failure };
-    const refusal = { current: null };
-    const mintedAt = { origin: "" };
-    const hold = {
-        record: (credential, endpoint) => {
-            // The row carries `g`'s lease (this process, 30 minutes): another verb's retry leaves it alone while the question is open.
-            const added = addPendingRevoke(ctx.home, credential, endpoint, ctx.now(), { lease: true });
-            if (added.kind === "written")
-                mintedAt.origin = new URL(endpoint).origin;
-            if (added.kind !== "written")
-                refusal.current = added;
-            return added.kind === "written";
-        },
-        release: (credential) => removePendingRevoke(ctx.home, credential.expose()),
-    };
-    const minted = await deps.browser(ctx, "connect", { device: options.device === true, scope: "repos", hold });
+    const written = writeAheadHold(ctx);
+    // W5 (P6 review, #5): `g` is connect's own sign-in, so it passes connect's path: the wait line and the recovery lines of DX-7 render, and
+    // the held-credential lifecycle is kept (`hold`, no `writeAhead`: this is not a replace). grantsWritten is true only when a grant exists now.
+    const minted = await deps.browser(ctx, "connect", {
+        device: options.device === true,
+        scope: "repos",
+        hold: written.hold,
+        connectPath: { rerun: connectCommandFor(ctx.env, ctx.selfPath), replacing: false, grantsWritten: machineCapture(ctx.home).kind === "on" },
+    });
     if (minted.kind === "unrecorded") {
-        const read = refusal.current !== null && refusal.current.kind === "refused" ? refusal.current.read : null;
-        if (read !== null && read.kind === "insecure-file") {
-            writeLines(ctx.stderr, ["", ...renderErrorBlock(credentialProblemBlock(read, authCommandFor(ctx.env, ctx.selfPath)), ctx.colour)]);
-        }
-        else {
-            writeLines(ctx.stdout, ["", ...wrap(PICKER.gNotRecorded, 2).map((line) => paint(ctx.colour, "muted", line))]);
-        }
-        // ⛔ NEVER "Cancelled. Nothing was changed.": a credential WAS made. In memory it was revoked (`declinedRevoked`), or it could not be
-        // and may still be live (`declinedOrphan` says where to revoke it) — either way the line is the credential's, and the exit is 1.
-        writeLines(ctx.stdout, wrap(minted.revoked ? REPLACE.declinedRevoked : REPLACE.declinedOrphan, 2).map((line) => paint(ctx.colour, "muted", line)));
+        printUnrecorded(ctx, written.refusal(), minted.revoked, { rerun: connectCommandFor(ctx.env, ctx.selfPath), which: "g" });
         return { kind: "exit", code: EXIT.failure };
     }
     // A declined or failed sign-in has already said why on screen, and made no credential that the client has to remember.
+    // A failed sign-in exits 3 (§4.12): the browser printed why. A declined one (the No) exits 1.
+    if (minted.kind === "failed")
+        return { kind: "exit", code: EXIT.notConnected };
     if (minted.kind !== "held")
         return { kind: "exit", code: EXIT.failure };
     const url = ingestUrl(ctx.env);
@@ -250,7 +295,7 @@ export async function mintForG(ctx, options, deps, account) {
             maxBodyBytes: GRANTS_VERB_BODY_BYTES,
         });
     const snapshot = read !== null && read.kind === "ok" ? read : null;
-    return { kind: "minted", credential: minted.credential, snapshot, notes: minted.notes ?? [], origin: mintedAt.origin };
+    return { kind: "minted", credential: minted.credential, snapshot, notes: minted.notes ?? [], origin: written.origin() };
 }
 /** The account's own list as a picker change: its owners, and its repos that no listed owner covers and that are not turned off. */
 export function accountChange(snapshot) {
@@ -280,7 +325,8 @@ export async function settleG(ctx, deps, g) {
     const result = await revokeHeld(ctx.home, g.credential, g.origin, deps.fetch ?? globalThis.fetch);
     // A queue file that is insecure is named, with its fix: until it is fixed no later verb can read the row.
     if (result.insecure !== null) {
-        writeLines(ctx.stderr, ["", ...renderErrorBlock(credentialProblemBlock(result.insecure, authCommandFor(ctx.env, ctx.selfPath)), ctx.colour)]);
+        // T10 (plan 4.12): settled by connect's `g`, so the re-run is connect.
+        writeLines(ctx.stderr, ["", ...renderErrorBlock(credentialProblemBlock(result.insecure, connectCommandFor(ctx.env, ctx.selfPath)), ctx.colour)]);
     }
     if (g.end === null)
         return;

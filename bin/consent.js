@@ -50,6 +50,7 @@ import { writeFileAtomic } from "./atomic_write.js";
 import { grantedFolders } from "./folder_grants.js";
 import { grantsAccountPath, grantsPath, projectsPath, rootDir } from "./paths.js";
 import { stripTrailing } from "./text_tail.js";
+import { isPrintableName } from "./printable.js";
 /**
  * Read the allow list. **Every failure returns an empty list**, which means "no
  * project is consented" — a corrupt or unreadable file must not be able to grant
@@ -241,15 +242,19 @@ export function grantsUnreadable(home) {
     return readGrants(home).kind === "unreadable";
 }
 export const EMPTY_ACCOUNT_STATE = { account: null, refused: [], stale: false, last_get_at: null };
+/** N3 (c) (CR-PRB2): a stored name a 0.16.0 client wrote with a control character is dropped on read, as the snapshot parse drops it. */
+function printableNames(list) {
+    return list === null ? null : list.filter(isPrintableName);
+}
 function parseAccountGrants(value) {
     if (value === null)
         return null;
     if (typeof value !== "object" || Array.isArray(value))
         return undefined;
     const o = value;
-    const owners = stringList(o.owners, normalizeOwner);
-    const repos = stringList(o.repos, normalizeSlug);
-    const excluded = stringList(o.excluded, normalizeSlug);
+    const owners = printableNames(stringList(o.owners, normalizeOwner));
+    const repos = printableNames(stringList(o.repos, normalizeSlug));
+    const excluded = printableNames(stringList(o.excluded, normalizeSlug));
     if (owners === null || repos === null || excluded === null)
         return undefined;
     if (typeof o.epoch !== "number" || !Number.isSafeInteger(o.epoch) || o.epoch < 0)
@@ -266,7 +271,7 @@ export function readAccountState(home) {
             return EMPTY_ACCOUNT_STATE;
         const o = parsed;
         const account = o.account === undefined ? null : parseAccountGrants(o.account);
-        const refused = o.refused === undefined ? [] : stringList(o.refused, normalizeSlug);
+        const refused = o.refused === undefined ? [] : printableNames(stringList(o.refused, normalizeSlug));
         const last = o.last_get_at === undefined ? null : o.last_get_at;
         if (account === undefined || refused === null)
             return EMPTY_ACCOUNT_STATE;
@@ -434,6 +439,24 @@ export function isCaptureAllowed(home, keys, slug) {
     return byClone || grants.repos.includes(name) || grants.owners.includes(ownerOfSlug(name));
 }
 /**
+ * Does this machine's consent name the repository `slug` through a grant, with no deny list naming it? The grant side of
+ * `isCaptureAllowed` only: a repo the grants list (`repos`, or its owner), and no list denies it. Denied by this file's
+ * `excluded` and `refused`, the account's `refused`, and the account's own `excluded` (`grants-account.json`). Shared by `off`'s
+ * "was it on" check (status.ts) and `auth`'s pending-offer summary (auth.ts, ENG-44). A pending grant not yet synced is not counted
+ * here, unlike the in-repo gate; a name from elsewhere has no clone key to consult, so this is the honest answer.
+ */
+export function slugGrantedHere(home, slug) {
+    const read = readGrants(home);
+    if (read.kind !== "ok")
+        return false;
+    const name = normalizeSlug(slug);
+    const account = readAccountState(home);
+    const denied = [read.grants.excluded, read.grants.refused, account.refused, account.account?.excluded ?? []].some((list) => list.includes(name));
+    if (denied)
+        return false;
+    return read.grants.repos.includes(name) || read.grants.owners.includes(ownerOfSlug(name));
+}
+/**
  * Does this machine hold ANY capture consent at all? The hook asks BEFORE it opens a transcript or writes a byte of state: a
  * machine that has granted nothing (no `projects.json` entry, no slug or owner grant) must not read or index a single session
  * (any-folder capture widens what a hook reads, never who it reads it for).
@@ -468,6 +491,74 @@ export function captureStanding(home, keys, slug) {
     const basis = isProjectAllowed(home, keys.consent) || grants.repos.includes(name) || grants.owners.includes(ownerOfSlug(name));
     return basis ? "held" : "undecided";
 }
+const PENDING_OFFER_KEY = "pending_offer";
+const PENDING_OFFER_KINDS = new Set(["owner", "repo", "folder"]);
+/** One entry's value in its stored form: an owner or a repo as the grants normalise them, a folder as given. */
+function pendingValue(kind, value) {
+    if (kind === "owner")
+        return normalizeOwner(value);
+    if (kind === "repo")
+        return normalizeSlug(value);
+    return value;
+}
+/** The entries in stored form, without the empty ones, and without a repeat of a kind and value already listed. */
+function cleanPendingOffer(entries) {
+    const seen = new Set();
+    const out = [];
+    for (const entry of entries) {
+        const value = pendingValue(entry.kind, entry.value);
+        if (value === "")
+            continue;
+        const id = JSON.stringify([entry.kind, value]);
+        if (seen.has(id))
+            continue;
+        seen.add(id);
+        out.push({ kind: entry.kind, value });
+    }
+    return out;
+}
+/** The stored `pending_offer` value read back, or `null` for ANY bad shape: a non-list, a non-object entry, a wrong kind, or a value that is not a non-empty string once normalised. */
+function parsePendingOffer(value) {
+    if (!Array.isArray(value))
+        return null;
+    const entries = [];
+    for (const item of value) {
+        if (item === null || typeof item !== "object" || Array.isArray(item))
+            return null;
+        const { kind, value: raw } = item;
+        if (typeof kind !== "string" || !PENDING_OFFER_KINDS.has(kind) || typeof raw !== "string")
+            return null;
+        const clean = pendingValue(kind, raw);
+        if (clean === "")
+            return null;
+        entries.push({ kind: kind, value: clean });
+    }
+    return cleanPendingOffer(entries);
+}
+/**
+ * The offer's list, read leniently (4.4a, ENG-26). Returns the stored entries, or `[]` for ANY bad shape: no file, an unreadable
+ * file, a file that is not a JSON object, no `pending_offer` key, a key that is not a list, or any one entry that is bad (one bad
+ * entry empties the whole list, so a half-garbage list never offers half). Never throws and never writes. Only `connect`'s offer
+ * reads it; `status`, the setup predicate and the hooks never do.
+ */
+export function readPendingOffer(home) {
+    let raw;
+    try {
+        raw = readFileSync(grantsPath(home), "utf8");
+    }
+    catch {
+        return [];
+    }
+    try {
+        const parsed = JSON.parse(raw);
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))
+            return [];
+        return parsePendingOffer(parsed[PENDING_OFFER_KEY]) ?? [];
+    }
+    catch {
+        return [];
+    }
+}
 /** `updateGrants` refuses to rewrite a file it cannot read: overwriting would silently drop exclusions it never saw. */
 export class GrantsUnreadableError extends Error {
     constructor() {
@@ -485,8 +576,12 @@ export class GrantsUnreadableError extends Error {
  * ⛔ **Keeps the top-level keys it does not know**, verbatim and uninterpreted, after the five it rebuilds (which always
  * win). A newer version's file read by this one is written back whole: dropping a key it added would silently undo its
  * state. No lock: same read-modify-write as `projects.json`, so two simultaneous verbs can lose one write.
+ *
+ * ⛔ **`patch` sets `pending_offer` in the SAME write** (ENG-26): a list replaces the key (normalised and de-duplicated), an
+ * empty list or `null` deletes it. Omitted, the file's own `pending_offer` is kept exactly as read, like any other unknown key,
+ * so every caller that passes no patch writes the same bytes as before.
  */
-export function updateGrants(home, change) {
+export function updateGrants(home, change, patch) {
     const { read, extras } = readGrantsWithExtras(home);
     if (read.kind === "unreadable")
         throw new GrantsUnreadableError();
@@ -507,7 +602,9 @@ export function updateGrants(home, change) {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     chmodSync(rootDir(home), 0o700);
     // `Object.fromEntries` defines own properties, so even a key named `__proto__` is written back as data.
-    const out = Object.fromEntries([...Object.entries(clean), ...extras]);
+    const kept = patch === undefined ? extras : extras.filter(([key]) => key !== PENDING_OFFER_KEY);
+    const offer = patch === undefined ? [] : cleanPendingOffer(patch.pending_offer ?? []);
+    const out = Object.fromEntries([...Object.entries(clean), ...kept, ...(offer.length > 0 ? [[PENDING_OFFER_KEY, offer]] : [])]);
     writeFileAtomic(path, `${JSON.stringify(out, null, 2)}\n`, 0o600);
     return clean;
 }

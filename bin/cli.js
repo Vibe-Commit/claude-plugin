@@ -347,15 +347,7 @@ async function runVerb(verb, argv, ctx) {
                 // stay the fallback. Injected HERE and nowhere else — the verb's default
                 // is paste-only, so this line is what makes the route reachable.
                 browser: realBrowser,
-                // `CR-236`. After a save inside a git work tree on a terminal, `auth` continues into `connect`.
-                // ⛔ NO `browser` HERE, AND THAT IS THE "ONE AUTH" GUARANTEE: this verb just saved a credential, so
-                // the chained `connect` finds one; were it ever absent it falls to the old warning, never to a
-                // second sign-in. `test/auth-connect-chain.test.ts` brace-matches this call to keep it so.
-                // The backfill offer IS passed: it is not a sign-in, it asks its own y/N (default N) on a terminal only, and the chain
-                // itself runs only on a terminal (the `!piped` gate, D32 guard 1), so a piped or CI `auth` never reaches it.
-                // Slice 2: the account's network is passed (it is not a sign-in), so the chained `connect` syncs and shows the picker's
-                // "on your account" group. `g` needs a `browser`, which this call never has, so the chain can never reach it.
-                connect: (c) => connect(c, {}, { backfill: backfillForConnect, account: { fetch: globalThis.fetch } }),
+                // 4.12. No `connect` dep: a save ends at the saved line and the next-step line. `connect` is the one front door.
                 // R3-7: a credential this verb saves, off the chain, is synced before it returns (only on a machine that has synced before).
                 account: { fetch: globalThis.fetch },
             });
@@ -374,7 +366,14 @@ async function runVerb(verb, argv, ctx) {
                 device: argv.includes("--device"),
                 // `D28`: the typed prompt even on a terminal — the checklist's way out for a screen reader.
                 typed: argv.includes("--typed"),
+                // T7 (4.9, B3): `--no-backfill` skips the offer and the test capture.
+                noBackfill: argv.includes("--no-backfill"),
                 help: argv.includes("--help") || argv.includes("-h"),
+                // CR-PRB T12 (4.11): the bare arguments are names (`owner/repo`, `owner/`); `connect` checks each one before it reads anything.
+                names: argv.slice(1).filter((token) => !token.startsWith("-")),
+                agentFlag: argv.find((token) => token.startsWith("--agent=")) ?? null,
+                // Round prb1 #10: a refusal's retry repeats the command as typed, `--no-color` included.
+                noColor: argv.includes("--no-color"),
             }, 
             // `D14`/`D15`: the backfill offer after "Capture is on" (PR 5's `backfillForConnect`).
             // Slice 2: `account` is the network for the sync, the "on your account" group, `g` and the joining-machine question.

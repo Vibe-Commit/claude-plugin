@@ -298,6 +298,48 @@ export function hasRegistration(raw, shape, registration, binaryExists = existsS
     return Array.isArray(entries) && entries.some((e) => isOurs(e, shape, registration, binaryExists));
 }
 /**
+ * Is one of OUR entries for this event one whose binary no longer exists and is not the one this client is? (CR-PRB T9a, the
+ * stale arm of `setup_state.ts`'s repair (c).) Read-only, like `hasRegistration`, and it uses the same `isOurs` rule, so a
+ * stale entry is by definition one `hasRegistration` already counts as ours.
+ *
+ * Unparseable, absent or the wrong shape all answer false.
+ */
+export function registrationStale(raw, shape, registration, binaryExists = existsSync) {
+    if (raw === null)
+        return false;
+    let doc;
+    try {
+        doc = JSON.parse(raw);
+    }
+    catch {
+        return false;
+    }
+    if (!isRecord(doc) || !isRecord(doc.hooks))
+        return false;
+    const entries = doc.hooks[registration.event];
+    const mine = parseHookCommand(registration.command);
+    if (!Array.isArray(entries) || mine === null)
+        return false;
+    return entries.some((entry) => {
+        if (!isOurs(entry, shape, registration, binaryExists))
+            return false;
+        const command = commandOf(entry, shape);
+        const theirs = command === null ? null : parseHookCommand(command);
+        return theirs !== null && theirs.binPath !== mine.binPath && !binaryExists(theirs.binPath);
+    });
+}
+/** The command an entry runs, in either document shape. `null` for a marker-only entry that carries none. */
+function commandOf(entry, shape) {
+    if (!isRecord(entry))
+        return null;
+    if (shape === "cursor")
+        return typeof entry.command === "string" ? entry.command : null;
+    if (!Array.isArray(entry.hooks))
+        return null;
+    const inner = entry.hooks[0];
+    return isRecord(inner) && typeof inner.command === "string" ? inner.command : null;
+}
+/**
  * ⛔ **THE WHOLE STRING, NEVER A SUBSTRING — the trap `TODOS[138]` names.**
  *
  * Two arms, and only two:
@@ -467,7 +509,7 @@ export function writeAgentHooks(path, shape, registrations) {
     // watches it to react. A MOVED binary path still lands here as different text and is refreshed, because a stale
     // path is worse than a fresh review — the hook would point at a binary that is gone.
     if (raw !== null && merged.text === raw)
-        return { kind: "already", path, events };
+        return { kind: "already", path, events, changed: false };
     // The temp file and the rename live in the TARGET's directory: for a symlinked config
     // that is where the bytes belong, and a rename over the link would replace the link.
     const temp = join(dirname(target), `.${AGENT_HOOK_MARKER.replace(/\W+/g, "-")}.tmp`);
@@ -483,8 +525,27 @@ export function writeAgentHooks(path, shape, registrations) {
     }
     // "already" is not "nothing happened" — the command was still refreshed. It is
     // the answer to *did this connect ADD anything*, which is what a user reads.
+    // T8 (ENG-16): a refreshed path is a write too (`changed`), even though it adds no hook.
     return merged.added.length === 0
-        ? { kind: "already", path, events }
-        : { kind: "installed", path, events };
+        ? { kind: "already", path, events, changed: true }
+        : { kind: "installed", path, events, changed: true };
+}
+/**
+ * Read an agent's config without writing it. ENOENT is absent; any other read error, and a dangling symlink, is refused. A
+ * symlink is read through to its target, which is where `writeAgentHooks` writes.
+ */
+export function readAgentConfig(path) {
+    const located = locateConfig(path);
+    if (located.kind === "refused")
+        return { kind: "refused", why: located.why };
+    const target = located.kind === "present" ? located.target : path;
+    try {
+        return { kind: "ok", raw: readFileSync(target, "utf8"), target };
+    }
+    catch (error) {
+        if (errnoOf(error) === "ENOENT")
+            return { kind: "absent", target };
+        return { kind: "refused", why: target === path ? unreadableWhy(error) : unreadableLinkWhy(error) };
+    }
 }
 //# sourceMappingURL=agent_hooks.js.map

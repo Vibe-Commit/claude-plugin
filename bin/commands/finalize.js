@@ -38,7 +38,7 @@
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_AGENT_ID, admitsTranscript, transcriptRoots } from "../agents/registry.js";
-import { BACKFILL, COMMANDS, ERRORS, FINALIZE } from "../copy/index.js";
+import { BACKFILL, COMMANDS, ERRORS, FINALIZE, relativeAge } from "../copy/index.js";
 import { renderVerbHelp } from "../verb_help.js";
 import { hasAnyConsent, isCaptureAllowed } from "../consent.js";
 import { authCommandFor, channelCommand, connectCommandFor } from "../install.js";
@@ -55,7 +55,7 @@ import { LockLostError, dialectIsolates, resolveTargets, stopKeyOf, stopTarget }
 import { repoSessionsDir, sessionStatePath } from "../paths.js";
 import { ingestUrl } from "../post.js";
 import { resolveProjectKeys } from "../project.js";
-import { loadSessionState } from "../state.js";
+import { loadSessionState, openTailForRepo, stuckForRepo } from "../state.js";
 import { renderErrorBlock, wrap } from "../term.js";
 import { notAGitRepoBlock, writeFailure, writeLines } from "./context.js";
 import { credentialProblem } from "./credential_problem.js";
@@ -90,8 +90,12 @@ function parseArgs(argv) {
         else
             return null;
     }
-    if ((session === null) === !latest)
-        return null; // exactly one of the two
+    // Plain `finalize` (no option) is allowed (screen 4.18). `--session` with `--latest` is refused, and `--force` needs a target: a bare
+    // `finalize --force` would close the one candidate without naming it, past the `stillWriting` guard (native Eng voice E5).
+    if (session !== null && latest)
+        return null;
+    if (force && session === null && !latest)
+        return null;
     return { session, latest, force };
 }
 /**
@@ -265,7 +269,7 @@ async function finalizeBody(ctx, argv, releases) {
             what: FINALIZE.needTarget,
             why: [],
             fixLabel: FINALIZE.needTargetFix,
-            fixes: [FINALIZE.commandSessionAny, COMMANDS.finalize].map((fix) => channelCommand(ctx.env, ctx.selfPath, fix)),
+            fixes: [FINALIZE.commandSessionAny, COMMANDS.finalizeLatest].map((fix) => channelCommand(ctx.env, ctx.selfPath, fix)),
         }, ctx.colour));
         return EXIT.usage;
     }
@@ -445,7 +449,9 @@ async function finalizeBody(ctx, argv, releases) {
             sessionId = args.session;
         }
         else {
-            const recent = recentSessions(ctx.home, projectKey, nowMs);
+            // Plain `finalize` (no option) takes its candidates from `status`'s own rules and never offers the session it runs inside (ENG-35).
+            // `--latest` keeps its own set, as it always has.
+            const recent = args.latest ? recentSessions(ctx.home, projectKey, nowMs) : plainCandidates(ctx.home, ctx.env, projectKey, nowMs);
             if (recent.length === 0) {
                 writeLines(ctx.stderr, renderErrorBlock({
                     kind: "bad",
@@ -457,18 +463,34 @@ async function finalizeBody(ctx, argv, releases) {
                 }, ctx.colour));
                 return EXIT.usage;
             }
-            if (recent.length > 1) {
+            // CLI UX PR-B round prb1 #1 (ENG-31): the list is a question, so it needs a terminal on stdout as well as stdin. A piped stdout
+            // takes the several-sessions block below, with its own what and why, and writes no question.
+            const outputPiped = !args.latest && ctx.stdinIsTty && ctx.stdout.isTTY !== true;
+            if (recent.length > 1 && !args.latest && ctx.stdinIsTty && !outputPiped) {
+                // Screen 4.18: the list, and one number closes that session. The rest of the verb is the same as `--session <id>`.
+                const chosen = await chooseSession(ctx, recent, nowMs);
+                if (typeof chosen === "number")
+                    return chosen;
+                sessionId = chosen.id;
+            }
+            else if (recent.length > 1) {
+                // Several and no terminal (or `--latest`, which never lists): the same block, with a runnable line per candidate (DX-18) for the
+                // plain verb. `--latest` keeps its placeholder, as it always has.
                 writeLines(ctx.stderr, renderErrorBlock({
                     kind: "bad",
                     code: "FINALIZE_SEVERAL_RECENT",
-                    what: FINALIZE.severalRecent,
-                    why: recent.map((r) => FINALIZE.recentRow(r.id, Math.round((nowMs - r.at) / 60000))),
+                    what: outputPiped ? FINALIZE.outputNotTerminalWhat : FINALIZE.severalRecent,
+                    why: [...(outputPiped ? [FINALIZE.outputNotTerminalWhy] : []), ...recent.map((r) => FINALIZE.recentRow(r.id, Math.round((nowMs - r.at) / 60000)))],
                     fixLabel: FINALIZE.severalRecentFix,
-                    fixes: [channelCommand(ctx.env, ctx.selfPath, FINALIZE.commandSessionAny)],
+                    fixes: args.latest
+                        ? [channelCommand(ctx.env, ctx.selfPath, FINALIZE.commandSessionAny)]
+                        : recent.map((r) => channelCommand(ctx.env, ctx.selfPath, FINALIZE.commandSession(r.id))),
                 }, ctx.colour));
                 return EXIT.usage;
             }
-            sessionId = recent[0].id;
+            else {
+                sessionId = recent[0].id;
+            }
         }
         // ── U5b: THE SESSION'S RECORDED FIRINGS ARE REPLAYED FIRST, under its lock, before anything asks whether the session exists. After U6 the
         //    hook writes no state file and promotes nothing, so a session the worker has not reached has neither, and `--session` would answer
@@ -664,6 +686,87 @@ export function ingestUrlUnavailableBlock(ctx) {
         fixLabel: FINALIZE.ingestUrlFix,
         fixes: [FINALIZE.ingestUrlCommand],
     }, ctx.colour);
+}
+/**
+ * The candidates for plain `finalize` (screen 4.18): `--latest`'s set, plus the sessions `status` names for this repo (`openTail` and `heldIdle`),
+ * de-duplicated, newest first. The session the environment names (`CLAUDE_CODE_SESSION_ID`, ENG-35) is never a candidate: an agent that runs
+ * `finalize` from inside a live session would otherwise find its own session, and with one candidate only the `stillWriting` guard stands
+ * between it and closing it. A `status` id that is not a valid session id is left out, since `finalize --session <id>` would refuse it.
+ */
+function plainCandidates(home, env, repoKey, nowMs) {
+    const at = new Map(recentSessions(home, repoKey, nowMs).map((r) => [r.id, r.at]));
+    for (const id of [...openTailForRepo(home, repoKey, nowMs).ids, ...stuckForRepo(home, repoKey, nowMs).heldIdle.ids]) {
+        if (!at.has(id))
+            at.set(id, stateFileTime(home, repoKey, id));
+    }
+    const own = env.CLAUDE_CODE_SESSION_ID;
+    return [...at]
+        .filter(([id]) => SESSION_ID.test(id) && id !== own)
+        .map(([id, t]) => ({ id, at: t }))
+        .sort((x, y) => y.at - x.at || (x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
+}
+/** When a session's state file was last written, for a candidate that `--latest`'s window does not hold. `0` when it cannot be read. */
+function stateFileTime(home, repoKey, sessionId) {
+    const path = sessionStatePath(home, { repoKey, sessionId });
+    if (path === null)
+        return 0;
+    try {
+        return statSync(path).mtimeMs;
+    }
+    catch {
+        return 0;
+    }
+}
+/** Ask a question; `null` when the prompt was aborted (Ctrl+C rejects, and nobody answered). A local copy: `connect`'s helper would pull in the picker. */
+async function askOrNull(ctx, question) {
+    try {
+        return await ctx.ask(question);
+    }
+    catch {
+        return null;
+    }
+}
+/** How many answers in a row the list will refuse before it gives up (the picker's rule). */
+const LIST_MAX_MISSES = 10;
+/**
+ * Screen 4.18: the list of several candidates, and the one number that closes one. Returns the chosen session, or the exit code the verb
+ * ends with (Enter closes nothing, exit 0; Ctrl+C and ten misses, exit 1). Only one number is accepted; anything else re-asks.
+ */
+async function chooseSession(ctx, candidates, nowMs) {
+    writeLines(ctx.stdout, [
+        "",
+        `  ${FINALIZE.pickHeading}`,
+        "",
+        ...candidates.map((c, i) => `    ${FINALIZE.pickRow(i + 1, c.id.slice(0, 8), relativeAge(c.at, nowMs))}`),
+        "",
+        ...wrap(FINALIZE.pickWarning, 2),
+        "",
+        `  ${FINALIZE.pickPrompt}`,
+    ]);
+    let misses = 0;
+    for (;;) {
+        const answer = await askOrNull(ctx, `  ${FINALIZE.promptMark}`);
+        if (answer === null) {
+            writeLines(ctx.stdout, ["", ...wrap(FINALIZE.cancelled, 2)]);
+            return EXIT.failure;
+        }
+        const typed = answer.trim();
+        if (typed === "") {
+            writeLines(ctx.stdout, wrap(FINALIZE.nothingClosed, 2));
+            return EXIT.ok;
+        }
+        const n = /^\d+$/.test(typed) ? Number(typed) : NaN;
+        if (Number.isInteger(n) && n >= 1 && n <= candidates.length) {
+            writeLines(ctx.stdout, [""]);
+            return { id: candidates[n - 1].id };
+        }
+        writeLines(ctx.stdout, wrap(FINALIZE.notUnderstood(/^\d+$/.test(typed) ? FINALIZE.noRow(typed) : typed), 2));
+        misses += 1;
+        if (misses >= LIST_MAX_MISSES) {
+            writeLines(ctx.stdout, ["", ...wrap(FINALIZE.cancelled, 2)]);
+            return EXIT.failure;
+        }
+    }
 }
 /**
  * Sessions of this repo that were touched in the last 24 h, newest first. "Touched" is a state file, the hook's `.live` stamp, or a recorded

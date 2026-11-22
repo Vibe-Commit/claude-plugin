@@ -6,12 +6,12 @@
  * flags those verbs accept: `connect`'s did-you-mean line is built from it, and `test/args-check.test.ts` ties each row to
  * the help's option rows (`HELP.verbs[verb].options`).
  *
- * ⛔ NOT CHECKED, ON PURPOSE: `status`, `off` and `backfill` (later PRs leave their handling exactly as it is), and the hidden
- * verbs `hook`, `post-commit`, `post-rewrite` and `__upload-worker`, which `index.ts` dispatches before `cli.ts` is loaded.
+ * ⛔ NOT CHECKED, ON PURPOSE: the hidden verbs `hook`, `post-commit`, `post-rewrite` and `__upload-worker`, which `index.ts`
+ * dispatches before `cli.ts` is loaded.
  */
 import { INGEST_TOKEN_PREFIX } from "./credential.js";
-/** The verbs this check governs in PR-A. */
-export const CHECKED_VERBS = ["connect", "auth", "scan", "why", "finalize", "report"];
+/** The user verbs this check governs: PR-A's six, and PR-B's `status`, `off` and `backfill` (T22). */
+export const CHECKED_VERBS = ["connect", "auth", "scan", "why", "finalize", "report", "status", "off", "backfill"];
 export function isCheckedVerb(value) {
     return value !== undefined && CHECKED_VERBS.includes(value);
 }
@@ -25,6 +25,8 @@ export const FLAG_TABLE = {
     connect: [
         { name: "--sign-in", value: false },
         { name: "--device", value: false },
+        // T7 (4.9, B3): skips the earlier-sessions offer, its question and the test capture. A `connect` flag, never a "yes" (D65 §DR7).
+        { name: "--no-backfill", value: false },
         { name: "--typed", value: false },
         { name: "--agent", value: true, equalsOnly: true },
     ],
@@ -45,20 +47,26 @@ export const FLAG_TABLE = {
         { name: "--ref", value: true },
         { name: "--json", value: false },
     ],
+    status: [{ name: "--json", value: false }],
+    off: [],
+    backfill: [],
 };
 /**
  * What a bare (non-flag) token means to each verb:
  *   - `refuse`: it is an unknown argument (names do not exist in this build for `connect`, so it is refused like any other);
  *   - `auth-check`: `auth`'s own `CREDENTIAL_IN_ARGV` check owns it, and runs first (it is a credential, not a flag);
- *   - `target`: the verb reads it (`why`'s `<file>:<line>`), and refuses a bad one itself.
+ *   - `target`: the verb reads it (`why`'s `<file>:<line>`, `off`'s `owner/repo`), and refuses a bad one itself.
  */
 export const POSITIONALS = {
-    connect: "refuse",
+    connect: "target",
     auth: "auth-check",
     scan: "refuse",
     why: "target",
     finalize: "refuse",
     report: "refuse",
+    status: "refuse",
+    off: "target",
+    backfill: "refuse",
 };
 /** The longest token the refusal names; longer ones are cut with an ellipsis (`unknownCommandWhat`'s rule). */
 export const SHOWN_LENGTH = 40;
@@ -82,7 +90,8 @@ function editDistance(a, b) {
 }
 /**
  * The nearest of `candidates` within edit distance 2; ties go to the alphabetically first. `connect` only (CEO-6).
- * The candidates are the check's own flag names, so a flag that does not exist (`--no-backfill` in this build) is never offered.
+ * The candidates are the check's own flag names, so a flag that does not exist is never offered (T7: `--no-backfill` is a flag of `connect`,
+ * so it is a candidate, and `--no-backfil` gets it).
  */
 export function nearestFlag(name, candidates) {
     let best = null;

@@ -24,11 +24,12 @@
  * y/N, which defaults to N. It is an ADDITION to the diff, never part of the baseline.
  */
 import { ownerOfSlug, normalizeSlug, normalizeOwner, isLocalSlug } from "./consent.js";
-import { AGENT_HOOKS, SCAN, PICKER, shortDate } from "./copy/index.js";
+import { SCAN, PICKER, shortDate } from "./copy/index.js";
 import { DIALECTS, agentIsolatesRecords } from "./agents/registry.js";
 import { LABEL_GUTTER, paint, truncateMiddle, wrap } from "./term.js";
 import { GITHUB_HOSTS, HOSTNAME, OWNER, REPO, parseRemoteSlug } from "./git.js";
 import { defaultTempRoots, safeRealpath } from "./temp_roots.js";
+import { terminalSafe } from "./printable.js";
 /** D9: each owner group shows at most this many repos before the `+ N more` row. */
 export const GROUP_CAP = 8;
 /** The gap between the name column and the counts, as `scan`'s screen has it. */
@@ -186,7 +187,8 @@ export function buildModel(input) {
         onNow.push({ kind: "clone", key: slug, reason: PICKER.reasonPerClone, counts: countsOf(slug), reposHere: 0, commonDirs });
     }
     // Folder grants (R3): a granted folder is an `on now` row (removable); every other folder with sessions is offered.
-    const folderLabel = input.folderLabel ?? ((path) => path);
+    // Sweep (CR-PRB2): a folder's label is a path on this disk, so it is printed through terminalSafe wherever the model carries it.
+    const folderLabel = (path) => terminalSafe(input.folderLabel?.(path) ?? path);
     const grantedFolders = new Set(input.grantedFolders ?? []);
     // ⛔ C34: counts and offers cover only what a folder grant would capture. A folder with no passing session is not offered; a granted
     // one stays a removable `on now` row, with no counts.
@@ -594,7 +596,8 @@ export function renderTyped(model, options) {
         return [
             ...lines,
             ...wrap(model.sawNothing ? PICKER.emptyNone : SCAN.noneListable, 2).map((l) => paint(colour, "strong", l)),
-            ...(model.sawNothing ? [...wrap(PICKER.emptyExpected, 2), ...wrap(AGENT_HOOKS.codexTrust, 2)] : []),
+            // D-CODEX (C2): no Codex trust line here. Nothing is written on this screen, so ENG-16's "written this run" rule holds.
+            ...(model.sawNothing ? wrap(PICKER.emptyExpected, 2) : []),
             ...(header ? notListedBlock(model, colour) : []),
             "",
             ...wrap(model.sawNothing ? PICKER.emptyType : PICKER.emptyListable, 2),
@@ -706,7 +709,7 @@ heading = PICKER.chose) {
             PICKER.labelOwners,
             change.addOwners.map((o) => {
                 const here = facts.reposHere.get(o) ?? 0;
-                return `${o}/  ${here > 0 ? PICKER.ownerHere(here) : PICKER.noCloneHere}`;
+                return `${o}/  ${here > 0 ? PICKER.ownerHere(here) : PICKER.ownerNoClone}`;
             }),
         ],
         [
@@ -721,7 +724,7 @@ heading = PICKER.chose) {
         // person is told so at the one moment they are asked. Nothing here claims more than that.
         [
             PICKER.labelFolders,
-            (change.addFolders ?? []).map((path) => `${facts.folderLabels?.get(path) ?? path}  ${PICKER.folderPrivate}`),
+            (change.addFolders ?? []).map((path) => `${terminalSafe(facts.folderLabels?.get(path) ?? path)}  ${PICKER.folderPrivate}`),
         ],
         [
             PICKER.labelStop,
@@ -729,26 +732,65 @@ heading = PICKER.chose) {
                 ...change.stopOwners.map((o) => `${o}/`),
                 ...change.stopRepos,
                 ...change.stopClones,
-                ...(change.stopFolders ?? []).map((path) => facts.folderLabels?.get(path) ?? path),
+                ...(change.stopFolders ?? []).map((path) => terminalSafe(facts.folderLabels?.get(path) ?? path)),
             ],
         ],
     ];
+    // 3E (plan 4.8): when the change also adds something, each stop row says it stops on either answer.
+    const marking = hasAdditions(change) ? `  ${paint(colour, "muted", PICKER.stopOnEither)}` : "";
     for (const [label, values] of rows) {
         values.forEach((value, i) => {
             const key = i === 0 ? label.padEnd(LABEL_GUTTER) : " ".repeat(LABEL_GUTTER);
-            lines.push(`    ${paint(colour, "muted", key)}${paint(colour, "text", value)}`);
+            const suffix = label === PICKER.labelStop ? marking : "";
+            lines.push(`    ${paint(colour, "muted", key)}${paint(colour, "text", value)}${suffix}`);
         });
     }
     return lines;
 }
+/**
+ * What the upload question names (plan 4.8, Marking): one addition by its name (a slug, an owner with `/`, or a folder label),
+ * more by a count. `labels` gives each folder its `~`-relative label.
+ */
+export function grantTarget(change, labels = new Map()) {
+    const repoCount = change.addOwners.length + change.addRepos.length + change.turnOn.length;
+    const folders = change.addFolders ?? [];
+    if (repoCount + folders.length === 1) {
+        if (change.addOwners.length === 1)
+            return `${change.addOwners[0]}/`;
+        if (change.addRepos.length === 1)
+            return change.addRepos[0] ?? "";
+        if (change.turnOn.length === 1)
+            return change.turnOn[0] ?? "";
+        const only = folders[0] ?? "";
+        return terminalSafe(labels.get(only) ?? only);
+    }
+    // T20 sweep (CL-B F1): an owner is not one repository, so a change that adds an owner is never counted as N repositories.
+    if (folders.length === 0)
+        return change.addOwners.length > 0 ? PICKER.grantTargetReposUncounted : PICKER.grantTargetRepos(repoCount);
+    if (repoCount === 0)
+        return PICKER.grantTargetFolders(folders.length);
+    return PICKER.grantTargetMixed;
+}
+/** The scope sentence and the check line (plan 4.8), after the `You chose:` rows and before the question. Empty with no additions. */
+export function grantScopeLines(change, check) {
+    if (!hasAdditions(change))
+        return [];
+    const folders = (change.addFolders ?? []).length > 0;
+    const repos = change.addOwners.length + change.addRepos.length + change.turnOn.length > 0;
+    const where = folders ? (repos ? PICKER.grantScopeWhereMixed : PICKER.grantScopeWhereFolders) : PICKER.grantScopeWhereRepos;
+    const sentences = [
+        PICKER.grantScopeStart(where),
+        ...(check === null ? [] : [PICKER.grantScopeCheck(check.agent, check.activity)]),
+        check === null ? PICKER.grantScopeEnd : PICKER.grantScopeEndChecked,
+    ];
+    return ["", ...wrap(sentences.join(" "), 2), ""];
+}
 /** The grant y/N: additions (with or without removals) get the upload question, removals alone the stop question. */
-export function grantQuestion(change, colour, answers) {
+export function grantQuestion(change, colour, answers, labels) {
     const folders = (change.addFolders ?? []).length > 0 || (change.stopFolders ?? []).length > 0;
     const repos = change.addOwners.length + change.addRepos.length + change.turnOn.length + change.stopOwners.length + change.stopRepos.length + change.stopClones.length > 0;
     const q = hasAdditions(change)
-        ? folders
-            ? repos ? PICKER.questionGrantMixed : PICKER.questionGrantFolders
-            : PICKER.questionGrant
+        ? PICKER.questionGrant(grantTarget(change, labels))
         : folders
             ? repos ? PICKER.questionStopMixed : PICKER.questionStopFolders
             : PICKER.questionStop;

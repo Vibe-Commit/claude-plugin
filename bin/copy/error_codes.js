@@ -37,6 +37,8 @@ export const ERROR_CODES = {
     CONSENT_NEEDS_TTY: { summary: "Consent needs a person at a terminal." },
     BACKFILL_NEEDS_TTY: { summary: "Backfill asks a question that needs a person at a terminal." },
     OFF_NEEDS_REPO: { summary: "`off` was run outside a repository." },
+    // DRAFT copy (CLI UX PR-B, T15): the summary line is not verbatim in the plan.
+    OFF_OWNER_NEEDS_PICKER: { summary: "`off` was given a whole owner, which is removed in the picker." },
     // — credentials —
     CREDENTIAL_IN_ARGV: { summary: "A credential was passed as a command-line argument." },
     CREDENTIAL_EMPTY: { summary: "No credential was given to `auth`." },
@@ -44,6 +46,12 @@ export const ERROR_CODES = {
     STORED_CREDENTIAL_NOT_INGEST: { summary: "The credential stored for this machine is not an ingest credential." },
     CREDENTIAL_FILE_INSECURE: { summary: "The credential file is readable by other accounts." },
     CREDENTIAL_FILE_UNREADABLE: { summary: "The credential file could not be read." },
+    // DRAFT copy (CLI UX PR-C, T10 B4): the folder cannot be written, so nothing is minted.
+    CREDENTIAL_FOLDER_UNWRITABLE: { summary: "The folder that holds the credential cannot be written to." },
+    // DRAFT copy (CLI UX PR-C prc1, S3): the pending-revoke record is refused or at its cap, so no credential is made.
+    PENDING_REVOKE_UNREADABLE: { summary: "The record of credentials waiting to be revoked could not be read." },
+    PENDING_REVOKE_FULL: { summary: "This machine already has the maximum number of credentials waiting to be revoked." },
+    PENDING_REVOKE_BUSY: { summary: "The record of credentials waiting to be revoked is in use by another command." },
     CREDENTIAL_REJECTED: { summary: "The server no longer accepts this machine's credential." },
     WORKSPACE_UNCONFIRMED: { summary: "The workspace for a new credential could not be confirmed." },
     // — signing in —
@@ -63,8 +71,10 @@ export const ERROR_CODES = {
     SIGNIN_CODE_DISABLED: { summary: "Sign-in by code is turned off for the account." },
     SIGNIN_RATE_LIMITED: { summary: "Too many sign-in attempts from this network." },
     AUTH_FLAGS_CONFLICT: { summary: "Two `auth` flags that cannot be combined were given." },
+    CONNECT_ARGS_CONFLICT: { summary: "`connect` was given names and `--typed`, which cannot be combined." },
     MINT_FAILED: { summary: "No credential was created through the browser." },
-    MINT_NOT_A_MEMBER: { summary: "The signed-in account is not a member of the workspace." },
+    // P7 ruling (2026-11-22): "organization", not the retired "workspace".
+    MINT_NOT_A_MEMBER: { summary: "The signed-in account is not a member of the organization." },
     MINT_RATE_LIMITED: { summary: "Too many credential requests; the service asked to wait." },
     // — the command on PATH —
     PATH_COMMAND_FOREIGN: { summary: "Another program owns the `vibecommit` command." },
