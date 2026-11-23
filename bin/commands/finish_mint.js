@@ -20,13 +20,21 @@ import { paint, labelled, renderErrorBlock, truncateMiddle, wrap, WRAP_COLUMNS, 
 import { writeLines } from "./context.js";
 import { probeCredential } from "./probe.js";
 /**
- * 0.17.1 (P7 ruling, 2026-11-22): a mint failure's why is its outcome's base sentence plus the path's tail. `auth` writes nothing
- * before its mint, so its tail is "Nothing was written." and its blocks are byte-identical to 0.17.0. On connect's path
- * (`connectPath` set) the grants and hooks were written BEFORE the mint (connect_picker.ts), so "Nothing was written." was false
- * there: the tail is "No credential was saved." One base sentence per outcome, one tail per path; no duplicated keys.
+ * 0.17.2 (P7 ruling, 2026-11-23): whether this run may have written something before its mint. connect's path wrote the grants and
+ * hooks first. `auth`'s BROWSER path may have written `session.json` in its first sign-in step: a new sign-in saves it, and so does a
+ * refresh of a stale stored one (src/oauth/signin.ts), and `mintWithSession` may refresh and save again after a 401. Only the device
+ * flow off connect's path (`auth --device`) writes nothing before its mint.
  */
-export function withMintTail(base, connectPath) {
-    return `${base} ${connectPath === undefined ? AUTH.mintTailAuth : AUTH.connectTail}`;
+export function mayHaveWrittenBeforeMint(connectPath, via) {
+    return connectPath !== undefined || via === "browser";
+}
+/**
+ * 0.17.1 (P7 ruling, 2026-11-22), widened in 0.17.2: a mint failure's why is its outcome's base sentence plus a tail. Where something
+ * may have been written before the mint (`mayHaveWrittenBeforeMint`: connect's path, and `auth`'s browser path) the tail is "No credential
+ * was saved."; only `auth --device` keeps "Nothing was written.", which is true there. One base sentence per outcome; no duplicated keys.
+ */
+export function withMintTail(base, mayHaveWritten) {
+    return `${base} ${mayHaveWritten ? AUTH.connectTail : AUTH.mintTailAuth}`;
 }
 /**
  * 0.17.1 (P7 ruling, 2026-11-22): the same shape for a failed sign-in (`signInError`) and a failed device sign-in. Off connect's path the
@@ -60,7 +68,8 @@ export function connectMintBlock(outcome, connectPath, endpoint, now) {
             kind: "bad",
             code: "MINT_RATE_LIMITED",
             what: AUTH.mintFailedWhat,
-            why: [withMintTail(AUTH.mintRateLimitedWhy, connectPath), wait, ...savedChoicesLines(connectPath)],
+            // connect's path always wrote the grants and hooks first, so the tail is connect's whatever the flow.
+            why: [withMintTail(AUTH.mintRateLimitedWhy, true), wait, ...savedChoicesLines(connectPath)],
             fixLabel: AUTH.rateLimitedAgain,
             fixes: [connectPath.rerun],
         };
@@ -70,7 +79,7 @@ export function connectMintBlock(outcome, connectPath, endpoint, now) {
             kind: "bad",
             code: "MINT_NOT_A_MEMBER",
             what: AUTH.mintFailedWhat,
-            why: [withMintTail(AUTH.mintNotMemberWhy, connectPath), ...savedChoicesLines(connectPath)],
+            why: [withMintTail(AUTH.mintNotMemberWhy, true), ...savedChoicesLines(connectPath)],
             fixLabel: AUTH.notMemberFix,
         };
     }
@@ -82,7 +91,7 @@ export function connectMintBlock(outcome, connectPath, endpoint, now) {
             // A 5xx is an ANSWER (the service refused), so it keeps `auth`'s refused sentence; only no answer at all is "did not answer" (T20
             // sweep, CL-C F4). The recovery line is DX-7's for both: retry once, then the network.
             why: [
-                withMintTail(outcome.kind === "unreachable" ? AUTH.mintUnreachableWhy : AUTH.mintRefusedWhy, connectPath),
+                withMintTail(outcome.kind === "unreachable" ? AUTH.mintUnreachableWhy : AUTH.mintRefusedWhy, true),
                 AUTH.unreachableTried(terminalSafe(new URL(endpoint).host)),
                 ...savedChoicesLines(connectPath),
             ],
@@ -162,7 +171,7 @@ export async function finishMint(ctx, input) {
                 kind: "bad",
                 code: "MINT_FAILED",
                 what: AUTH.mintFailedWhat,
-                why: [withMintTail(AUTH.mintUnconfirmedWhy, input.connectPath), ...savedChoicesLines(input.connectPath)],
+                why: [withMintTail(AUTH.mintUnconfirmedWhy, mayHaveWrittenBeforeMint(input.connectPath, input.via)), ...savedChoicesLines(input.connectPath)],
             }, ctx.colour),
         ]);
         return { kind: "failed" };
@@ -251,9 +260,10 @@ export async function finishMint(ctx, input) {
             // T10 (B5, DX-7): a No after the grants were written is not "the approval is discarded": the choices were saved. Ctrl+C after the
             // grants were written gets the same true line as a No (T20 sweep, CL-C F5). 0.17.1 r1 R1 (P7): on connect's path with NO grant, the
             // hooks may still have been written in this run, so the line says no CREDENTIAL was saved. `auth` keeps 0.17.0's two lines.
+            // 0.17.2 (P7): `auth`'s browser path may have written session.json before this question too, so it takes the same two lines.
             const line = input.connectPath?.grantsWritten === true
                 ? REPLACE.declinedSavedChoices(input.connectPath.rerun)
-                : input.connectPath !== undefined
+                : mayHaveWrittenBeforeMint(input.connectPath, input.via)
                     ? answer === null
                         ? REPLACE.cancelledConnect
                         : REPLACE.declinedConnect

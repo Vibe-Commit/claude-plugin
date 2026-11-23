@@ -40,7 +40,7 @@ import { machineLabel, mintUrl, requestMint } from "../oauth/mint.js";
 import { HTTP_TIMEOUT_MS, openBrowser as platformOpenBrowser } from "../oauth/signin.js";
 import { paint, renderErrorBlock, wrap } from "../term.js";
 import { terminalSafe } from "../printable.js";
-import { connectMintBlock, finishMint, savedChoicesLines, withMintTail, withSignInTail, writeAheadOf, } from "./finish_mint.js";
+import { connectMintBlock, finishMint, mayHaveWrittenBeforeMint, savedChoicesLines, withMintTail, withSignInTail, writeAheadOf, } from "./finish_mint.js";
 import { writeLines } from "./context.js";
 /** Poll failures in a row (a deploy, a blip) before the wait gives up on the service. */
 const MAX_TRANSIENT = 3;
@@ -212,6 +212,8 @@ export async function deviceCredential(ctx, input, deps = {}) {
             writeLines(ctx.stderr, ["", ...renderErrorBlock(connectBlock, ctx.colour)]);
             return { kind: "failed" };
         }
+        // 0.17.2: the device flow writes nothing before its mint, so `auth --device` keeps "Nothing was written." (connect's path does not).
+        const mayHaveWritten = mayHaveWrittenBeforeMint(input.connectPath, "device");
         writeLines(ctx.stderr, [
             "",
             ...errorBlock(ctx, input.connectPath, minted.kind === "refused" && minted.error === "rate_limited" ? "MINT_RATE_LIMITED" : "MINT_FAILED", AUTH.mintFailedWhat, 
@@ -222,7 +224,7 @@ export async function deviceCredential(ctx, input, deps = {}) {
                     ? AUTH.mintRateLimitedWhy
                     : minted.kind === "malformed"
                         ? AUTH.mintMalformedWhy
-                        : DEVICE.redeemFailedWhy, input.connectPath), DEVICE.retryFix, [rerun]),
+                        : DEVICE.redeemFailedWhy, mayHaveWritten), DEVICE.retryFix, [rerun]),
         ]);
         return { kind: "failed" };
     }
@@ -232,6 +234,7 @@ export async function deviceCredential(ctx, input, deps = {}) {
         prior: input.prior,
         endpoint: input.endpoint,
         fetch: fetchImpl,
+        via: "device",
         // The approver is not necessarily the person at this terminal: the question is never skipped (A4 §3).
         confirm: "always",
         ticket: { account: polled.account, orgName: polled.orgName },

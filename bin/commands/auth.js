@@ -131,6 +131,10 @@ export async function auth(ctx, argv, deps = {}) {
             }, ctx.colour));
         return EXIT.usage;
     }
+    // 0.17.2 #135 r1 R1 (P7's gate): the paste's refusals say no CREDENTIAL was saved only after a failure on the browser sign-in's
+    // LOOPBACK branch (its first step may have written session.json). Keyed on the flow that ran, never on argv: a device-flow failure,
+    // a refusal before any sign-in, `--paste` and `--stdin` keep their words.
+    let afterLoopback = false;
     // ── `CR-226`: the browser, first, on a terminal only. ──────────────────────
     if (!piped && !argv.includes(PASTE_FLAG) && deps.browser !== undefined) {
         const minted = await deps.browser(ctx, "auth", { device: argv.includes(DEVICE_FLAG) });
@@ -139,6 +143,7 @@ export async function auth(ctx, argv, deps = {}) {
         // The user said NO at the replace confirmation: not a failure of the browser, so no paste prompt.
         if (minted.kind === "declined")
             return EXIT.failure;
+        afterLoopback = minted.kind === "failed" && minted.afterLoopback === true;
         // The reason is already on stderr. The documented fallback is the paste
         // this verb has always had, with the page that mints one named first.
         writeLines(ctx.stdout, [
@@ -161,7 +166,7 @@ export async function auth(ctx, argv, deps = {}) {
             kind: "bad",
             code: "CREDENTIAL_EMPTY",
             what: AUTH.emptyWhat,
-            why: [AUTH.emptyWhy],
+            why: [afterLoopback ? AUTH.emptyWhyAfterSignIn : AUTH.emptyWhy],
             fixLabel: AUTH.mintFix(URLS.settings),
             fixes: AUTH.mintCommands(authCommandFor(ctx.env, ctx.selfPath)),
         }, ctx.colour));
@@ -176,7 +181,7 @@ export async function auth(ctx, argv, deps = {}) {
             kind: "bad",
             code: "CREDENTIAL_NOT_INGEST",
             what: AUTH.wrongClassWhat,
-            why: [AUTH.wrongClassWhy],
+            why: [afterLoopback ? AUTH.wrongClassWhyAfterSignIn : AUTH.wrongClassWhy],
             fixLabel: AUTH.mintFix(URLS.settings),
             fixes: AUTH.mintCommands(authCommandFor(ctx.env, ctx.selfPath)),
         }, ctx.colour));
