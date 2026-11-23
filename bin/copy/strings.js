@@ -107,7 +107,8 @@ export const HELP = {
             ],
             exits: [
                 ["0", "Credential saved."],
-                ["1", "Nothing was saved."],
+                // 0.17.2 (P7): on the browser path the sign-in may have written session.json, so the row names the credential.
+                ["1", "No credential was saved."],
                 ["2", "Bad arguments, such as a credential passed as an argument."],
             ],
         },
@@ -2377,7 +2378,8 @@ export const REPLACE = {
     cancelled: "Cancelled. Nothing was saved.",
     // 0.17.1 r1 R1 (P7 ruling, 2026-11-22): `declined` and `cancelled` on connect's path with NO grant held. The hooks may have been written
     // in this run (the faulty-file Enter path), so "Nothing was saved" was false there. With a grant held, `declinedSavedChoices` stays for
-    // both. `auth` and `auth --device` keep the two above, byte-identical.
+    // both. 0.17.2 (P7 ruling, 2026-11-23): `auth`'s BROWSER path uses these two as well (its sign-in may have written session.json);
+    // `auth --device` keeps the two above, byte-identical. The keys keep their names.
     declinedConnect: "No credential was saved. The approval is discarded.",
     cancelledConnect: "Cancelled. No credential was saved.",
     /**
@@ -2622,6 +2624,12 @@ export const AUTH = {
     emptyWhat: "No credential was given.",
     emptyWhy: "Nothing was read, so nothing was written.",
     /**
+     * 0.17.2 #135 r1 R1 (P7, 2026-11-23): `emptyWhy` after a failure on the browser sign-in's LOOPBACK branch (`afterLoopback`), whose
+     * first step may have written `session.json`. A device-flow failure, a refusal before any sign-in, `--paste` and `--stdin` keep
+     * `emptyWhy`. On Alexander's veto list with 0.17.2's other lines.
+     */
+    emptyWhyAfterSignIn: "Nothing was read, so no credential was saved.",
+    /**
      * PR 6 item 1. Was "Mint one, then run:" over the URL alone, so the label promised a command and printed a link, and the
      * non-interactive path was named nowhere. The URL comes FIRST (inside the label, where it cannot be wrapped away from
      * its sentence) and the commands LAST, so the fix stays last (§13.6). A function because `URLS` is declared below.
@@ -2635,6 +2643,8 @@ export const AUTH = {
     mintCommands: (auth) => [`printf %s "$TOKEN" | ${auth} --stdin`, auth],
     wrongClassWhat: "That is not a VibeCommit ingest credential.",
     wrongClassWhy: `An ingest credential begins ${INGEST_TOKEN_PREFIX}. Nothing was written and nothing was sent.`,
+    /** 0.17.2 #135 r1 R1 (P7): `wrongClassWhy` under `emptyWhyAfterSignIn`'s gate. On Alexander's veto list. */
+    wrongClassWhyAfterSignIn: `An ingest credential begins ${INGEST_TOKEN_PREFIX}. No credential was saved, and the pasted text was not sent.`,
     argvWhat: "A credential must not be passed as an argument.",
     argvWhy: "Arguments are written to your shell history and are readable by other processes on this machine while the command runs. Treat the one you just typed as exposed and revoke it.",
     argvFix: "Read it from the terminal, or from a pipe:",
@@ -2650,9 +2660,9 @@ export const AUTH = {
     minting: (label) => `Creating this machine's credential, labelled "${label}"…`,
     /** Every mint failure shares the `what`; the `why` names which step refused. */
     mintFailedWhat: "No credential was created through the browser.",
-    // 0.17.1 (P7 ruling, 2026-11-22): the mint whys below are each outcome's BASE sentence. The path adds its tail (`withMintTail`,
-    // finish_mint.ts): `auth` wrote nothing before its mint, so `mintTailAuth`, and its blocks stay byte-identical to 0.17.0; on connect's
-    // path the grants and hooks were written first, so "Nothing was written." was false there, and the tail is `connectTail`.
+    // 0.17.1 (P7 ruling, 2026-11-22), widened in 0.17.2 (2026-11-23): the mint whys below are each outcome's BASE sentence. The path adds
+    // its tail (`withMintTail`, finish_mint.ts). Where something may have been written before the mint (connect's path: the grants and
+    // hooks; `auth`'s browser path: session.json) the tail is `connectTail`; only `auth --device` keeps `mintTailAuth`, true there.
     /** `not-authorized`, or a 401 that survived one refresh. */
     mintSessionWhy: "The sign-in on this machine could not be used to create one. It may have ended or been revoked.",
     // P7 ruling (2026-11-22): "organization", not the retired "workspace" (0.15.0, T41a/T41c).
@@ -2661,11 +2671,13 @@ export const AUTH = {
     mintRefusedWhy: "The service refused the request.",
     mintUnreachableWhy: "The service did not answer.",
     mintMalformedWhy: "The service answered in a form this version cannot use.",
-    /** The tail on `auth`'s mint failures: `auth` writes nothing before its mint. */
+    /** 0.17.2: the tail on `auth --device`'s mint failures only: the device flow writes nothing before its mint (`mayHaveWrittenBeforeMint`). */
     mintTailAuth: "Nothing was written.",
     /**
      * 0.17.1 (P7 ruling, 2026-11-22): the tail every failed sign-in, device sign-in or mint on connect's path ends with. The grants and
      * hooks were written before the sign-in, so "Nothing was written." and "Nothing was changed on this machine." were false there.
+     * 0.17.2 (P7 ruling, 2026-11-23): `auth`'s BROWSER path uses it too, for its mint whys and the retry after an `expired` mint: its first
+     * sign-in step may have written `session.json` (a new sign-in, or a refresh). The key keeps its name; renaming it would churn the register.
      */
     connectTail: "No credential was saved.",
     /**
