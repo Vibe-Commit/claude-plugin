@@ -19,16 +19,16 @@
   ],
   "capture": {
     "repo": "Vibe-Commit/vibecommit-capture",
-    "commit": "1af460bb7278d09a0caa7b5af0ce6f9a9a6428de",
+    "commit": "9691c35bc5002909d03265bba8d9999c328b8a81",
     "npmPackage": "@vibe-commit/capture",
-    "npmVersion": "0.17.2"
+    "npmVersion": "0.17.3"
   },
   "bundle": {
     "root": "bin",
     "algorithm": "sha256",
-    "digest": "c6e0f21e6151767363b3cc4aa7e5276694aefcf403bfc5ed319a7cd1c5e2d769",
+    "digest": "b47cb2c21fcbca8fa3939b1ae9f2937509f074431665cb14a7f41bad63ff6625",
     "fileCount": 123,
-    "byteCount": 2262956,
+    "byteCount": 2274008,
     "files": {
       "account_not_here.js": "2bdd8e5ffbe8b10e1eef86a3b54b273b425be6bb7454eef57a9c5b210b70f194",
       "agent_hooks.js": "a8633c48c79a8cb198a454661dbbca7a68c5909b0c225b4b67a12efc789eb27e",
@@ -50,12 +50,12 @@
       "commands/auth.js": "f694a5da9f1b741d26a8039ac95f172d1573631eeaf29e52551fbdc49c1d7942",
       "commands/backfill.js": "87ff3ff3d1a878bdbd3962d8675932dfea693a27fa0ae28fe078dab8d581aaa4",
       "commands/browser_credential.js": "1bb6a19a59f8b7e80d347851173cc77de931fd96c73e66ba8dd979eca64b3175",
-      "commands/connect.js": "b60c07fb9508968ad23843e0b1cbc1c29726904563152d16605806b298fe7a83",
+      "commands/connect.js": "6ac5e5305eccc7d92eacbbf355a4044049b127bc8bae63e7829277691a394ed8",
       "commands/connect_account.js": "eb43a8f8cc5ecb33aee0acb181377a76baea20c0e4b3408b677be98cf850c172",
-      "commands/connect_picker.js": "321e74a87dbcfc186de6f1f4f3300c09b31b110c5da46a1c546468ccb6159835",
+      "commands/connect_picker.js": "f7d34d1a2c90137da2f1594d3c3b8b106867745f47cefd2a0d78f3cf96bb3293",
       "commands/connect_retry.js": "06cd451410d839da2e9632dc9d1e7f3f5463d3ed0518b901123e5e034c24f87b",
       "commands/context.js": "fd45422c236dd3a18575dac2b333539be97421c296642a96dcbb8a0a221179ac",
-      "commands/credential_problem.js": "f26bdf05240d18e07a30a23c63f9530170a8adda677cfe0ee21470e0c2ebee4c",
+      "commands/credential_problem.js": "5793f7a811af46441376426abc7c7ddb27d8b8e0b3bcbfd8cf8128fab9d2f80c",
       "commands/device_credential.js": "f7ad99234b96a245ae3665b99c342bd9fb0c6395f1ffd69078f99b964d2ef52b",
       "commands/finalize.js": "0e76818e86a33e314ec05a6d8182b5da750377d4c86bd7c1749e63fdb0e93d08",
       "commands/finish_mint.js": "f46222581ee2b0173615bad6261c589cddb7720ad09d09f66a13c656027bc941",
@@ -76,9 +76,9 @@
       "copy/error_codes.js": "61e7fb4f4fdf5562bfc8341d0beae5252f50d9e19917c4d463301e070d535a6c",
       "copy/grades.js": "5fd18e685ac9c063c5431aeb0f21dd5be0ebfa2018487ae9d523f6d3914a0c4a",
       "copy/index.js": "02dd130aeef0d966563e1189532d0242f8c2bb4dfbff046faf5812ce6f780ed9",
-      "copy/strings.js": "24d3661ead059523b2ae2ee014bf68a45c773e413aea6b0e5d51473b4229ce71",
+      "copy/strings.js": "a55addbdb14c4e246787d9c1629e4267bd4aba6614cc0e23e67072011f66e8fe",
       "copy/time.js": "01ea725f5d575d3d7833d49346d4969a70ba19cef1fa728b01001af228358133",
-      "credential.js": "d71b2eefb6f67776f5b7319da045dc03d51797ff75b6c34f97eb5acb39f58ce5",
+      "credential.js": "75c21a14b38e19a0de8f0eb5d42a5030f41a7c9be322fa4b66a72475503ed12d",
       "credential_meta.js": "9a115afca8406d732ed42544bda2f0ebe259de1421214f6d123e116dbea774c1",
       "device_mode.js": "199a67d4a467e22f4682413bfccb8d217bfb8601f08fa2c99fb5b2c93bb8a644",
       "drain.js": "86e7e7a45c927c43e3dc4fa91006e823c17b47491bf0df8ae39c4669a73252ca",
@@ -114,11 +114,11 @@
       "oauth/pkce.js": "badc2d64eb070ee24d483186c04c96250d2be2219f38a8449423f7d47c4ba023",
       "oauth/read.js": "aacff611f14cbc5dc5ad8f22a0408abfaa3f5f8690566443716dc05716827e36",
       "oauth/retire.js": "d36612289e808e04aa9877a3b9bfac08ef1808f76c90fa3f3234c57b1acd2ee6",
-      "oauth/session.js": "28322f8fbdbb6f013d0b9f9d85e4649e9a3ed04137114e6e15929b942319e704",
+      "oauth/session.js": "5898f90402ade318141685177e5685fac3073cf072a2aefbfba73b3d17e1fb4b",
       "oauth/signin.js": "555f3aba85a76cc80d2787141176f707d2ddf8c23404eb29655ae7f9e15ac99c",
       "oauth/token.js": "cb5344b8dd0ece247b9b30d0719ad4ee855c4d8acbfe92a435536285aadb8b0b",
       "oauth/whoami.js": "0cce3bb7010da0f147b162ca8f1f7554e0684ba5fe7a9c1efa0bf52d25448953",
-      "paths.js": "42d15ea9fac2c0c6322ba35a8e29aa8b5a82b4857354fd0a205dbef34be9cba8",
+      "paths.js": "ad1c815deb68f420d09199df9e4630f000046d8bec94581800e319fe9ea1703c",
       "pending_bound.js": "552e914c6dbe2956457ce1939e8079fb13504ab85f950b4b32490d1c7d6dad9c",
       "pending_prune.js": "d716590904d25aa488158579998971d1ec2dd7a957ddf3e41c3fa5a50ce1b3cd",
       "pending_revoke.js": "73f041befac5ea2d0371e912acc106d03207436d4a02dbd7c811efae31fd8620",
@@ -152,7 +152,7 @@
       "uploader_view.js": "5d46e45e660df37ead7198fbbf36d8bb3c87e3c72d28c02767909044518c576e",
       "verb_help.js": "52d38e61546855b496d243b45c0817d3c850280a68897eef40fe151540028c39",
       "verbs.js": "8188f08159a602e4a416c537416d7ce7bb1d03f7fc9ad1cf4997aa2d37358f8d",
-      "version.js": "3fcb41fcc4a3ced84f64755bf33b74519cca928e9e243e5cbfd8b4dc01002960"
+      "version.js": "7a2db47ee1a68c10fcd0a35f3fee5ca00ff97d9ffde42980bc2dda187457dabf"
     }
   }
 }

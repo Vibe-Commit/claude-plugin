@@ -14,7 +14,7 @@
  * @provenance vibecommit-schema ingest_sessions.file_key — CHECK bound 1..128, retyped
  */
 import { createHash } from "node:crypto";
-import { join, sep } from "node:path";
+import { dirname, join, sep } from "node:path";
 import { physicalPath } from "./physical_path.js";
 /** Root of the client's own state. Never Claude Code's — see the plan's keychain note. */
 export function rootDir(home) {
@@ -83,6 +83,20 @@ export function pendingRevokeLockPath(home) {
  */
 export function sessionPath(home) {
     return join(rootDir(home), "session.json");
+}
+/**
+ * 0.17.3 (D-1, P6 spec): which of this client's own secret files `path` is, or null for any other path (session.json included: no block
+ * names it). THE FIXED TABLE the credential blocks choose a fix command from: a `chmod` is never built from a path, and a path not here
+ * gets a block with no command, never the credentials.json one. Exact equality with this module's own paths, so a file of the same name
+ * anywhere else is not in the table.
+ */
+export function secretFileOf(path) {
+    const home = dirname(dirname(path));
+    if (path === credentialsPath(home))
+        return "credentials";
+    if (path === pendingRevokePath(home))
+        return "pending-revoke";
+    return null;
 }
 /**
  * Client state. `CR-023`'s capture-confirmed key lives here under `(repo, day)`;
