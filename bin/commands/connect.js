@@ -362,7 +362,7 @@ export async function askOrCancel(ctx, question) {
         return null;
     }
 }
-/** §10.11: Ctrl+C at the picker or the grant y/N is a No. Exit 1, and nothing was changed. */
+/** §10.11: Ctrl+C at the picker or the grant y/N is a No. Exit 1, and no choice was saved (0.17.4, P7 FINAL: `PICKER.cancelled`). */
 export function cancelled(ctx) {
     writeLines(ctx.stdout, cancelledLines());
     return EXIT.failure;

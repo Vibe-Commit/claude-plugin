@@ -48,6 +48,7 @@ import { authCommandFor, channelCommand, installChannel } from "./install.js";
 import { renderJsonError } from "./json.js";
 import { readStdin } from "./stdin.js";
 import { LABEL_GUTTER, renderErrorBlock, resolveColour, wrap } from "./term.js";
+import { verbStartRetryRuns } from "./verb_start.js";
 import { CLIENT_VERSION } from "./version.js";
 import { VERBS, VERB_GROUPS, isVerb } from "./verbs.js";
 // `CR-216/U2` adds `auth`, and adding it MOVES `test/help.golden.txt` — which
@@ -311,8 +312,8 @@ async function main(argv) {
     // needing no credential, inside one 3 s bound across every row. Not for `--help`, not for `scan` (network-free by contract,
     // README), not for a `--stdin`, piped or no-terminal `auth` (below), and never from a hook (this is the verb path; hooks branch off at the bottom of this file).
     // F8 (L10): nor for `auth` run with `--stdin`, piped or with no terminal ("it only saves the credential" stays exactly true of it).
-    const authSavesOnly = verb === "auth" && (argv.includes("--stdin") || !ctx.stdinIsTty);
-    if (verb !== "scan" && !authSavesOnly && !argv.includes("--help") && !argv.includes("-h")) {
+    // 0.17.4: the decision is `verbStartRetryRuns` (verb_start.ts), which `auth` also reads to choose its paste whys.
+    if (verbStartRetryRuns(verb, argv, ctx)) {
         // Loaded HERE, on the verb path only (the connect.ts rule): `vibecommit hook` never imports the module that holds a token.
         const { retryPendingRevokes } = await import("./pending_revoke.js");
         await retryPendingRevokes(ctx.home, ctx.env, globalThis.fetch, ctx.now());

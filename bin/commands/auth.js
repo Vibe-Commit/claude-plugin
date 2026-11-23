@@ -75,6 +75,7 @@ import { credentialsPath } from "../paths.js";
 import { setupState } from "../setup_state.js";
 import { resolveProjectKeys } from "../project.js";
 import { paint, renderErrorBlock, tildePath, wrap } from "../term.js";
+import { verbStartRetryRuns } from "../verb_start.js";
 /**
  * `--stdin` forces the pipe even on a terminal — the CI shape, where a job may
  * well have a TTY attached and must not start prompting because of it.
@@ -131,10 +132,11 @@ export async function auth(ctx, argv, deps = {}) {
             }, ctx.colour));
         return EXIT.usage;
     }
-    // 0.17.2 #135 r1 R1 (P7's gate): the paste's refusals say no CREDENTIAL was saved only after a failure on the browser sign-in's
-    // LOOPBACK branch (its first step may have written session.json). Keyed on the flow that ran, never on argv: a device-flow failure,
-    // a refusal before any sign-in, `--paste` and `--stdin` keep their words.
-    let afterLoopback = false;
+    // 0.17.4 (P7 FINAL; P6's binding gate): the paste's refusals say no CREDENTIAL was saved wherever the verb-start revoke retry ran (it
+    // may have rewritten or deleted pending-revoke.json): at a terminal, `--paste` and the paste after ANY browser or device failure. The
+    // gate IS the CLI's own skip decision, never a re-derived `piped`, so the words cannot drift from whether the retry ran. Piped and
+    // `--stdin` `auth` runs no retry and keeps 0.17.0's words.
+    const retryRan = verbStartRetryRuns("auth", argv, ctx);
     // ── `CR-226`: the browser, first, on a terminal only. ──────────────────────
     if (!piped && !argv.includes(PASTE_FLAG) && deps.browser !== undefined) {
         const minted = await deps.browser(ctx, "auth", { device: argv.includes(DEVICE_FLAG) });
@@ -143,7 +145,6 @@ export async function auth(ctx, argv, deps = {}) {
         // The user said NO at the replace confirmation: not a failure of the browser, so no paste prompt.
         if (minted.kind === "declined")
             return EXIT.failure;
-        afterLoopback = minted.kind === "failed" && minted.afterLoopback === true;
         // The reason is already on stderr. The documented fallback is the paste
         // this verb has always had, with the page that mints one named first.
         writeLines(ctx.stdout, [
@@ -166,7 +167,7 @@ export async function auth(ctx, argv, deps = {}) {
             kind: "bad",
             code: "CREDENTIAL_EMPTY",
             what: AUTH.emptyWhat,
-            why: [afterLoopback ? AUTH.emptyWhyAfterSignIn : AUTH.emptyWhy],
+            why: [retryRan ? AUTH.emptyWhyAfterSignIn : AUTH.emptyWhy],
             fixLabel: AUTH.mintFix(URLS.settings),
             fixes: AUTH.mintCommands(authCommandFor(ctx.env, ctx.selfPath)),
         }, ctx.colour));
@@ -181,7 +182,7 @@ export async function auth(ctx, argv, deps = {}) {
             kind: "bad",
             code: "CREDENTIAL_NOT_INGEST",
             what: AUTH.wrongClassWhat,
-            why: [afterLoopback ? AUTH.wrongClassWhyAfterSignIn : AUTH.wrongClassWhy],
+            why: [retryRan ? AUTH.wrongClassWhyAfterSignIn : AUTH.wrongClassWhy],
             fixLabel: AUTH.mintFix(URLS.settings),
             fixes: AUTH.mintCommands(authCommandFor(ctx.env, ctx.selfPath)),
         }, ctx.colour));

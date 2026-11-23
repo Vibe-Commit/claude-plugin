@@ -48,6 +48,8 @@ export const ERROR_CODES = {
     CREDENTIAL_FILE_UNREADABLE: { summary: "The credential file could not be read." },
     // DRAFT copy (CLI UX PR-C, T10 B4): the folder cannot be written, so nothing is minted.
     CREDENTIAL_FOLDER_UNWRITABLE: { summary: "The folder that holds the credential cannot be written to." },
+    // DRAFT copy (0.17.4 r1 rv174-2; P6 named the code): ~/.vibecommit cannot be read, so finalize cannot read this repository's consent.
+    CREDENTIAL_FOLDER_UNREADABLE: { summary: "The folder that holds this machine's consent files cannot be read." },
     // DRAFT copy (CLI UX PR-C prc1, S3): the pending-revoke record is refused or at its cap, so no credential is made.
     PENDING_REVOKE_UNREADABLE: { summary: "The record of credentials waiting to be revoked could not be read." },
     PENDING_REVOKE_FULL: { summary: "This machine already has the maximum number of credentials waiting to be revoked." },

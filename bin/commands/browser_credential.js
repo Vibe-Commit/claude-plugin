@@ -45,7 +45,7 @@ import { terminalSafe } from "../printable.js";
 import { credentialProblemBlock } from "./credential_problem.js";
 import { writeLines } from "./context.js";
 import { deviceCredential } from "./device_credential.js";
-import { connectMintBlock, finishMint, mayHaveWrittenBeforeMint, savedChoicesLines, withMintTail, withSignInTail, writeAheadOf, } from "./finish_mint.js";
+import { connectMintBlock, finishMint, savedChoicesLines, withMintTail, withSignInTail, writeAheadOf, } from "./finish_mint.js";
 import { probeCredential } from "./probe.js";
 // `finishMint` and its types moved to `finish_mint.ts` (`CR-234d`) so the device flow can share them without
 // a cycle. Re-exported here because this is where every caller and test has always found them.
@@ -80,12 +80,8 @@ function connectPathOf(options) {
 }
 /** `signInBeat`'s sentinel for "no browser, go to the device flow". Never an exit code a verb returns. */
 export const NO_BROWSER = -1;
-/**
- * 0.17.2 #135 r1 R1 (P7's gate): a failure after `browserCredential`'s LOOPBACK branch ran (`signInBeat` was called): the first sign-in
- * failed, the retry after an `expired` mint failed, the mint failed, or `finishMint` refused the new credential. `auth`'s paste then says
- * no credential was saved. Every other failed result (the device flow, a refusal before any sign-in) stays `{ kind: "failed" }`.
- */
-const LOOPBACK_FAILED = { kind: "failed", afterLoopback: true };
+/** A failure after `browserCredential`'s loopback branch ran; the reason is on stderr. (0.17.2's `afterLoopback` flag is gone in 0.17.4.) */
+const LOOPBACK_FAILED = { kind: "failed" };
 /**
  * The browser sign-in beat — `CR-084d`.
  *
@@ -141,15 +137,15 @@ export async function signInBeat(ctx, options) {
     }
     if (outcome.kind === "no-browser")
         return NO_BROWSER;
-    writeLines(ctx.stderr, ["", ...signInFailure(ctx, options.retry, outcome, options.savedChoices === true, options.connectHost ?? null, options.onConnectPath === true, options.afterWrites ?? null, options.mayHaveWritten === true)]);
+    writeLines(ctx.stderr, ["", ...signInFailure(ctx, options.retry, outcome, options.savedChoices === true, options.connectHost ?? null, options.onConnectPath === true, options.afterWrites ?? null)]);
     return EXIT.failure;
 }
 /** §13.6's shape for a sign-in failure. One renderer, six outcomes. `savedChoices`: connect's grants are already written (T10 DX-7). */
-function signInFailure(ctx, retry, outcome, savedChoices, connectHost, onConnectPath, afterWrites, mayHaveWritten) {
+function signInFailure(ctx, retry, outcome, savedChoices, connectHost, onConnectPath, afterWrites) {
     const failure = (code, what, why, fixLabel) => signInError(ctx, retry, code, what, why, fixLabel, savedChoices, null, onConnectPath, afterWrites);
-    // 0.17.1: a why that ended "Nothing was changed on this machine." is its base plus the path's tail: connect's `--sign-in` beat (D1) says
-    // no sign-in was saved; connect's own sign-in (B) says no credential was saved; every other caller keeps 0.17.0's words.
-    const tailed = (base) => afterWrites !== null ? `${base} ${SIGNIN.signInNotSavedTail}` : withSignInTail(base, onConnectPath || mayHaveWritten);
+    // 0.17.1: a why that ended "Nothing was changed on this machine." is its base plus a tail: connect's `--sign-in` beat (D1) says no
+    // sign-in was saved; every other caller, `auth` included since 0.17.4 (P7 FINAL), says no credential was saved.
+    const tailed = (base) => (afterWrites !== null ? `${base} ${SIGNIN.signInNotSavedTail}` : withSignInTail(base));
     // DX-7 (T10, connect's path only): an unreachable sign-in service names the host it tried, the variable by name, and says to retry
     // once, then check the network. Every other caller keeps the block above, byte-identical.
     const unreachable = (code, what, why, fixLabel) => connectHost === null
@@ -286,9 +282,7 @@ export async function browserCredential(ctx, retry, deps = {}, options = {}) {
     // unreachable server is not fixed by a browser.
     if (outcome.kind === "not-authorized" && outcome.authorized.kind === "expired") {
         // prc1 S9(a): the retry is the same connect sign-in as the first call, with the same recovery lines (saved choices, host, device).
-        // 0.17.2 (P7): this retry follows the first sign-in step, which may have written session.json, so its denied, timeout and
-        // unreachable whys say no credential was saved, on `auth` too (`mayHaveWritten`). The FIRST sign-in's failures keep their words.
-        if ((await signInBeat(ctx, { ...deps, retry, forMint: true, ...connectSignInOf(options, endpoint), replace: true, mayHaveWritten: true })) !== EXIT.ok) {
+        if ((await signInBeat(ctx, { ...deps, retry, forMint: true, ...connectSignInOf(options, endpoint), replace: true })) !== EXIT.ok) {
             return LOOPBACK_FAILED;
         }
         outcome = await mint();
@@ -300,7 +294,6 @@ export async function browserCredential(ctx, retry, deps = {}, options = {}) {
             prior,
             endpoint,
             fetch: fetchImpl,
-            via: "browser",
             // The block guards a re-auth that lands in a DIFFERENT workspace. The device flow passes
             // "always" — there the approver is not the person at this terminal. T10 (plan 4.12): `connect`
             // over a 401'd or faulty FILE credential asks ALWAYS, because `on-replace` asks only when the old
@@ -316,8 +309,6 @@ export async function browserCredential(ctx, retry, deps = {}, options = {}) {
     // T10 (B5, DX-7): connect's path names the recovery for the failures it can (rate limited, not a member, unreachable). Every other
     // caller prints today's block.
     const connectBlock = options.connectPath === undefined ? null : connectMintBlock(outcome, options.connectPath, endpoint, ctx.now());
-    // 0.17.2 (P7): the browser path's first sign-in step may have written session.json, so `auth` takes connect's tail here too.
-    const mayHaveWritten = mayHaveWrittenBeforeMint(options.connectPath, "browser");
     writeLines(ctx.stderr, [
         "",
         ...renderErrorBlock(
@@ -326,7 +317,7 @@ export async function browserCredential(ctx, retry, deps = {}, options = {}) {
             kind: "bad",
             code: mintCode(outcome),
             what: AUTH.mintFailedWhat,
-            why: [withMintTail(mintWhy(outcome), mayHaveWritten), ...savedChoicesLines(options.connectPath)],
+            why: [withMintTail(mintWhy(outcome)), ...savedChoicesLines(options.connectPath)],
         }, ctx.colour),
     ]);
     return LOOPBACK_FAILED;

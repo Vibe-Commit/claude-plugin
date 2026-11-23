@@ -241,6 +241,14 @@ export function readGrants(home) {
 export function grantsUnreadable(home) {
     return readGrants(home).kind === "unreadable";
 }
+/**
+ * 0.17.4 (P6 ruling): does an UNREADABLE `grants.json` deny this clone? `isCaptureAllowed`'s own rule, and the one `finalize` names its
+ * refusal by, so the two cannot drift: it does for a clone with a remote; a `local:` clone is still decided by `projects.json`.
+ * `slug` is already normalized (`normalizeSlug`).
+ */
+export function unreadableGrantsDeny(slug) {
+    return !isLocalSlug(slug);
+}
 export const EMPTY_ACCOUNT_STATE = { account: null, refused: [], stale: false, last_get_at: null };
 /** N3 (c) (CR-PRB2): a stored name a 0.16.0 client wrote with a control character is dropped on read, as the snapshot parse drops it. */
 function printableNames(list) {
@@ -421,7 +429,7 @@ export function isCaptureAllowed(home, keys, slug) {
     const read = readGrants(home);
     const resolve = () => normalizeSlug(typeof slug === "function" ? slug() : slug);
     if (read.kind === "unreadable")
-        return isLocalSlug(resolve()) ? byClone : false;
+        return unreadableGrantsDeny(resolve()) ? false : byClone;
     const grants = read.kind === "ok" ? read.grants : EMPTY_GRANTS;
     const account = readAccountState(home);
     const denyLists = [grants.excluded, grants.refused, account.refused, account.account?.excluded ?? []];

@@ -491,15 +491,21 @@ export function headRef(dir) {
     // `HEAD` is what `--abbrev-ref` prints when detached. Not a branch name.
     return { sha, branch: ref === "" || ref === "HEAD" ? null : ref };
 }
-/** The branch `HEAD` is on, or null on a detached HEAD or a failure. */
+/**
+ * The branch `HEAD` is on, born or not, or null on a detached HEAD or a failure.
+ *
+ * 0.17.4 [6b] (P6 ruling, option a): `symbolic-ref` names the branch even before its first commit, where `rev-parse --abbrev-ref HEAD`
+ * failed. So `report` on an unborn branch now reaches the history read and says git could not read the ref's history
+ * (`REPORT.refUnreadableWhy`), instead of the false "HEAD is detached here". A detached HEAD makes `symbolic-ref -q` exit 1 with no output:
+ * null, as before.
+ */
 export function currentBranch(dir) {
-    const out = gitProbe(dir, ["rev-parse", "--abbrev-ref", "HEAD"]);
+    const out = gitProbe(dir, ["symbolic-ref", "-q", "--short", "HEAD"]);
     if (out === null)
         return null;
     const ref = out.trim();
-    // `HEAD` is what `--abbrev-ref` prints when detached. That is not a branch
-    // name, and reporting "coverage on HEAD" would name nothing the reader can
-    // check, so the caller asks for `--ref` instead of guessing.
+    // `HEAD` is not a branch name, and reporting "coverage on HEAD" would name nothing the reader can check, so the caller asks for `--ref`
+    // instead of guessing.
     return ref === "" || ref === "HEAD" ? null : ref;
 }
 /**

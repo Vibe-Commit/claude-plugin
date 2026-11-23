@@ -37,7 +37,7 @@
  */
 import { chmodSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
 import { writeFileAtomic } from "./atomic_write.js";
-import { IngestCredential, INGEST_TOKEN_PREFIX } from "./credential.js";
+import { envCredentialToken, fileCredentialToken, IngestCredential, INGEST_TOKEN_PREFIX, normalizedCredentialToken, } from "./credential.js";
 import { LEASE_MS, leased, readPendingRevokes, readQueue } from "./pending_revoke_file.js";
 import { REVOKE_TIMEOUT_MS, selfRevokeOutcome } from "./oauth/retire.js";
 import { claimPath } from "./hooks/fire_lock.js";
@@ -177,21 +177,45 @@ async function revokeToken(origin, token, fetchImpl, timeoutMs) {
     const outcome = await selfRevokeOutcome(origin, new IngestCredential(token, "file"), { fetch: fetchImpl, timeoutMs });
     return outcome.kind === "retired" || outcome.kind === "gone" ? "revoked" : outcome.kind === "unknown" ? "unrevocable" : null;
 }
-/** The tokens this machine is using right now: `credentials.json`'s, read RAW (a mode problem does not hide it) and the environment's. */
+/**
+ * The tokens this machine is using right now: `credentials.json`'s, read without the mode check (a mode problem does not hide it), and
+ * the environment's. Fail closed on both sides (0.17.4 item 1, widened by r1 rv174-1, P6):
+ *   - the file's token RAW, exactly as 0.17.3 protected it, AND through `loadCredential`'s own normalization (`fileCredentialToken`), so
+ *     a file holding `" vcik_X "` protects a row `" vcik_X "` (0.17.3's raw match) and a row `vcik_X` (the token a verb loads and sends);
+ *   - the environment's token, through `envCredentialToken`.
+ * `inUse` then matches a row by its token OR its normalized form. Compared only one way, a padded row or a padded file left the live
+ * credential unprotected, and the retry revoked it (fetch trims the bearer it sends).
+ */
 function currentTokens(home, env) {
     const out = new Set();
     try {
-        const token = JSON.parse(readFileSync(credentialsPath(home), "utf8")).token;
-        if (typeof token === "string" && token !== "")
-            out.add(token);
+        const raw = readFileSync(credentialsPath(home), "utf8");
+        try {
+            const token = JSON.parse(raw)?.token;
+            if (typeof token === "string" && token !== "")
+                out.add(token);
+        }
+        catch {
+            /* not JSON: the normalized read below says the same */
+        }
+        const normalized = fileCredentialToken(raw);
+        if (normalized !== null)
+            out.add(normalized);
     }
     catch {
         /* no file, or not ours: nothing to protect */
     }
-    const envToken = env.VIBECOMMIT_TOKEN?.trim();
-    if (envToken !== undefined && envToken !== "")
+    const envToken = envCredentialToken(env);
+    if (envToken !== null)
         out.add(envToken);
     return out;
+}
+/** A pending-revoke row is the credential in use when its token, or that token normalized, is one this machine is using. */
+function inUse(token, current) {
+    if (current.has(token))
+        return true;
+    const normalized = normalizedCredentialToken(token);
+    return normalized !== null && current.has(normalized);
 }
 /**
  * `g`'s every no-grant exit: one revoke within 3 s. With a readable row it goes to the row's recorded origin and removes the row on a
@@ -247,7 +271,7 @@ export async function retryPendingRevokes(home, env, fetchImpl, now, deadlineMs 
             const row = fresh.rows.find((r) => r.token === listed.token);
             if (row === undefined)
                 continue;
-            if (currentTokens(home, env).has(row.token)) {
+            if (inUse(row.token, currentTokens(home, env))) {
                 removePendingRevoke(home, row.token);
                 continue;
             }

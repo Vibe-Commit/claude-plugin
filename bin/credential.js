@@ -191,6 +191,41 @@ export function credentialFolderWritable(home) {
     }
 }
 /**
+ * 0.17.4 (item 1, P6 ruling): THE normalization of the credential this machine is using, in ONE place, shared by `loadCredential` and the
+ * pending-revoke retry's "is this row the credential in use?" check (`pending_revoke.ts` `currentTokens`). The retry compared
+ * `credentials.json`'s token RAW while `loadCredential` trims it, so a file holding `" vcik_X "` loaded and was used as `vcik_X`, but did not
+ * protect a row holding `vcik_X`, and the retry could revoke this machine's live credential. Neither caller may normalize on its own.
+ *   - `envCredentialToken`: `VIBECOMMIT_TOKEN`, trimmed; null when unset or blank (a blank variable is not set).
+ *   - `fileCredentialToken`: the token inside the file's JSON envelope, trimmed; null when the bytes are not JSON, hold no string token, or
+ *     hold a blank one (`loadCredential`'s `form` fault).
+ * Neither checks the class (`vcik_`, header-safe): that is `loadCredential`'s next step, and a pending-revoke row is `vcik_` already.
+ */
+export function envCredentialToken(env) {
+    const value = env.VIBECOMMIT_TOKEN;
+    return value === undefined ? null : normalizedCredentialToken(value);
+}
+/**
+ * The one trim both readers above apply, for a bare token string: trimmed, or null when blank. 0.17.4 r1 (rv174-1, P6): the retry also
+ * normalizes a pending-revoke ROW's token with it, because a row only has to start with `vcik_` (`pending_revoke_file.ts`), so a row
+ * `"vcik_X "` names the credential `vcik_X` that fetch would send (it trims the bearer).
+ */
+export function normalizedCredentialToken(token) {
+    const trimmed = token.trim();
+    return trimmed === "" ? null : trimmed;
+}
+export function fileCredentialToken(raw) {
+    let token;
+    try {
+        // Parsing the FILE is not parsing the CREDENTIAL. The file is our own JSON
+        // envelope; the credential is the opaque string inside it and stays opaque.
+        token = JSON.parse(raw)?.token;
+    }
+    catch {
+        return null;
+    }
+    return typeof token !== "string" ? null : normalizedCredentialToken(token);
+}
+/**
  * Load the ingest credential. `VIBECOMMIT_TOKEN` first, then the credentials
  * file.
  *
@@ -199,9 +234,9 @@ export function credentialFolderWritable(home) {
  * distinguish the four not-ok outcomes to print four different fixes.
  */
 export function loadCredential(ctx) {
-    const fromEnv = ctx.env.VIBECOMMIT_TOKEN;
-    if (fromEnv !== undefined && fromEnv.trim() !== "") {
-        const secret = fromEnv.trim();
+    const fromEnv = envCredentialToken(ctx.env);
+    if (fromEnv !== null) {
+        const secret = fromEnv;
         // ⛔ `TODOS[182]`. `!headerSafe(secret)` ALONGSIDE the prefix check, not a
         // separate outcome: a credential containing a stray CR/LF or a byte above
         // U+00FF can never become `Authorization: Bearer <secret>` either — the
@@ -221,20 +256,9 @@ export function loadCredential(ctx) {
     const read = readSecretFile(ctx.home, path);
     if (read.kind !== "ok")
         return read;
-    const raw = read.raw;
-    let token;
-    try {
-        // Parsing the FILE is not parsing the CREDENTIAL. The file is our own JSON
-        // envelope; the credential is the opaque string inside it and stays opaque.
-        token = JSON.parse(raw).token;
-    }
-    catch {
+    const secret = fileCredentialToken(read.raw);
+    if (secret === null)
         return { kind: "unreadable", path, cause: "form" };
-    }
-    if (typeof token !== "string" || token.trim() === "") {
-        return { kind: "unreadable", path, cause: "form" };
-    }
-    const secret = token.trim();
     // `TODOS[182]` — see the `env` branch above for why `headerSafe` belongs here too.
     if (!secret.startsWith(INGEST_TOKEN_PREFIX) || !headerSafe(secret)) {
         return { kind: "wrong-class", source: "file" };

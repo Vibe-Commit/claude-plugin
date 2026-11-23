@@ -316,7 +316,8 @@ export async function report(ctx, argv, deps = {}) {
     // which is what lets state 3 render before anything is read.
     const log = gitProbe(projectKey, ["log", "--format=%H", `--since=${since} 00:00`, ref, "--"]);
     if (log === null) {
-        return fail(ctx, json, errorCopy("REPORT_REF_UNNAMEABLE", REPORT.refWhat, REPORT.refWhy, REPORT.refFix, COMMANDS.reportRef), EXIT.usage);
+        // 0.17.4 [6b] (P7 FINAL): git could not read this ref (an unknown `--ref`, an unborn branch); HEAD need not be detached.
+        return fail(ctx, json, errorCopy("REPORT_REF_UNNAMEABLE", REPORT.refWhat, REPORT.refUnreadableWhy, REPORT.refFix, COMMANDS.reportRef), EXIT.usage);
     }
     const windowShas = log.split("\n").filter((line) => line.trim() !== "");
     const window = REPORT.window(since);
