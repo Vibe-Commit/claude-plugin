@@ -45,7 +45,7 @@ import { terminalSafe } from "../printable.js";
 import { credentialProblemBlock } from "./credential_problem.js";
 import { writeLines } from "./context.js";
 import { deviceCredential } from "./device_credential.js";
-import { connectMintBlock, finishMint, writeAheadOf } from "./finish_mint.js";
+import { connectMintBlock, finishMint, savedChoicesLines, withMintTail, withSignInTail, writeAheadOf, } from "./finish_mint.js";
 import { probeCredential } from "./probe.js";
 // `finishMint` and its types moved to `finish_mint.ts` (`CR-234d`) so the device flow can share them without
 // a cycle. Re-exported here because this is where every caller and test has always found them.
@@ -104,7 +104,7 @@ export async function signInBeat(ctx, options) {
     }
     const endpoint = mcpUrl(ctx.env);
     if (endpoint === null) {
-        writeLines(ctx.stderr, signInError(ctx, options.retry, "SIGNIN_SERVICE_NOT_FOUND", SIGNIN.noServerWhat, SIGNIN.noServerRefusedWhy, undefined, options.savedChoices === true, null, options.onConnectPath === true));
+        writeLines(ctx.stderr, signInError(ctx, options.retry, "SIGNIN_SERVICE_NOT_FOUND", SIGNIN.noServerWhat, SIGNIN.noServerRefusedWhy, undefined, options.savedChoices === true, null, options.onConnectPath === true, options.afterWrites ?? null));
         return EXIT.failure;
     }
     const outcome = await signIn({
@@ -135,17 +135,20 @@ export async function signInBeat(ctx, options) {
     }
     if (outcome.kind === "no-browser")
         return NO_BROWSER;
-    writeLines(ctx.stderr, ["", ...signInFailure(ctx, options.retry, outcome, options.savedChoices === true, options.connectHost ?? null, options.onConnectPath === true)]);
+    writeLines(ctx.stderr, ["", ...signInFailure(ctx, options.retry, outcome, options.savedChoices === true, options.connectHost ?? null, options.onConnectPath === true, options.afterWrites ?? null)]);
     return EXIT.failure;
 }
 /** §13.6's shape for a sign-in failure. One renderer, six outcomes. `savedChoices`: connect's grants are already written (T10 DX-7). */
-function signInFailure(ctx, retry, outcome, savedChoices, connectHost, onConnectPath) {
-    const failure = (code, what, why, fixLabel) => signInError(ctx, retry, code, what, why, fixLabel, savedChoices, null, onConnectPath);
+function signInFailure(ctx, retry, outcome, savedChoices, connectHost, onConnectPath, afterWrites) {
+    const failure = (code, what, why, fixLabel) => signInError(ctx, retry, code, what, why, fixLabel, savedChoices, null, onConnectPath, afterWrites);
+    // 0.17.1: a why that ended "Nothing was changed on this machine." is its base plus the path's tail: connect's `--sign-in` beat (D1) says
+    // no sign-in was saved; connect's own sign-in (B) says no credential was saved; every other caller keeps 0.17.0's words.
+    const tailed = (base) => (afterWrites !== null ? `${base} ${SIGNIN.signInNotSavedTail}` : withSignInTail(base, onConnectPath));
     // DX-7 (T10, connect's path only): an unreachable sign-in service names the host it tried, the variable by name, and says to retry
     // once, then check the network. Every other caller keeps the block above, byte-identical.
     const unreachable = (code, what, why, fixLabel) => connectHost === null
         ? failure(code, what, why, fixLabel)
-        : signInError(ctx, retry, code, what, why, AUTH.unreachableFix, savedChoices, AUTH.unreachableTried(connectHost), onConnectPath);
+        : signInError(ctx, retry, code, what, why, AUTH.unreachableFix, savedChoices, AUTH.unreachableTried(connectHost), onConnectPath, afterWrites);
     switch (outcome.kind) {
         case "no-server":
             if (outcome.detail === "unreachable") {
@@ -153,25 +156,30 @@ function signInFailure(ctx, retry, outcome, savedChoices, connectHost, onConnect
             }
             return failure("SIGNIN_SERVICE_NOT_FOUND", SIGNIN.noServerWhat, SIGNIN.noServerMalformedWhy, SIGNIN.noServerFix);
         case "denied":
-            return failure("SIGNIN_DENIED", SIGNIN.deniedWhat, SIGNIN.deniedWhy, SIGNIN.deniedFix);
+            return failure("SIGNIN_DENIED", SIGNIN.deniedWhat, tailed(SIGNIN.deniedWhy), SIGNIN.deniedFix);
         case "timeout":
             // prc1 S9(b): a loopback timeout shares this renderer, so connect's path gets DX-7's unreachable recovery (host, name, retry once).
-            return unreachable("SIGNIN_TIMED_OUT", SIGNIN.timeoutWhat, SIGNIN.timeoutWhy, SIGNIN.timeoutFix);
+            return unreachable("SIGNIN_TIMED_OUT", SIGNIN.timeoutWhat, tailed(SIGNIN.timeoutWhy), SIGNIN.timeoutFix);
         case "rejected":
             return failure("SIGNIN_CLIENT_REFUSED", SIGNIN.rejectedWhat, SIGNIN.rejectedWhy, SIGNIN.rejectedFix);
         case "unreachable":
-            return unreachable("SIGNIN_UNREACHABLE", SIGNIN.unreachableWhat, SIGNIN.unreachableWhy, SIGNIN.unreachableFix);
+            return unreachable("SIGNIN_UNREACHABLE", SIGNIN.unreachableWhat, tailed(SIGNIN.unreachableWhy), SIGNIN.unreachableFix);
         case "malformed":
             return failure("SIGNIN_ANSWER_UNUSABLE", SIGNIN.malformedWhat, SIGNIN.malformedWhy, SIGNIN.malformedFix);
     }
 }
-function signInError(ctx, retry, code, what, why, fixLabel = SIGNIN.noServerFix, savedChoices = false, extraWhy = null, onConnectPath = false) {
+function signInError(ctx, retry, code, what, why, fixLabel = SIGNIN.noServerFix, savedChoices = false, extraWhy = null, onConnectPath = false, afterWrites = null) {
     return renderErrorBlock({
         kind: "bad",
         code,
         what,
-        // T10 (DX-7): on connect's path, once the grants are written, a failed sign-in says what it left behind (the saved choices).
-        why: [why, ...(extraWhy === null ? [] : [extraWhy]), ...(savedChoices ? [AUTH.savedChoicesWhy] : [])],
+        // T10 (DX-7): on connect's path, once the grants are written, a failed sign-in says what it left behind (the saved choices). 0.17.1 D1:
+        // connect's `--sign-in` beat says it with the lines its caller computes NOW, when the block prints.
+        why: [
+            why,
+            ...(extraWhy === null ? [] : [extraWhy]),
+            ...(afterWrites !== null ? afterWrites() : savedChoices ? [AUTH.savedChoicesWhy] : []),
+        ],
         fixLabel,
         fixes: [
             channelCommand(ctx.env, ctx.selfPath, retry === "auth" ? COMMANDS.auth : retry === "connect" ? COMMANDS.connect : COMMANDS.signIn),
@@ -300,7 +308,14 @@ export async function browserCredential(ctx, retry, deps = {}, options = {}) {
     const connectBlock = options.connectPath === undefined ? null : connectMintBlock(outcome, options.connectPath, endpoint, ctx.now());
     writeLines(ctx.stderr, [
         "",
-        ...renderErrorBlock(connectBlock ?? { kind: "bad", code: mintCode(outcome), what: AUTH.mintFailedWhat, why: [mintWhy(outcome)] }, ctx.colour),
+        ...renderErrorBlock(
+        // 0.17.1 (P7): the session and malformed outcomes reach this block on connect's path too, so the tail is the path's.
+        connectBlock ?? {
+            kind: "bad",
+            code: mintCode(outcome),
+            what: AUTH.mintFailedWhat,
+            why: [withMintTail(mintWhy(outcome), options.connectPath), ...savedChoicesLines(options.connectPath)],
+        }, ctx.colour),
     ]);
     return { kind: "failed" };
 }

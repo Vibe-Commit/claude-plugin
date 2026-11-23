@@ -40,7 +40,7 @@ import { machineLabel, mintUrl, requestMint } from "../oauth/mint.js";
 import { HTTP_TIMEOUT_MS, openBrowser as platformOpenBrowser } from "../oauth/signin.js";
 import { paint, renderErrorBlock, wrap } from "../term.js";
 import { terminalSafe } from "../printable.js";
-import { connectMintBlock, finishMint, writeAheadOf } from "./finish_mint.js";
+import { connectMintBlock, finishMint, savedChoicesLines, withMintTail, withSignInTail, writeAheadOf, } from "./finish_mint.js";
 import { writeLines } from "./context.js";
 /** Poll failures in a row (a deploy, a blip) before the wait gives up on the service. */
 const MAX_TRANSIENT = 3;
@@ -69,12 +69,17 @@ function sigintOnce() {
     };
 }
 const realSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-function errorBlock(ctx, code, what, why, fixLabel, fixes) {
+/**
+ * One device failure block. 0.17.1 (scope C, plan 4.12 row 5: a failed sign-in on connect's path "says what it left behind"): on connect's
+ * path, once the grants were written, EVERY device failure block ends with `AUTH.savedChoicesWhy`, added HERE once (`savedChoicesLines`, the
+ * same gate as `signInError`'s), so no caller adds it a second time. Off connect's path `connectPath` is undefined: byte-identical to 0.17.0.
+ */
+function errorBlock(ctx, connectPath, code, what, why, fixLabel, fixes) {
     return renderErrorBlock({
         kind: "bad",
         code,
         what,
-        why: [why],
+        why: [why, ...savedChoicesLines(connectPath)],
         ...(fixLabel === undefined || fixes === undefined ? {} : { fixLabel, fixes }),
     }, ctx.colour);
 }
@@ -84,12 +89,12 @@ function errorBlock(ctx, code, what, why, fixLabel, fixes) {
  */
 function unreachableBlock(ctx, input, rerun, code, what, why) {
     if (input.connectPath === undefined)
-        return errorBlock(ctx, code, what, why, DEVICE.retryFix, [rerun]);
+        return errorBlock(ctx, undefined, code, what, why, DEVICE.retryFix, [rerun]);
     return renderErrorBlock({
         kind: "bad",
         code,
         what,
-        why: [why, AUTH.unreachableTried(terminalSafe(new URL(input.endpoint).host))],
+        why: [why, AUTH.unreachableTried(terminalSafe(new URL(input.endpoint).host)), ...savedChoicesLines(input.connectPath)],
         fixLabel: AUTH.unreachableFix,
         fixes: [rerun],
     }, ctx.colour);
@@ -114,19 +119,21 @@ function waitingBlock(ctx, grant) {
 export async function deviceCredential(ctx, input, deps = {}) {
     const fetchImpl = deps.fetch ?? fetch;
     const rerun = connectDeviceCommandFor(ctx.env, ctx.selfPath);
+    /** 0.17.1 (P7): a device why that ended "Nothing was changed on this machine." is its base plus the path's tail (`withSignInTail`). */
+    const tailed = (base) => withSignInTail(base, input.connectPath !== undefined);
     const discovery = await discover(input.endpoint, { fetch: fetchImpl, timeoutMs: HTTP_TIMEOUT_MS });
     if (discovery.kind !== "ok") {
         writeLines(ctx.stderr, [
             "",
             ...(discovery.kind === "unreachable"
                 ? unreachableBlock(ctx, input, rerun, "SIGNIN_SERVICE_NOT_FOUND", SIGNIN.noServerWhat, SIGNIN.noServerUnreachableWhy)
-                : errorBlock(ctx, "SIGNIN_SERVICE_NOT_FOUND", SIGNIN.noServerWhat, SIGNIN.noServerMalformedWhy, DEVICE.retryFix, [rerun])),
+                : errorBlock(ctx, input.connectPath, "SIGNIN_SERVICE_NOT_FOUND", SIGNIN.noServerWhat, SIGNIN.noServerMalformedWhy, DEVICE.retryFix, [rerun])),
         ]);
         return { kind: "failed" };
     }
     const { device_authorization_endpoint, token_endpoint } = discovery.metadata;
     if (device_authorization_endpoint === undefined) {
-        writeLines(ctx.stderr, ["", ...errorBlock(ctx, "SIGNIN_CODE_UNSUPPORTED", DEVICE.unsupportedWhat, DEVICE.unsupportedWhy)]);
+        writeLines(ctx.stderr, ["", ...errorBlock(ctx, input.connectPath, "SIGNIN_CODE_UNSUPPORTED", DEVICE.unsupportedWhat, DEVICE.unsupportedWhy)]);
         return { kind: "failed" };
     }
     const label = machineLabel((deps.hostname ?? osHostname)());
@@ -140,16 +147,16 @@ export async function deviceCredential(ctx, input, deps = {}) {
         case "ok":
             break;
         case "rate-limited":
-            writeLines(ctx.stderr, ["", ...rateLimitedBlock(ctx, started.retryAfterS, rerun)]);
+            writeLines(ctx.stderr, ["", ...rateLimitedBlock(ctx, input.connectPath, started.retryAfterS, rerun)]);
             return { kind: "declined" };
         case "refused":
-            writeLines(ctx.stderr, ["", ...errorBlock(ctx, "SIGNIN_CODE_REFUSED", DEVICE.refusedWhat, DEVICE.refusedWhy, DEVICE.retryFix, [rerun])]);
+            writeLines(ctx.stderr, ["", ...errorBlock(ctx, input.connectPath, "SIGNIN_CODE_REFUSED", DEVICE.refusedWhat, tailed(null), DEVICE.retryFix, [rerun])]);
             return { kind: "failed" };
         case "unreachable":
-            writeLines(ctx.stderr, ["", ...unreachableBlock(ctx, input, rerun, "SIGNIN_UNREACHABLE", DEVICE.unreachableWhat, DEVICE.unreachableWhy)]);
+            writeLines(ctx.stderr, ["", ...unreachableBlock(ctx, input, rerun, "SIGNIN_UNREACHABLE", DEVICE.unreachableWhat, tailed(DEVICE.unreachableWhy))]);
             return { kind: "failed" };
         case "malformed":
-            writeLines(ctx.stderr, ["", ...errorBlock(ctx, "SIGNIN_ANSWER_UNUSABLE", DEVICE.malformedWhat, DEVICE.malformedWhy, SIGNIN.malformedFix, [rerun])]);
+            writeLines(ctx.stderr, ["", ...errorBlock(ctx, input.connectPath, "SIGNIN_ANSWER_UNUSABLE", DEVICE.malformedWhat, tailed(DEVICE.malformedWhy), SIGNIN.malformedFix, [rerun])]);
             return { kind: "failed" };
     }
     const grant = started.grant;
@@ -162,28 +169,29 @@ export async function deviceCredential(ctx, input, deps = {}) {
     if (polled.kind !== "ticket") {
         switch (polled.kind) {
             case "cancelled":
-                writeLines(ctx.stdout, ["", paint(ctx.colour, "muted", `  ${DEVICE.cancelled}`)]);
+                // 0.17.1 (P7): "Cancelled." plus the path's tail; on connect's path, once grants exist, the saved-choices line as a second muted line.
+                writeLines(ctx.stdout, ["", ...[tailed(DEVICE.cancelled), ...savedChoicesLines(input.connectPath)].map((line) => paint(ctx.colour, "muted", `  ${line}`))]);
                 return { kind: "declined" };
             case "denied":
-                writeLines(ctx.stderr, ["", ...errorBlock(ctx, "SIGNIN_DENIED", DEVICE.deniedWhat, DEVICE.deniedWhy, DEVICE.deniedFix, [rerun])]);
+                writeLines(ctx.stderr, ["", ...errorBlock(ctx, input.connectPath, "SIGNIN_DENIED", DEVICE.deniedWhat, tailed(null), DEVICE.deniedFix, [rerun])]);
                 return { kind: "declined" };
             case "code-signin-off":
-                writeLines(ctx.stderr, ["", ...gateOffBlock(ctx, rerun)]);
+                writeLines(ctx.stderr, ["", ...gateOffBlock(ctx, input.connectPath, rerun)]);
                 return { kind: "declined" };
             case "expired":
-                writeLines(ctx.stderr, ["", ...errorBlock(ctx, "SIGNIN_TIMED_OUT", DEVICE.expiredWhat, DEVICE.expiredWhy, DEVICE.expiredFix, [rerun])]);
+                writeLines(ctx.stderr, ["", ...errorBlock(ctx, input.connectPath, "SIGNIN_TIMED_OUT", DEVICE.expiredWhat, DEVICE.expiredWhy, DEVICE.expiredFix, [rerun])]);
                 return { kind: "declined" };
             case "rate-limited":
-                writeLines(ctx.stderr, ["", ...rateLimitedBlock(ctx, polled.retryAfterS, rerun)]);
+                writeLines(ctx.stderr, ["", ...rateLimitedBlock(ctx, input.connectPath, polled.retryAfterS, rerun)]);
                 return { kind: "declined" };
             case "invalid":
-                writeLines(ctx.stderr, ["", ...errorBlock(ctx, "SIGNIN_CODE_INVALID", DEVICE.invalidWhat, DEVICE.invalidWhy, DEVICE.retryFix, [rerun])]);
+                writeLines(ctx.stderr, ["", ...errorBlock(ctx, input.connectPath, "SIGNIN_CODE_INVALID", DEVICE.invalidWhat, tailed(DEVICE.invalidWhy), DEVICE.retryFix, [rerun])]);
                 return { kind: "failed" };
             case "unreachable":
-                writeLines(ctx.stderr, ["", ...unreachableBlock(ctx, input, rerun, "SIGNIN_UNREACHABLE", DEVICE.unreachableWhat, DEVICE.unreachableWhy)]);
+                writeLines(ctx.stderr, ["", ...unreachableBlock(ctx, input, rerun, "SIGNIN_UNREACHABLE", DEVICE.unreachableWhat, tailed(DEVICE.unreachableWhy))]);
                 return { kind: "failed" };
             case "malformed":
-                writeLines(ctx.stderr, ["", ...errorBlock(ctx, "SIGNIN_ANSWER_UNUSABLE", DEVICE.malformedWhat, DEVICE.malformedWhy, SIGNIN.malformedFix, [rerun])]);
+                writeLines(ctx.stderr, ["", ...errorBlock(ctx, input.connectPath, "SIGNIN_ANSWER_UNUSABLE", DEVICE.malformedWhat, tailed(DEVICE.malformedWhy), SIGNIN.malformedFix, [rerun])]);
                 return { kind: "failed" };
         }
     }
@@ -194,7 +202,7 @@ export async function deviceCredential(ctx, input, deps = {}) {
         timeoutMs: HTTP_TIMEOUT_MS,
     });
     if (minted.kind === "refused" && minted.error === "code_signin_off") {
-        writeLines(ctx.stderr, ["", ...gateOffBlock(ctx, rerun)]);
+        writeLines(ctx.stderr, ["", ...gateOffBlock(ctx, input.connectPath, rerun)]);
         return { kind: "declined" };
     }
     if (minted.kind !== "ok") {
@@ -206,13 +214,15 @@ export async function deviceCredential(ctx, input, deps = {}) {
         }
         writeLines(ctx.stderr, [
             "",
-            ...errorBlock(ctx, minted.kind === "refused" && minted.error === "rate_limited" ? "MINT_RATE_LIMITED" : "MINT_FAILED", AUTH.mintFailedWhat, minted.kind === "unreachable"
+            ...errorBlock(ctx, input.connectPath, minted.kind === "refused" && minted.error === "rate_limited" ? "MINT_RATE_LIMITED" : "MINT_FAILED", AUTH.mintFailedWhat, 
+            // 0.17.1 (P7): the base sentence plus the path's tail; `errorBlock` adds the saved-choices line on connect's path once grants exist.
+            withMintTail(minted.kind === "unreachable"
                 ? AUTH.mintUnreachableWhy
                 : minted.kind === "refused" && minted.error === "rate_limited"
                     ? AUTH.mintRateLimitedWhy
                     : minted.kind === "malformed"
                         ? AUTH.mintMalformedWhy
-                        : DEVICE.redeemFailedWhy, DEVICE.retryFix, [rerun]),
+                        : DEVICE.redeemFailedWhy, input.connectPath), DEVICE.retryFix, [rerun]),
         ]);
         return { kind: "failed" };
     }
@@ -233,14 +243,16 @@ export async function deviceCredential(ctx, input, deps = {}) {
         ...(input.hold === undefined ? {} : { hold: input.hold }),
     });
 }
-function gateOffBlock(ctx, rerun) {
-    return errorBlock(ctx, "SIGNIN_CODE_DISABLED", DEVICE.gateOffWhat, DEVICE.gateOffWhy, DEVICE.gateOffFix, [rerun]);
+/** 16C: the poll's `access_denied` and the mint's `code_signin_off`. 0.17.1 (P7): connect's path has its own why (a special shape). */
+function gateOffBlock(ctx, connectPath, rerun) {
+    const why = connectPath === undefined ? DEVICE.gateOffWhy : DEVICE.gateOffWhyConnect;
+    return errorBlock(ctx, connectPath, "SIGNIN_CODE_DISABLED", DEVICE.gateOffWhat, why, DEVICE.gateOffFix, [rerun]);
 }
-function rateLimitedBlock(ctx, retryAfterS, rerun) {
+function rateLimitedBlock(ctx, connectPath, retryAfterS, rerun) {
     const fixLabel = retryAfterS === null
         ? DEVICE.rateLimitedFixUnknown
         : DEVICE.rateLimitedFix(clockTime(new Date(ctx.now().getTime() + retryAfterS * 1000)));
-    return errorBlock(ctx, "SIGNIN_RATE_LIMITED", DEVICE.rateLimitedWhat, DEVICE.rateLimitedWhy, fixLabel, [rerun]);
+    return errorBlock(ctx, connectPath, "SIGNIN_RATE_LIMITED", DEVICE.rateLimitedWhat, DEVICE.rateLimitedWhy, fixLabel, [rerun]);
 }
 /**
  * RFC 8628 §3.5's loop. The interval is the server's, `slow_down` raises it for good, and every poll is

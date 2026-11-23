@@ -28,7 +28,7 @@
  */
 import { setupState } from "../setup_state.js";
 import { machineCapture } from "../machine_state.js";
-import { ARGS, AUTH, CONNECT, PICKER, SETUP, COMMANDS, AGENT_HOOKS, COMMIT_HOOK, HELP, PATH_CLASH, REJECTED, DEVICE, RUNTIME, URLS, relativeAge, } from "../copy/index.js";
+import { ARGS, AUTH, CONNECT, PICKER, SETUP, COMMANDS, AGENT_HOOKS, COMMIT_HOOK, HELP, PATH_CLASH, REJECTED, DEVICE, RUNTIME, SIGNIN, URLS, relativeAge, } from "../copy/index.js";
 import { dialectFor } from "../agents/registry.js";
 import { TEST_CAPTURE_RECENT_MS } from "../agents/types.js";
 import { clearExclusion, grantProject, grantsUnreadable, isAffirmative, isCaptureAllowed, isLocalSlug, } from "../consent.js";
@@ -407,7 +407,13 @@ pinned) {
     if (options.signIn === true) {
         // `G8a`: `verify` — a session file that loads but that the server refuses to renew is expired,
         // and "already signed in" over it was the bug.
-        const code = await signInBeat(ctx, { retry: "sign-in", verify: true, ...(deps.fetch === undefined ? {} : { fetch: deps.fetch }) });
+        // 0.17.1 D1: the hooks are written, so a failed beat says what it left behind (`signInLeftBehind`), not "Nothing was changed".
+        const code = await signInBeat(ctx, {
+            retry: "sign-in",
+            verify: true,
+            afterWrites: () => signInLeftBehind(ctx),
+            ...(deps.fetch === undefined ? {} : { fetch: deps.fetch }),
+        });
         if (code !== EXIT.ok) {
             writeLines(ctx.stdout, localSetupLines(ctx));
             return code;
@@ -652,6 +658,17 @@ function signInFailedBlock(ctx) {
  */
 function grantsWritten(ctx) {
     return machineCapture(ctx.home).kind === "on";
+}
+/**
+ * 0.17.1 D1 (P7 ruling, 2026-11-22): what a failed `--sign-in` beat left behind, decided when its block prints. The beat runs after the grants
+ * and hooks are written (connect.ts's local path, connect_picker.ts's picker path). With a grant held and no credential that loads
+ * (`loadCredential`, VIBECOMMIT_TOKEN first, the loader uploads use), nothing uploads yet: `AUTH.savedChoicesWhy`. With a grant and a credential
+ * that loads, uploads may go on, so the line claims nothing about them: `SIGNIN.choicesSaved`. With no grant, nothing.
+ */
+export function signInLeftBehind(ctx) {
+    if (!grantsWritten(ctx))
+        return [];
+    return loadCredential({ env: ctx.env, home: ctx.home }).kind === "ok" ? [SIGNIN.choicesSaved] : [AUTH.savedChoicesWhy];
 }
 /** "Saved to <credentials.json>" — what the credential beat says once a credential is on disk (and `g`, once its yes has put it there). */
 export function savedBlock(ctx, notes) {

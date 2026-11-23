@@ -19,16 +19,16 @@
   ],
   "capture": {
     "repo": "Vibe-Commit/vibecommit-capture",
-    "commit": "dfe3d37d57f8c6c3d89f23ecd8b10f66cc4cee1b",
+    "commit": "ccf9e57158ce8737fee3a1fcc156f81d323b716e",
     "npmPackage": "@vibe-commit/capture",
-    "npmVersion": "0.17.0"
+    "npmVersion": "0.17.1"
   },
   "bundle": {
     "root": "bin",
     "algorithm": "sha256",
-    "digest": "7e88eac3888584a7caf4fb2ccc1e55c2d4cfb0da999e5b3691bfe6637ef0ac4a",
+    "digest": "6f03bf39ce84cf47373a43921473e4c27f42bd174144fd2a76972fa0964a0a2b",
     "fileCount": 123,
-    "byteCount": 2247970,
+    "byteCount": 2258830,
     "files": {
       "account_not_here.js": "2bdd8e5ffbe8b10e1eef86a3b54b273b425be6bb7454eef57a9c5b210b70f194",
       "agent_hooks.js": "a8633c48c79a8cb198a454661dbbca7a68c5909b0c225b4b67a12efc789eb27e",
@@ -49,16 +49,16 @@
       "codex_folders.js": "021b913b92af4791dc9155f7f8c1aa118ed70121186f7f44bbca4ea3dfdec3aa",
       "commands/auth.js": "fc59dc0785e07089ca292f67467d83a36c5ca54f56b8138607fe3c0a60ec2873",
       "commands/backfill.js": "87ff3ff3d1a878bdbd3962d8675932dfea693a27fa0ae28fe078dab8d581aaa4",
-      "commands/browser_credential.js": "56276e111c17cf608e607f6c087d8374599cd300c96b951d7a54abf04ff7a6cb",
-      "commands/connect.js": "b36ab72c72562a7d977dee1518c928f217e8eddde69f6cc2d08d2a6df45b155d",
+      "commands/browser_credential.js": "2c73601abe8cbd5d4bc326aeac1908d90c3fecf3167254ce629336e8194fa94b",
+      "commands/connect.js": "b60c07fb9508968ad23843e0b1cbc1c29726904563152d16605806b298fe7a83",
       "commands/connect_account.js": "eb43a8f8cc5ecb33aee0acb181377a76baea20c0e4b3408b677be98cf850c172",
-      "commands/connect_picker.js": "e54709cba117ff94d9683ad89d237cf062550b72e830644863c4b0825e1ce05e",
+      "commands/connect_picker.js": "321e74a87dbcfc186de6f1f4f3300c09b31b110c5da46a1c546468ccb6159835",
       "commands/connect_retry.js": "06cd451410d839da2e9632dc9d1e7f3f5463d3ed0518b901123e5e034c24f87b",
       "commands/context.js": "fd45422c236dd3a18575dac2b333539be97421c296642a96dcbb8a0a221179ac",
       "commands/credential_problem.js": "f26bdf05240d18e07a30a23c63f9530170a8adda677cfe0ee21470e0c2ebee4c",
-      "commands/device_credential.js": "90d98b0dac3a5850bc9fa7e246670819a5c243e32c76237c47d67d5ae010560b",
+      "commands/device_credential.js": "2e0dfa5a5ba6e745be2d8f45a65e7f69f84008aeca010b76265f198340c9b455",
       "commands/finalize.js": "0e76818e86a33e314ec05a6d8182b5da750377d4c86bd7c1749e63fdb0e93d08",
-      "commands/finish_mint.js": "4e4bdb2be55ec7b5a3400b16479d2c723a5037a2b806d0bc83af2938183e5c50",
+      "commands/finish_mint.js": "0ed542c17aeb1d269fd4e611db2c9fbda8f22fa027e8dc3001bf485670d542a5",
       "commands/probe.js": "6629d7ec80e653cde0c1fefb9ca34cce906400e5706c8bf6de1fbdd2b03e332e",
       "commands/report.js": "60806f1d3a6440f13e3786be2ebad39dbacdc66ebd9b02d3b3164f2e4c9e3474",
       "commands/scan.js": "75e4513ceeef15074e018d73180cc1b634d2df2e83e335596544acca9cc39810",
@@ -76,7 +76,7 @@
       "copy/error_codes.js": "61e7fb4f4fdf5562bfc8341d0beae5252f50d9e19917c4d463301e070d535a6c",
       "copy/grades.js": "5fd18e685ac9c063c5431aeb0f21dd5be0ebfa2018487ae9d523f6d3914a0c4a",
       "copy/index.js": "02dd130aeef0d966563e1189532d0242f8c2bb4dfbff046faf5812ce6f780ed9",
-      "copy/strings.js": "8cfd81a1e9d81b65d15bf9cf883efaabb87edc6164760f492b0f2bc091986a6c",
+      "copy/strings.js": "ea58b27e730b5af9237b7dd11ff4fd8cdf94df8ddf2889c3d5bdf936e965adc7",
       "copy/time.js": "01ea725f5d575d3d7833d49346d4969a70ba19cef1fa728b01001af228358133",
       "credential.js": "d71b2eefb6f67776f5b7319da045dc03d51797ff75b6c34f97eb5acb39f58ce5",
       "credential_meta.js": "9a115afca8406d732ed42544bda2f0ebe259de1421214f6d123e116dbea774c1",
@@ -152,7 +152,7 @@
       "uploader_view.js": "5d46e45e660df37ead7198fbbf36d8bb3c87e3c72d28c02767909044518c576e",
       "verb_help.js": "52d38e61546855b496d243b45c0817d3c850280a68897eef40fe151540028c39",
       "verbs.js": "8188f08159a602e4a416c537416d7ce7bb1d03f7fc9ad1cf4997aa2d37358f8d",
-      "version.js": "3bd15f0c6f0d5292c02e595bb5aa0000a0a09644a2c7882635d0c1d54b2bcb44"
+      "version.js": "319e412bb9762d1a85844b5fa974b39cf9c589d514e17c1e3177244ee302c675"
     }
   }
 }

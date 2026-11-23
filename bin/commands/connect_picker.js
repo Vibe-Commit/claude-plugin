@@ -35,7 +35,7 @@ import { paint, renderErrorBlock, tildePath, truncatePath, wrap } from "../term.
 import { terminalSafe } from "../printable.js";
 import { signInBeat } from "./browser_credential.js";
 import { accountChange, accountNoteLines, changeOps, commitG, joiningMachine, lastAccountState, mintForG, settleG, splitAccountExclusions, } from "./connect_account.js";
-import { agentHookBeat, printSetupReport, setupBeatStart, askOrCancel, cancelledLines, disclosure, grantsUnreadableLines, holdLines, holdTail, obtainCredential, pinTestTranscript, sendTestCapture, tail, } from "./connect.js";
+import { agentHookBeat, printSetupReport, setupBeatStart, askOrCancel, cancelledLines, disclosure, grantsUnreadableLines, holdLines, holdTail, obtainCredential, pinTestTranscript, sendTestCapture, tail, signInLeftBehind, } from "./connect.js";
 import { writeLines } from "./context.js";
 import { connectRetryCommand } from "./connect_retry.js";
 import { pickerNotListedLines, sawNoSession, scanMachine } from "./scan.js";
@@ -502,7 +502,14 @@ async function connectPickerRun(ctx, options, deps, here, keys, g, names) {
         working = agentHookBeat(ctx, commit, work);
     }
     if (options.signIn === true) {
-        const code = await signInBeat(ctx, { retry: "sign-in", verify: true, ...(deps.fetch === undefined ? {} : { fetch: deps.fetch }) });
+        // 0.17.1 D1: the grants and hooks are written, so a failed beat says what it left behind (`signInLeftBehind`): the signInFailed ending
+        // prints nothing after the block, so the block is the only place the user learns that this run's writes stand.
+        const code = await signInBeat(ctx, {
+            retry: "sign-in",
+            verify: true,
+            afterWrites: () => signInLeftBehind(ctx),
+            ...(deps.fetch === undefined ? {} : { fetch: deps.fetch }),
+        });
         if (code !== EXIT.ok)
             return end(connectEnding({ kind: "signInFailed", code }));
     }

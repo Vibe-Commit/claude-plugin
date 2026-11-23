@@ -10,7 +10,7 @@ function workspaceQuestion(scope) {
  */
 import { isAffirmative } from "../consent.js";
 import { authCommandFor } from "../install.js";
-import { CONNECT, REPLACE, RETIRE, AUTH } from "../copy/index.js";
+import { CONNECT, REPLACE, RETIRE, AUTH, SIGNIN } from "../copy/index.js";
 import { loadedFingerprints, metaFor, recordCredentialMeta } from "../credential_meta.js";
 import { saveCredential } from "../credential.js";
 import { REVOKE_TIMEOUT_MS, retireCredential, selfRevokeCredential, selfRevokeOutcome } from "../oauth/retire.js";
@@ -19,6 +19,31 @@ import { credentialFingerprint } from "../post.js";
 import { paint, labelled, renderErrorBlock, truncateMiddle, wrap, WRAP_COLUMNS, LABEL_GUTTER } from "../term.js";
 import { writeLines } from "./context.js";
 import { probeCredential } from "./probe.js";
+/**
+ * 0.17.1 (P7 ruling, 2026-11-22): a mint failure's why is its outcome's base sentence plus the path's tail. `auth` writes nothing
+ * before its mint, so its tail is "Nothing was written." and its blocks are byte-identical to 0.17.0. On connect's path
+ * (`connectPath` set) the grants and hooks were written BEFORE the mint (connect_picker.ts), so "Nothing was written." was false
+ * there: the tail is "No credential was saved." One base sentence per outcome, one tail per path; no duplicated keys.
+ */
+export function withMintTail(base, connectPath) {
+    return `${base} ${connectPath === undefined ? AUTH.mintTailAuth : AUTH.connectTail}`;
+}
+/**
+ * 0.17.1 (P7 ruling, 2026-11-22): the same shape for a failed sign-in (`signInError`) and a failed device sign-in. Off connect's path the
+ * tail is "Nothing was changed on this machine." (`SIGNIN.unchangedTail`), byte-identical to 0.17.0; on it the grants and hooks were
+ * written before the sign-in, so the tail is "No credential was saved." A `null` base (DEVICE's denied and refused) is the tail alone.
+ */
+export function withSignInTail(base, onConnectPath) {
+    const tail = onConnectPath ? AUTH.connectTail : SIGNIN.unchangedTail;
+    return base === null ? tail : `${base} ${tail}`;
+}
+/**
+ * 0.17.1 (P7 ruling): the saved-choices line a failed sign-in or mint on connect's path adds, with the SAME gate as `signInError`'s
+ * (browser_credential.ts): connect's path, once grants were written. Empty for `auth` and before any grant, so those stay as they were.
+ */
+export function savedChoicesLines(connectPath) {
+    return connectPath?.grantsWritten === true ? [AUTH.savedChoicesWhy] : [];
+}
 /**
  * T10 (B5, DX-7): `connect`'s recovery line for the mint failures that have one (rate limited, not a member, unreachable). Only
  * `connect` passes a `connectPath`. For every other caller, and for the failures this does not name, the caller prints its own block,
@@ -35,13 +60,19 @@ export function connectMintBlock(outcome, connectPath, endpoint, now) {
             kind: "bad",
             code: "MINT_RATE_LIMITED",
             what: AUTH.mintFailedWhat,
-            why: [AUTH.mintRateLimitedWhy, wait],
+            why: [withMintTail(AUTH.mintRateLimitedWhy, connectPath), wait, ...savedChoicesLines(connectPath)],
             fixLabel: AUTH.rateLimitedAgain,
             fixes: [connectPath.rerun],
         };
     }
     if (outcome.kind === "refused" && outcome.error === "not_a_member") {
-        return { kind: "bad", code: "MINT_NOT_A_MEMBER", what: AUTH.mintFailedWhat, why: [AUTH.mintNotMemberWhy], fixLabel: AUTH.notMemberFix };
+        return {
+            kind: "bad",
+            code: "MINT_NOT_A_MEMBER",
+            what: AUTH.mintFailedWhat,
+            why: [withMintTail(AUTH.mintNotMemberWhy, connectPath), ...savedChoicesLines(connectPath)],
+            fixLabel: AUTH.notMemberFix,
+        };
     }
     if (outcome.kind === "unreachable" || (outcome.kind === "refused" && outcome.status >= 500)) {
         return {
@@ -51,8 +82,9 @@ export function connectMintBlock(outcome, connectPath, endpoint, now) {
             // A 5xx is an ANSWER (the service refused), so it keeps `auth`'s refused sentence; only no answer at all is "did not answer" (T20
             // sweep, CL-C F4). The recovery line is DX-7's for both: retry once, then the network.
             why: [
-                outcome.kind === "unreachable" ? AUTH.mintUnreachableWhy : AUTH.mintRefusedWhy,
+                withMintTail(outcome.kind === "unreachable" ? AUTH.mintUnreachableWhy : AUTH.mintRefusedWhy, connectPath),
                 AUTH.unreachableTried(terminalSafe(new URL(endpoint).host)),
+                ...savedChoicesLines(connectPath),
             ],
             fixLabel: AUTH.unreachableFix,
             fixes: [connectPath.rerun],
@@ -124,7 +156,15 @@ export async function finishMint(ctx, input) {
     }
     const fresh = await probeCredential(ctx, minted, input.fetch, { record: false });
     if (fresh.kind === "unauthorized") {
-        writeLines(ctx.stderr, ["", ...renderErrorBlock({ kind: "bad", code: "MINT_FAILED", what: AUTH.mintFailedWhat, why: [AUTH.mintUnconfirmedWhy] }, ctx.colour)]);
+        writeLines(ctx.stderr, [
+            "",
+            ...renderErrorBlock({
+                kind: "bad",
+                code: "MINT_FAILED",
+                what: AUTH.mintFailedWhat,
+                why: [withMintTail(AUTH.mintUnconfirmedWhy, input.connectPath), ...savedChoicesLines(input.connectPath)],
+            }, ctx.colour),
+        ]);
         return { kind: "failed" };
     }
     const priorOk = prior !== null && prior.who.kind === "ok";
@@ -162,7 +202,14 @@ export async function finishMint(ctx, input) {
                 kind: "bad",
                 code: "WORKSPACE_UNCONFIRMED",
                 what: REPLACE.unconfirmableWhat,
-                why: [revoked.kind === "retired" ? REPLACE.unconfirmableWhyRevoked : REPLACE.unconfirmableWhyOrphan],
+                // 0.17.1 D2 (P7): on connect's path the grants and hooks were written first, so "Nothing was saved" was false there; then the
+                // saved-choices line under the same gate. `auth` and `auth --device` keep 0.17.0's words, byte-identical.
+                why: input.connectPath === undefined
+                    ? [revoked.kind === "retired" ? REPLACE.unconfirmableWhyRevoked : REPLACE.unconfirmableWhyOrphan]
+                    : [
+                        revoked.kind === "retired" ? REPLACE.unconfirmableWhyRevokedConnect : REPLACE.unconfirmableWhyOrphanConnect,
+                        ...savedChoicesLines(input.connectPath),
+                    ],
                 fixLabel: REPLACE.unconfirmableFix,
                 fixes: [input.rerun ?? authCommandFor(ctx.env, ctx.selfPath)],
             }, ctx.colour),
@@ -201,12 +248,21 @@ export async function finishMint(ctx, input) {
             const revoked = await selfRevokeCredential(input.endpoint, minted, { fetch: input.fetch });
             if (revoked.kind === "retired")
                 releaseRow(input, minted);
-            // T10 (B5, DX-7): a No after the grants were written is not "the approval is discarded": the choices were saved.
-            const declined = input.connectPath?.grantsWritten === true ? REPLACE.declinedSavedChoices(input.connectPath.rerun) : REPLACE.declined;
+            // T10 (B5, DX-7): a No after the grants were written is not "the approval is discarded": the choices were saved. Ctrl+C after the
+            // grants were written gets the same true line as a No (T20 sweep, CL-C F5). 0.17.1 r1 R1 (P7): on connect's path with NO grant, the
+            // hooks may still have been written in this run, so the line says no CREDENTIAL was saved. `auth` keeps 0.17.0's two lines.
+            const line = input.connectPath?.grantsWritten === true
+                ? REPLACE.declinedSavedChoices(input.connectPath.rerun)
+                : input.connectPath !== undefined
+                    ? answer === null
+                        ? REPLACE.cancelledConnect
+                        : REPLACE.declinedConnect
+                    : answer === null
+                        ? REPLACE.cancelled
+                        : REPLACE.declined;
             writeLines(ctx.stdout, [
                 "",
-                // Ctrl+C after the grants were written gets the same true line as a No: the choices WERE saved (T20 sweep, CL-C F5).
-                ...wrap(answer === null && input.connectPath?.grantsWritten !== true ? REPLACE.cancelled : declined, 2),
+                ...wrap(line, 2),
                 ...wrap(revoked.kind === "retired" ? REPLACE.declinedRevoked : REPLACE.declinedOrphan, 2),
             ]);
             return { kind: "declined" };

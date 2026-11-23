@@ -87,7 +87,8 @@ export const HELP = {
                 // T7 (4.9, DX-12 as amended by ENG-16): the amended line. DX-12's own "Send nothing written before this run" overclaimed (a session
                 // open before the run can upload from its first byte after a restart), so this one says only what the run does.
                 ["--no-backfill", "This run sends no check and offers no earlier sessions."],
-                ["--sign-in", "Sign in through the browser before connecting."],
+                // 0.17.1 D3 (P7's words, on Alexander's veto list): the beat runs AFTER the grants and hooks are written, not before connecting.
+                ["--sign-in", "Sign in through the browser after your choices are saved."],
                 ["--typed", "Use the typed prompt even on a terminal, for a screen reader."],
             ],
             exits: [
@@ -1059,11 +1060,16 @@ export const SIGNIN = {
      */
     noServerRefusedWhy: "VIBECOMMIT_MCP_URL is set to an address this client will not send a sign-in to. Only https, or http on the loopback, is allowed.",
     noServerFix: "Check the service, then run:",
+    // 0.17.1 (P7 ruling, 2026-11-22): `deniedWhy`, `timeoutWhy` and `unreachableWhy` are BASE sentences. The path adds its tail
+    // (`withSignInTail`, finish_mint.ts): `auth`'s is `unchangedTail`, byte-identical to 0.17.0; on connect's path the grants and hooks were
+    // written before the sign-in, so "Nothing was changed on this machine." was false there, and the tail is `AUTH.connectTail`.
+    /** The tail on a failed sign-in or device sign-in off connect's path: nothing was written before it. */
+    unchangedTail: "Nothing was changed on this machine.",
     deniedWhat: "Sign-in was declined.",
-    deniedWhy: "The sign-in screen returned without granting access. Nothing was changed on this machine.",
+    deniedWhy: "The sign-in screen returned without granting access.",
     deniedFix: "To try again, run:",
     timeoutWhat: "Sign-in did not finish in time.",
-    timeoutWhy: "The browser did not come back before the deadline. Nothing was changed on this machine.",
+    timeoutWhy: "The browser did not come back before the deadline.",
     timeoutFix: "To try again, run:",
     rejectedWhat: "The sign-in service refused this client.",
     /**
@@ -1075,7 +1081,7 @@ export const SIGNIN = {
     rejectedWhy: "The service did not accept this client's sign-in request.",
     rejectedFix: "Report this, with the command you ran:",
     unreachableWhat: "VibeCommit could not reach the sign-in service.",
-    unreachableWhy: "The request did not complete. Nothing was changed on this machine.",
+    unreachableWhy: "The request did not complete.",
     unreachableFix: "Check the connection, then run:",
     malformedWhat: "The sign-in service returned an unexpected answer.",
     malformedWhy: "The response was not in the form this version can use. No session was stored.",
@@ -1087,6 +1093,17 @@ export const SIGNIN = {
      * There "Already signed in" lands right after connect's "…Signing in again." and reads as a contradiction; this says what happens.
      */
     reusedForMint: "Using this machine's existing sign-in; no browser is needed.",
+    /**
+     * 0.17.1 D1 (P7 ruling, 2026-11-22): the tail on `deniedWhy`, `timeoutWhy` and `unreachableWhy` at connect's `--sign-in` beat, which runs
+     * after the grants and hooks are written, so "Nothing was changed on this machine." was false there. The beat stores a sign-in (in capture's
+     * copy "session" means a coding-agent session), so the tail names the sign-in.
+     */
+    signInNotSavedTail: "No sign-in was saved.",
+    /**
+     * DRAFT copy (0.17.1 D1, P7): the second line of a failed `--sign-in` beat when the machine holds a grant AND a credential that loads. It
+     * makes no claim about uploads: a credential that loads can still be refused by the server. With no credential, `AUTH.savedChoicesWhy`.
+     */
+    choicesSaved: "Your choices are saved.",
     // --- `authorizedAccessToken`'s last two outcomes — `CR-086`, W9. ---
     /**
      * ⚠ THE COPY THIS OBJECT DEFERRED BY TASK NUMBER, now written by the first
@@ -2358,6 +2375,11 @@ export const REPLACE = {
     declined: "Nothing was saved. The approval is discarded.",
     /** Ctrl+C at the question (the prompt was aborted): the same outcome as N, said as what it was. */
     cancelled: "Cancelled. Nothing was saved.",
+    // 0.17.1 r1 R1 (P7 ruling, 2026-11-22): `declined` and `cancelled` on connect's path with NO grant held. The hooks may have been written
+    // in this run (the faulty-file Enter path), so "Nothing was saved" was false there. With a grant held, `declinedSavedChoices` stays for
+    // both. `auth` and `auth --device` keep the two above, byte-identical.
+    declinedConnect: "No credential was saved. The approval is discarded.",
+    cancelledConnect: "Cancelled. No credential was saved.",
     /**
      * The new credential was created and then declined, so it was never saved. The client revokes it with
      * the retire route's self form (brief A3); this is what it says when that worked.
@@ -2371,6 +2393,10 @@ export const REPLACE = {
     unconfirmableWhat: "The new credential could not be confirmed with the server.",
     unconfirmableWhyRevoked: "Nothing was saved, and the credential just created was revoked.",
     unconfirmableWhyOrphan: "Nothing was saved. The credential just created is unused; revoke it in Settings if you want it gone.",
+    // 0.17.1 D2 (P7 ruling, 2026-11-22): the same two on connect's path, where the grants and hooks were written before the sign-in, so
+    // "Nothing was saved" was false there. `auth` and `auth --device` keep the two above, byte-identical.
+    unconfirmableWhyRevokedConnect: "No credential was saved, and the credential just created was revoked.",
+    unconfirmableWhyOrphanConnect: "No credential was saved. The credential just created is unused; revoke it in Settings if you want it gone.",
     unconfirmableFix: "Run the command again:",
     declinedRevoked: "The credential just created was revoked.",
     /**
@@ -2405,14 +2431,18 @@ export const DEVICE = {
     /** The remote-phishing mitigation: whoever enters the code picks the account this machine uploads to. */
     shareWarning: "Don't share it: whoever enters it chooses the account this machine uploads to.",
     waiting: "Waiting for approval…  (Ctrl+C to cancel)",
-    /** Ctrl+C. §13.7: exit 1. Not a failure block — nothing went wrong. */
-    cancelled: "Cancelled. Nothing was changed on this machine.",
+    // 0.17.1 (P7 ruling, 2026-11-22): the device whys below that ended "Nothing was changed on this machine." are BASE sentences, and the
+    // path adds its tail (`withSignInTail`): `SIGNIN.unchangedTail` off connect's path (byte-identical to 0.17.0), `AUTH.connectTail` on it.
+    // The denied and refused whys were the tail alone, so they have no base: the why is the path's tail.
+    /** Ctrl+C. §13.7: exit 1. Not a failure block — nothing went wrong. A base: the line is this plus the path's tail. */
+    cancelled: "Cancelled.",
     deniedWhat: "The request was denied in the browser.",
-    deniedWhy: "Nothing was changed on this machine.",
     deniedFix: "If this was you, run it again:",
     /** 16C, brief A7: one block for the poll's `access_denied` (gate) and the mint's 403 `code_signin_off`. */
     gateOffWhat: "Code sign-in is off for this account.",
     gateOffWhy: "Nothing was approved, and nothing was changed on this machine.",
+    /** 0.17.1 (P7 ruling): `gateOffWhy` on connect's path, where the grants and hooks were written before the sign-in. */
+    gateOffWhyConnect: "Nothing was approved, and no credential was saved.",
     gateOffFix: "Turn on \"Allow approving machines with a code\" in Settings → Machines, then run it again:",
     expiredWhat: "The code expired before it was approved.",
     expiredWhy: "Codes last 5 minutes.",
@@ -2426,14 +2456,13 @@ export const DEVICE = {
     unsupportedWhat: "This server does not offer sign-in by code.",
     unsupportedWhy: "The sign-in service does not list a device endpoint, so it may be older than this version.",
     refusedWhat: "The service refused to start a sign-in by code.",
-    refusedWhy: "Nothing was changed on this machine.",
     unreachableWhat: "Sign-in by code could not reach the service.",
-    unreachableWhy: "The service stopped answering. Nothing was changed on this machine.",
+    unreachableWhy: "The service stopped answering.",
     malformedWhat: "Sign-in by code got an answer this version cannot use.",
-    malformedWhy: "The service answered in a form this version does not understand. Nothing was changed on this machine.",
+    malformedWhy: "The service answered in a form this version does not understand.",
     /** `invalid_grant`: the code is unknown or already spent. */
     invalidWhat: "The service no longer recognises this code.",
-    invalidWhy: "It may have been used already. Nothing was changed on this machine.",
+    invalidWhy: "It may have been used already.",
     retryFix: "To try again, run:",
     /** `--device` is TTY only: the approval is a person's, and nothing attached can answer for them. */
     needsTerminalWhat: "Sign-in by code needs a terminal.",
@@ -2444,8 +2473,11 @@ export const DEVICE = {
     conflictWhat: "--device and --paste cannot be used together.",
     conflictWhy: "One waits for an approval elsewhere; the other asks for a credential here.",
     conflictFix: "Pick one:",
-    /** The ticket could not be redeemed (expired, spent, or the service refused the mint). */
-    redeemFailedWhy: "The approval could not be exchanged for a credential. It may have expired or been used already. Nothing was written.",
+    /**
+     * The ticket could not be redeemed (expired, spent, or the service refused the mint). A base sentence: the path adds its tail
+     * (`withMintTail`), as for `AUTH`'s mint whys (0.17.1).
+     */
+    redeemFailedWhy: "The approval could not be exchanged for a credential. It may have expired or been used already.",
 };
 /**
  * `13A` — the update nudge: `muted` sentence, the command on its own line in `accent`.
@@ -2618,22 +2650,31 @@ export const AUTH = {
     minting: (label) => `Creating this machine's credential, labelled "${label}"…`,
     /** Every mint failure shares the `what`; the `why` names which step refused. */
     mintFailedWhat: "No credential was created through the browser.",
+    // 0.17.1 (P7 ruling, 2026-11-22): the mint whys below are each outcome's BASE sentence. The path adds its tail (`withMintTail`,
+    // finish_mint.ts): `auth` wrote nothing before its mint, so `mintTailAuth`, and its blocks stay byte-identical to 0.17.0; on connect's
+    // path the grants and hooks were written first, so "Nothing was written." was false there, and the tail is `connectTail`.
     /** `not-authorized`, or a 401 that survived one refresh. */
-    mintSessionWhy: "The sign-in on this machine could not be used to create one. It may have ended or been revoked. Nothing was written.",
-    mintNotMemberWhy: 
+    mintSessionWhy: "The sign-in on this machine could not be used to create one. It may have ended or been revoked.",
     // P7 ruling (2026-11-22): "organization", not the retired "workspace" (0.15.0, T41a/T41c).
-    "The account that signed in is not a member of the organization its sign-in names. Nothing was written.",
-    mintRateLimitedWhy: "Too many credentials were created for this account in the last hour. Nothing was written.",
-    mintRefusedWhy: "The service refused the request. Nothing was written.",
-    mintUnreachableWhy: "The service did not answer. Nothing was written.",
-    mintMalformedWhy: "The service answered in a form this version cannot use. Nothing was written.",
+    mintNotMemberWhy: "The account that signed in is not a member of the organization its sign-in names.",
+    mintRateLimitedWhy: "Too many credentials were created for this account in the last hour.",
+    mintRefusedWhy: "The service refused the request.",
+    mintUnreachableWhy: "The service did not answer.",
+    mintMalformedWhy: "The service answered in a form this version cannot use.",
+    /** The tail on `auth`'s mint failures: `auth` writes nothing before its mint. */
+    mintTailAuth: "Nothing was written.",
+    /**
+     * 0.17.1 (P7 ruling, 2026-11-22): the tail every failed sign-in, device sign-in or mint on connect's path ends with. The grants and
+     * hooks were written before the sign-in, so "Nothing was written." and "Nothing was changed on this machine." were false there.
+     */
+    connectTail: "No credential was saved.",
     /**
      * The documented fallback (FOUNDER_OAUTH_PROPOSAL decision 2): the paste path
      * that worked before this, unchanged. `auth` prints this and then prompts.
      */
     pasteInsteadLabel: "Paste one instead. Create it here, then paste it below:",
     /** `R5`/`8A`: the mint came back unusable (the probe of the NEW credential was refused). */
-    mintUnconfirmedWhy: "The service created a credential and then refused it. Nothing was written.",
+    mintUnconfirmedWhy: "The service created a credential and then refused it.",
     // --- T10 B5 (plan 4.12, DX-7): connect's recovery line per failure. Only on connect's path. ---
     /** DRAFT copy (CLI UX PR-C, DX-7). `requestMint` does not carry the server's retry time, so the plan's fallback is the line. */
     rateLimitedWait: "Wait up to an hour. A retry before then fails the same way.",
