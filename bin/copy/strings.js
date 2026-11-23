@@ -2574,6 +2574,36 @@ export const CREDENTIAL = {
     notAFileWhat: "The credential's path is not a file.",
     notAFileWhy: "Something other than a file, such as a folder, is where the credential is saved, so no new credential can be saved there.",
     notAFileFix: "Move it aside, then run the command again.",
+    // ---- 0.17.3 (P6 spec cli-ux-0173-fix-spec.md; P7 FINAL words 2026-11-23, binding character for character; Alexander's veto list) ----
+    // D-1: an insecure secret file other than credentials.json. The fix command comes from a fixed table keyed on the refused file
+    // (`paths.ts` `secretFileOf`, read by `credential_problem.ts`), never from the path itself.
+    insecureQueueWhat: "The record of credentials waiting to be revoked is readable by other accounts on this machine.",
+    insecureQueueWhy: "It was not read. It holds credentials, so it must be readable only by its owner.",
+    insecureQueueFix: "Restore the mode, then run the command again:",
+    /** Fail closed: an insecure file that is not in the table. No command: never the credentials.json `chmod`. */
+    insecureOtherWhat: "A file VibeCommit keeps secrets in is readable by other accounts on this machine.",
+    insecureOtherWhy: "It was not read. It must be readable only by its owner.",
+    insecureOtherFix: "Make it readable only by you, then run the command again.",
+    // D-2: CREDENTIAL_FILE_UNREADABLE by cause. `form` keeps `unreadableWhy` / `unreadableFix` above, byte-identical.
+    /** read-refused: EACCES/EPERM from the file's read. */
+    readRefusedWhy: "Permission to read it was refused. If another user on this computer owns the file, that user or an administrator must change it.",
+    readRefusedFix: "Restore the mode, then run the command again:",
+    /** read-refused at a path not in the table (fail closed; no command). */
+    readRefusedOtherFix: "Make it readable by you, then run the command again.",
+    /** folder-closed: EACCES/EPERM from the FILE's lstat; the folder passed its mode check but cannot be searched. */
+    folderClosedWhat: "The folder that holds the credential file cannot be opened.",
+    folderClosedWhy: "Permission to open it was refused, so the credential was not read. If another user on this computer owns the folder, that user or an administrator must change it.",
+    folderClosedFix: "Restore the folder's mode, then run the command again:",
+    /** folder-unchecked: the folder's stat failed with anything but ENOENT. No command: the causes vary. */
+    folderUncheckedWhat: "The folder that holds the credential file could not be checked.",
+    folderUncheckedWhy: "The credential is read only after this folder is checked, so it was not read.",
+    folderUncheckedFix: "Check that folder, then run the command again.",
+    /** not-a-file on a READ (`notAFileWhat` and `notAFileFix` reused). The sign-in preflight keeps `notAFileWhy`, which is true for a save. */
+    notAFileReadWhy: "Something other than a file, such as a folder, is where the credential is saved, so it was not read.",
+    /** read-failed (EIO, EMFILE, ENOTDIR, …). The code prints only when it is a plain errno name (`^[A-Z0-9_]+$`). */
+    readFailedWhy: (code) => `Reading it failed with ${code}.`,
+    readFailedWhyNoCode: "Reading it failed.",
+    readFailedFix: "Check that file, then run the command again.",
     // prc1 S3 (P7 ruling, 2026-11-22): the record of credentials waiting to be revoked cannot be read, so no new credential is made. The
     // claim is this command's own: hooks still upload with whatever credential exists, so it does not say "nothing is sent" or "uploaded".
     queueUnreadableWhat: "The record of credentials waiting to be revoked could not be read.",
@@ -2880,6 +2910,8 @@ export const COMMANDS = {
      */
     why: "vibecommit why src/auth/session.ts:47",
     chmodCredentials: "chmod 600 ~/.vibecommit/credentials.json",
+    /** 0.17.3 (D-1, P7 FINAL): the insecure pending-revoke record's own fix. */
+    chmodPendingRevoke: "chmod 600 ~/.vibecommit/pending-revoke.json",
     /** The folder's remedy, for `CREDENTIAL_FILE_INSECURE` when the folder is the one with the wrong mode. */
     chmodDirectory: "chmod 700 ~/.vibecommit",
     /**

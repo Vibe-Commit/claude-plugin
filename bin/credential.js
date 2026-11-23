@@ -101,14 +101,14 @@ export class IngestCredential {
 export function readSecretFile(home, path) {
     // prb-S1 (plan 4.12): ONLY ENOENT is "absent". Every other failure is a fault at the path it names: the old catch-all made an EACCES,
     // an EISDIR or an ELOOP look like "not connected", and `connect` then minted over a credential it could not read, with no replace hold.
-    const fault = (error, at) => error.code === "ENOENT" ? { kind: "absent" } : { kind: "unreadable", path: at };
+    // 0.17.3 (D-2): and the fault says which call failed, so its block can say what is true and print a fix that fixes it.
     const dir = rootDir(home);
     let dirMode;
     try {
         dirMode = statSync(dir).mode & 0o777;
     }
     catch (error) {
-        return fault(error, dir);
+        return errorCode(error) === "ENOENT" ? { kind: "absent" } : { kind: "unreadable", path: dir, cause: "folder-unchecked" };
     }
     if ((dirMode & 0o077) !== 0) {
         return { kind: "insecure-file", path: dir, mode: dirMode.toString(8).padStart(3, "0"), target: "directory" };
@@ -116,13 +116,20 @@ export function readSecretFile(home, path) {
     // `lstat`, not `stat`: `stat` follows a symlink and would report the
     // TARGET's mode, so a link to an attacker-owned 0600 file would pass a
     // check that exists to establish who can read this one.
-    let mode;
+    let stat;
     try {
-        mode = lstatSync(path).mode & 0o777;
+        stat = lstatSync(path);
     }
     catch (error) {
-        return fault(error, path);
+        // EACCES/EPERM here is the FOLDER refusing a search: it passed its mode check above (600 and 000 do), or another user owns it.
+        return lstatFault(error, dir, path);
     }
+    // Q2 (0.17.3, P6): the TYPE before the mode. A folder at the path with mode 755 is not "readable by other accounts" with a `chmod 600`
+    // fix; a link's own mode cannot be changed on Linux, so its `chmod` loops; and a 0600 FIFO passes the mode check, then blocks the read.
+    // Nothing behind a link is read (the /cso lstat rule), and nothing that is not a regular file is opened.
+    if (!stat.isFile())
+        return { kind: "unreadable", path, cause: "not-a-file" };
+    const mode = stat.mode & 0o777;
     if ((mode & 0o077) !== 0) {
         return { kind: "insecure-file", path, mode: mode.toString(8).padStart(3, "0"), target: "file" };
     }
@@ -130,8 +137,37 @@ export function readSecretFile(home, path) {
         return { kind: "ok", raw: readFileSync(path, "utf8") };
     }
     catch (error) {
-        return fault(error, path);
+        return readFault(error, path);
     }
+}
+/** The error's `code` when it is a string, else null. */
+function errorCode(error) {
+    const code = error?.code;
+    return typeof code === "string" ? code : null;
+}
+/** The file's `lstat` failed. EACCES/EPERM: the folder cannot be searched (`folder-closed`, at the folder). Else `read-failed`. */
+function lstatFault(error, dir, path) {
+    const code = errorCode(error);
+    if (code === "ENOENT")
+        return { kind: "absent" };
+    if (code === "EACCES" || code === "EPERM")
+        return { kind: "unreadable", path: dir, cause: "folder-closed" };
+    return { kind: "unreadable", path, cause: "read-failed", code };
+}
+/**
+ * The file's read failed. EACCES/EPERM: the file refuses this user (`read-refused`, its own `chmod`). EISDIR/ELOOP: what is there now is
+ * not a regular file (`not-a-file`). Anything else is `read-failed` with its code. Exported for the cells that give it a coded error
+ * no real file system produces on demand (EIO, a code that is not an errno name, no code at all).
+ */
+export function readFault(error, path) {
+    const code = errorCode(error);
+    if (code === "ENOENT")
+        return { kind: "absent" };
+    if (code === "EACCES" || code === "EPERM")
+        return { kind: "unreadable", path, cause: "read-refused" };
+    if (code === "EISDIR" || code === "ELOOP")
+        return { kind: "unreadable", path, cause: "not-a-file" };
+    return { kind: "unreadable", path, cause: "read-failed", code };
 }
 /**
  * T10 (B4, plan 4.12 and ENG-15): is `~/.vibecommit` writable? `finishMint` saves AFTER the server has created the credential, so an
@@ -193,10 +229,10 @@ export function loadCredential(ctx) {
         token = JSON.parse(raw).token;
     }
     catch {
-        return { kind: "unreadable", path };
+        return { kind: "unreadable", path, cause: "form" };
     }
     if (typeof token !== "string" || token.trim() === "") {
-        return { kind: "unreadable", path };
+        return { kind: "unreadable", path, cause: "form" };
     }
     const secret = token.trim();
     // `TODOS[182]` — see the `env` branch above for why `headerSafe` belongs here too.

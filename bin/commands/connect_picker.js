@@ -38,6 +38,7 @@ import { accountChange, accountNoteLines, changeOps, commitG, joiningMachine, la
 import { agentHookBeat, printSetupReport, setupBeatStart, askOrCancel, cancelledLines, disclosure, grantsUnreadableLines, holdLines, holdTail, obtainCredential, pinTestTranscript, sendTestCapture, tail, signInLeftBehind, } from "./connect.js";
 import { writeLines } from "./context.js";
 import { connectRetryCommand } from "./connect_retry.js";
+import { replaceableInline } from "./credential_problem.js";
 import { pickerNotListedLines, sawNoSession, scanMachine } from "./scan.js";
 /**
  * `connect` from any folder: scan → picker → disclosure → grant y/N → hooks → sign in → "Capture is on" → backfill offer
@@ -258,7 +259,9 @@ async function connectPickerRun(ctx, options, deps, here, keys, g, names) {
     const credentialAtStart = loaded.kind === "ok";
     // T10 (plan 4.4a, spec loop pass 3): a credential FILE that is wrong-class or unreadable. The nothing-chosen endings read it here, locally
     // (`obtainCredential` reads it only after a grant that adds something): Enter goes into the inline replace, and q/Esc names it.
-    const faultyFile = loaded.kind === "unreadable" || (loaded.kind === "wrong-class" && loaded.source === "file");
+    // 0.17.3 (P6 ruling): only a fault connect REPLACES (`replaceableInline`): a file it could not read is never replaced, so q/Esc must not
+    // say "press Enter to replace it"; it is handled as an insecure file is.
+    const faultyFile = loaded.kind === "unreadable" ? replaceableInline(loaded) : loaded.kind === "wrong-class" && loaded.source === "file";
     // The first-sync line is said once per run: if this one prints it, the sync after the writes does not.
     let firstSyncSaid = false;
     let syncUnauthorized = false;

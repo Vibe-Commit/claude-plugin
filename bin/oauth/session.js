@@ -48,11 +48,11 @@ export function loadSession(home) {
         doc = JSON.parse(read.raw);
     }
     catch {
-        return { kind: "unreadable", path };
+        return { kind: "unreadable", path, cause: "form" };
     }
     const { refresh_token: refresh, access_token: access } = doc;
     if (typeof refresh !== "string" || typeof access !== "string") {
-        return { kind: "unreadable", path };
+        return { kind: "unreadable", path, cause: "form" };
     }
     // Class before shape-of-envelope: a `vcik_` here is the interesting mistake,
     // and reporting it as "unreadable" would send the user to fix the wrong thing.
@@ -65,7 +65,7 @@ export function loadSession(home) {
         doc.issuer === "" ||
         typeof doc.token_endpoint !== "string" ||
         doc.token_endpoint === "") {
-        return { kind: "unreadable", path };
+        return { kind: "unreadable", path, cause: "form" };
     }
     return {
         kind: "ok",

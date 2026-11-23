@@ -48,7 +48,7 @@ import { terminalSafe } from "../printable.js";
 import { paint, renderErrorBlock, tildePath, truncatePath, wrap } from "../term.js";
 import { isWorking, setupReportLines } from "../setup_report.js";
 import { renderVerbHelp } from "../verb_help.js";
-import { credentialProblem, credentialProblemBlock, rejectedCredentialBlock } from "./credential_problem.js";
+import { credentialProblem, credentialProblemBlock, rejectedCredentialBlock, replaceableInline } from "./credential_problem.js";
 import { probeCredential } from "./probe.js";
 import { writeLines } from "./context.js";
 import { connectRetryCommand } from "./connect_retry.js";
@@ -560,12 +560,13 @@ export async function obtainCredential(ctx, deps, options = {}, scope) {
         // T10 (F-A3): a failed sign-in printed its own block on stderr (the SIGNIN error, or the mint's DX-7 block). Print nothing more.
         return { kind: "exit", code: EXIT.notConnected };
     }
-    // ⛔ R15 (T10, plan 4.12 row 3): a FAULTY file is named as the fault it is, not as "no credential". A wrong-class or unreadable FILE is
-    // then replaced inline by a person at a terminal, with no `auth` fix line: the fix follows inline. An env token and an insecure file keep
-    // today's block (a `chmod` for the file, and for the env token the variable).
+    // ⛔ R15 (T10, plan 4.12 row 3): a FAULTY file is named as the fault it is, not as "no credential". A wrong-class FILE, or one whose form
+    // is wrong, is then replaced inline by a person at a terminal, with no `auth` fix line: the fix follows inline. An env token and an
+    // insecure file keep today's block (a `chmod` for the file, and for the env token the variable). 0.17.3 (P6 ruling): so does a file that
+    // could not be READ (refused, not a file, a closed or unchecked folder, a failed read): it may hold a live credential a `chmod` restores.
     if (load.kind !== "absent") {
         const browser = inlineBrowser(ctx, deps);
-        if (envTokenSet(ctx) || browser === null || load.kind === "insecure-file") {
+        if (envTokenSet(ctx) || browser === null || !replaceableInline(load)) {
             writeLines(ctx.stderr, credentialProblem(load, ctx.colour, envTokenSet(ctx) ? authCommandFor(ctx.env, ctx.selfPath) : connectCommandOf(ctx)));
             return { kind: "exit", code: EXIT.notConnected };
         }
