@@ -34,15 +34,12 @@ and until then a session shows *"VibeCommit is installed but not connected."* Th
   vibecommit connect
   ```
 
-  Run `vibecommit connect` in each repository you want captured. On a machine with no credential it
-  opens your browser to sign in and saves the credential for you; there is nothing to copy or paste.
+  Run `vibecommit connect` from any folder and choose what to capture: whole owners, including repositories you clone later, or single repositories. On a machine with no credential it opens your browser to sign in and saves the credential for you; there is nothing to copy or paste.
 - **Run the bundled client.** Without npm, run the plugin's own client with Node:
   `node <the plugin's bin/index.js> connect`. The path is inside Claude Code's plugin directory; when
-  anything needs reconnecting, the message names the exact command for your install.
+  anything needs reconnecting, the message names the exact command for your install (when that would make the line too long, it points to `vibecommit.ai/install` instead).
 
-If capture later stops with *"this machine's credential is no longer accepted"*, the credential was
-revoked or expired. Run the command the message gives (`vibecommit auth`, or the `node … auth` form).
-Turns held in the meantime upload once you reconnect.
+If capture later stops because the credential is no longer accepted, it was revoked or expired, and the message says what to do. For a credential saved on this machine, the message reads *"this machine's credential is no longer accepted"* and names `vibecommit auth` or the `node … auth` form to run (or points to `vibecommit.ai/install`, as above). For one set through `VIBECOMMIT_TOKEN`, it reads *"VIBECOMMIT_TOKEN is no longer accepted"*: replace the variable's value, or unset it. Turns held in the meantime upload once you reconnect. A failed upload after that drops turns held more than 24 hours with no upload of their transcript file succeeding, and the oldest once that file has more than 512 held uploads; `status` lists them as skipped.
 
 What is uploaded is listed at [vibecommit.ai/docs/what-we-upload](https://vibecommit.ai/docs/what-we-upload).
 
@@ -66,11 +63,7 @@ server's `setup` tool, which writes them into your repository as a managed secti
 
 ## Cross-vendor users
 
-Using Cursor, Windsurf, VS Code Copilot, or another agent? The plugin path is
-Claude Code-specific. For all other agents — or for the same per-session re-sync
-experience across vendors — use the VibeCommit setup tool instead:
-
-**https://www.vibecommit.ai/install**
+Using Codex or Cursor? Install the CLI above: `vibecommit connect` adds capture for them too. For other agents, and for the MCP server and rules files in any agent (Claude Code included), use the VibeCommit setup tool: https://www.vibecommit.ai/install
 
 The install page has one-liner MCP blocks for every supported agent. The `setup`
 MCP tool is how the rules files reach ANY project, Claude Code included: its content is
