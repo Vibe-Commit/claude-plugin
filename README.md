@@ -39,7 +39,7 @@ and until then a session shows *"VibeCommit is installed but not connected."* Th
   `node <the plugin's bin/index.js> connect`. The path is inside Claude Code's plugin directory; when
   anything needs reconnecting, the message names the exact command for your install (when that would make the line too long, it points to `vibecommit.ai/install` instead).
 
-If capture later stops with *"this machine's credential is no longer accepted"*, the credential was revoked or expired. Run the command the message gives (`vibecommit auth`, or the `node … auth` form; with `VIBECOMMIT_TOKEN` set, it says to change or remove the variable). Turns held in the meantime upload once you reconnect. A failed upload after that drops turns held more than 24 hours with no upload of their transcript file succeeding, and the oldest once that file has more than 512 held uploads; `status` lists them as skipped.
+If capture later stops because the credential is no longer accepted, it was revoked or expired, and the message says what to do. For a credential saved on this machine, the message reads *"this machine's credential is no longer accepted"* and names `vibecommit auth` or the `node … auth` form to run (or points to `vibecommit.ai/install`, as above). For one set through `VIBECOMMIT_TOKEN`, it reads *"VIBECOMMIT_TOKEN is no longer accepted"*: replace the variable's value, or unset it. Turns held in the meantime upload once you reconnect. A failed upload after that drops turns held more than 24 hours with no upload of their transcript file succeeding, and the oldest once that file has more than 512 held uploads; `status` lists them as skipped.
 
 What is uploaded is listed at [vibecommit.ai/docs/what-we-upload](https://vibecommit.ai/docs/what-we-upload).
 
