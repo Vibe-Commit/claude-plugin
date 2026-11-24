@@ -97,7 +97,7 @@ export async function auth(ctx, argv, deps = {}) {
             what: AUTH.argvWhat,
             why: [AUTH.argvWhy],
             fixLabel: AUTH.argvFix,
-            fixes: [channelCommand(ctx.env, ctx.selfPath, AUTH.argvFixPrompt), AUTH.argvFixStdin(authCommandFor(ctx.env, ctx.selfPath))],
+            fixes: [channelCommand(ctx.env, ctx.selfPath, COMMANDS.authPaste), AUTH.argvFixStdin(authCommandFor(ctx.env, ctx.selfPath))],
         }, ctx.colour));
         return EXIT.usage;
     }

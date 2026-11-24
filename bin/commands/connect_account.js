@@ -36,7 +36,7 @@ import { machineCapture, readPerClone } from "../machine_state.js";
 import { credentialsPath } from "../paths.js";
 import { ingestUrl } from "../post.js";
 import { paint, renderErrorBlock, wrap } from "../term.js";
-import { askOrCancel, savedBlock } from "./connect.js";
+import { askOrCancel, connectRerunOf, savedBlock } from "./connect.js";
 import { credentialProblemBlock } from "./credential_problem.js";
 import { writeLines } from "./context.js";
 import { isPrintableName, terminalSafe } from "../printable.js";
@@ -143,7 +143,9 @@ firstSyncSaid = false) {
  *   - anything else (no answer, off-contract, over the caps, or no sync attempted): "hasn't been told yet; running `status` retries".
  * Only `connect`, `status` and `off` sync, so the retry it names is `status`.
  */
-export function accountNoteLines(ctx, sync) {
+export function accountNoteLines(ctx, sync, 
+/** 0.17.5 (P6's principle): the picker's connect as typed (`connectRerunOf`); plain `connect` when not given. */
+rerun = connectCommandFor(ctx.env, ctx.selfPath)) {
     if (sync === null)
         return [];
     if (sync.kind === "ran" && sync.result.kind === "synced")
@@ -151,7 +153,7 @@ export function accountNoteLines(ctx, sync) {
     if (sync.kind === "ran") {
         // A 400 and a 401 have their own lines, shared with `off` (`sync_reason.ts`, hook-safe).
         // T10 (plan 4.12): this is connect's own sync reason (only connect's picker reads it), so a 401 names connect, which signs in inline.
-        const reason = stoppedSyncReason(ctx, sync.result, connectCommandFor(ctx.env, ctx.selfPath));
+        const reason = stoppedSyncReason(ctx, sync.result, rerun);
         if (reason !== null)
             return reason;
     }
@@ -274,10 +276,16 @@ export async function mintForG(ctx, options, deps, account) {
         device: options.device === true,
         scope: "repos",
         hold: written.hold,
-        connectPath: { rerun: connectCommandFor(ctx.env, ctx.selfPath), replacing: false, grantsWritten: machineCapture(ctx.home).kind === "on" },
+        // 0.17.5 item 5b: the re-run as typed (`connectRerunOf`), here too: `g` is connect's own sign-in and has the run's options.
+        connectPath: {
+            rerun: connectRerunOf(ctx, options),
+            deviceRerun: connectRerunOf(ctx, { ...options, device: true }),
+            replacing: false,
+            grantsWritten: machineCapture(ctx.home).kind === "on",
+        },
     });
     if (minted.kind === "unrecorded") {
-        printUnrecorded(ctx, written.refusal(), minted.revoked, { rerun: connectCommandFor(ctx.env, ctx.selfPath), which: "g" });
+        printUnrecorded(ctx, written.refusal(), minted.revoked, { rerun: connectRerunOf(ctx, options), which: "g" });
         return { kind: "exit", code: EXIT.failure };
     }
     // A declined or failed sign-in has already said why on screen, and made no credential that the client has to remember.
@@ -319,7 +327,9 @@ export function accountChange(snapshot) {
  * `end` says how a run that granted nothing ended: its line is printed here, and "the server will be told on the next vibecommit
  * command that contacts the server" only when the row is still there to say it with. A throw prints nothing and rethrows.
  */
-export async function settleG(ctx, deps, g) {
+export async function settleG(ctx, deps, g, 
+/** 0.17.5 (P6's principle): "run connect again to finish" is connect as typed (`connectRerunOf`); plain `connect` when not given. */
+rerun = connectCommandFor(ctx.env, ctx.selfPath)) {
     if (g.credential === null || g.committed)
         return;
     const result = await revokeHeld(ctx.home, g.credential, g.origin, deps.fetch ?? globalThis.fetch);
@@ -333,7 +343,7 @@ export async function settleG(ctx, deps, g) {
     const cancelled = g.end === "cancelled";
     // Exactly what happened: "revoked" only on an answer from the server; "removed here … will be told" only while a readable row is
     // there to tell it with; and with no usable row and no answer the credential may be live, so it says where to remove it.
-    const connect = connectCommandFor(ctx.env, ctx.selfPath);
+    const connect = rerun;
     const fate = result.kind === "revoked" ? REPLACE.declinedRevoked : result.kind === "waiting" ? PICKER.gRemovedWillTell : REPLACE.declinedOrphan;
     // `orphan` (no usable row, no answer) and `unrevocable` (a 404: the row ended, but nothing revoked it) both leave a credential that may
     // be live: neither is ever called "revoked" ("0.8.0 truth fixes" F7).

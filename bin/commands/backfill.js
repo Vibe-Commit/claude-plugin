@@ -34,10 +34,10 @@
 import { lstatSync, realpathSync } from "node:fs";
 import { basename, isAbsolute } from "node:path";
 import { admitsTranscript, agentIsolatesRecords, DIALECTS } from "../agents/registry.js";
-import { BACKFILL, COMMANDS, CONNECT, SCAN, URLS, shortDate } from "../copy/index.js";
+import { BACKFILL, COMMANDS, CONNECT, REJECTED, SCAN, URLS, shortDate } from "../copy/index.js";
 import { captureStanding, grantsUnreadable, hasAnyConsent, isCaptureAllowed } from "../consent.js";
 import { folderStandingOf } from "../folder_grants.js";
-import { loadCredential } from "../credential.js";
+import { envCredentialToken, loadCredential } from "../credential.js";
 import { EXIT } from "../exit.js";
 import { firstReflogSeconds, onceStrictRepoSlug } from "../git.js";
 import { FOLDER_REPOSITORY_FORBIDDEN } from "../policy.js";
@@ -975,9 +975,15 @@ function stopRun(ctx, plan, uploaded, tally, fromConnect) {
             code: "CREDENTIAL_REJECTED",
             what: BACKFILL.credentialStoppedWhat,
             why: [BACKFILL.credentialStoppedWhy],
-            fixLabel: BACKFILL.credentialStoppedFixLabel,
-            // W7 (P6 review, #7): inside connect's run the remedy is connect's (it re-signs in); the standalone verb keeps auth's.
-            fixes: [fromConnect ? connectCommandFor(ctx.env, ctx.selfPath) : authCommandFor(ctx.env, ctx.selfPath), channelCommand(ctx.env, ctx.selfPath, COMMANDS.backfill)],
+            // capture 0.17.5 A2 (P7 FINAL; P6: L26 allows it): a rejected VIBECOMMIT_TOKEN is fixed by the variable, never by `auth` or `connect`
+            // (`envCredentialToken` is the predicate `loadCredential` chooses it by). A file keeps W7's fix.
+            ...(envCredentialToken(ctx.env) !== null
+                ? { fixLabel: REJECTED.fixLabelEnv, fixes: [COMMANDS.unsetToken] }
+                : {
+                    fixLabel: BACKFILL.credentialStoppedFixLabel,
+                    // W7 (P6 review, #7): inside connect's run the remedy is connect's (it re-signs in); the standalone verb keeps auth's.
+                    fixes: [fromConnect ? connectCommandFor(ctx.env, ctx.selfPath) : authCommandFor(ctx.env, ctx.selfPath), channelCommand(ctx.env, ctx.selfPath, COMMANDS.backfill)],
+                }),
         }, ctx.colour)
         : renderErrorBlock({
             kind: "warn",
@@ -1041,11 +1047,9 @@ export async function backfill(ctx, argv = [], deps = {}) {
         writeLines(ctx.stdout, renderVerbHelp(helpVerb));
         return EXIT.ok;
     }
-    // T22 (CLI UX PR-B): `--no-color` is the global flag, accepted everywhere by the shared check (`src/args.ts`). Any other argument refuses.
-    if (argv.some((arg) => arg !== "--no-color")) {
-        writeLines(ctx.stderr, renderErrorBlock({ kind: "bad", code: "UNRECOGNIZED_ARGUMENT", what: BACKFILL.usageWhat, why: [BACKFILL.usageWhy] }, ctx.colour));
-        return EXIT.usage;
-    }
+    // T22 (CLI UX PR-B): `--no-color` is the global flag. capture 0.17.5 (item 8, P6): every OTHER argument is refused by main()'s shared
+    // check before this verb runs (cli.ts checkArgs, args.ts FLAG_TABLE.backfill = [] and POSITIONALS.backfill = "refuse"), so the refusal this
+    // verb used to print could not be reached from any command line; it and its two strings are gone (test/args-check.test.ts walks the tokens).
     const result = await runBackfill(ctx, deps, { noColor: argv.includes("--no-color") });
     if (result.end === "uploaded" || result.end === "interrupted") {
         writeLines(ctx.stdout, ["", `  ${paint(ctx.colour, "accent", result.uploaded > 0 ? URLS.conversations : URLS.dashboard)}`]);

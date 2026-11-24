@@ -95,12 +95,11 @@ export function connectCommandFor(env, selfPath) {
     return `${installChannel(env, selfPath).command} connect`;
 }
 /**
- * What a user types to run the device sign-in again, for THIS install (`CR-234d`): `<channel command>
- * connect --device`. The same channel rule as `authCommandFor`, so a plugin-only machine — which has no
- * `vibecommit` on PATH — is not told to run a command that does not exist.
+ * 0.17.5 (A4, P6 scope): `auth --device`'s own rerun, for THIS install: `<channel command> auth --device`. Its failures printed
+ * `connect --device`, which runs `connect`, not the sign-in that failed. Built as `DEVICE.needsTerminalCommand` builds auth's `--stdin`.
  */
-export function connectDeviceCommandFor(env, selfPath) {
-    return `${installChannel(env, selfPath).command} connect --device`;
+export function authDeviceCommandFor(env, selfPath) {
+    return `${authCommandFor(env, selfPath)} --device`;
 }
 /** The first executable `name` on PATH, or null. */
 export function resolveOnPath(env, name) {

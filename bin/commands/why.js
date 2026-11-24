@@ -93,6 +93,7 @@
  * @provenance vibecommit-schema capture_turns + commit_file_attribution — MEASURED ABSENCE, cited
  */
 import { ABSENCE, COMMANDS, SIGNIN, ORG_ANSWER, WHY, renderCommitHeader, renderCommitIdentity, } from "../copy/index.js";
+import { rerunLine } from "../args.js";
 import { renderVerbHelp } from "../verb_help.js";
 import { EXIT } from "../exit.js";
 import { gitProbe, isShallowClone, resolveRepoSlug } from "../git.js";
@@ -685,23 +686,23 @@ function attributionNote(ctx) {
  * §13.7 makes distinct precisely so a wrapper can branch on it without parsing
  * copy. The rest are failures of this attempt and exit 1.
  */
-function notAuthorized(ctx, json, authorized, commit) {
+function notAuthorized(ctx, json, authorized, commit, rerun) {
     switch (authorized.kind) {
         case "no-session":
             return fail(ctx, json, errorCopy("NOT_SIGNED_IN", WHY.signedOutWhat, WHY.signedOutWhy, WHY.signedOutFix, COMMANDS.signIn), EXIT.notConnected, commit);
         case "expired":
             return fail(ctx, json, errorCopy("SIGNIN_ENDED", SIGNIN.expiredWhat, SIGNIN.expiredWhy, SIGNIN.expiredFix, COMMANDS.signIn), EXIT.notConnected, commit);
         case "busy":
-            return fail(ctx, json, errorCopy("SIGNIN_BUSY", SIGNIN.busyWhat, SIGNIN.busyWhy, SIGNIN.busyFix, COMMANDS.why), EXIT.failure, commit);
+            return fail(ctx, json, errorCopy("SIGNIN_BUSY", SIGNIN.busyWhat, SIGNIN.busyWhy, SIGNIN.busyFix, rerun), EXIT.failure, commit);
         case "unreachable":
-            return fail(ctx, json, errorCopy("RECORD_SERVICE_UNREACHABLE", WHY.unreachableWhat, WHY.unreachableWhy, WHY.readFix, COMMANDS.why), EXIT.failure, commit);
+            return fail(ctx, json, errorCopy("RECORD_SERVICE_UNREACHABLE", WHY.unreachableWhat, WHY.unreachableWhy, WHY.readFix, rerun), EXIT.failure, commit);
         case "malformed":
-            return fail(ctx, json, errorCopy("RECORD_ANSWER_UNREADABLE", WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, COMMANDS.why), EXIT.failure, commit);
+            return fail(ctx, json, errorCopy("RECORD_ANSWER_UNREADABLE", WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, rerun), EXIT.failure, commit);
         case "ok":
             // Unreachable by construction: `readWithSession` only wraps a NON-ok
             // outcome in `not-authorized`. Rendered rather than thrown, because a
             // crash here would be a worse answer than an honest failure.
-            return fail(ctx, json, errorCopy("RECORD_ANSWER_UNREADABLE", WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, COMMANDS.why), EXIT.failure, commit);
+            return fail(ctx, json, errorCopy("RECORD_ANSWER_UNREADABLE", WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, rerun), EXIT.failure, commit);
     }
 }
 export async function why(ctx, argv, deps = {}) {
@@ -720,6 +721,9 @@ export async function why(ctx, argv, deps = {}) {
     if (target === null) {
         return fail(ctx, json, errorCopy("WHY_NEEDS_FILE_AND_LINE", WHY.usageWhat, WHY.usageWhy, WHY.usageFix, COMMANDS.why), EXIT.usage);
     }
+    // 0.17.5 item 4 (P6 scope; P7 FINAL): every "this again" line reruns the command as typed. It printed the usage example
+    // (`COMMANDS.why`, src/auth/session.ts:47), which asks about a different line. `whyShape` only when a typed token is not shell-safe.
+    const rerun = rerunLine("why", argv, COMMANDS.whyShape);
     const projectKey = resolveProjectKey(ctx.cwd);
     if (projectKey === null) {
         writeFailure(ctx, notAGitRepoBlock(ctx), json ? "why" : null);
@@ -732,11 +736,14 @@ export async function why(ctx, argv, deps = {}) {
     }
     const blamed = blameLine(projectKey, target.file, target.line);
     if (blamed === null) {
-        return fail(ctx, json, errorCopy("BLAME_FAILED", WHY.blameWhat, WHY.blameWhy, WHY.blameFix, COMMANDS.why), EXIT.failure);
+        // 0.17.5 (P6 scope): "Check the path and the line, then run this again:" over the typed command, which the reader edits.
+        return fail(ctx, json, errorCopy("BLAME_FAILED", WHY.blameWhat, WHY.blameWhy, WHY.blameFix, rerun), EXIT.failure);
     }
     const endpoint = mcpUrl(ctx.env);
     if (endpoint === null) {
-        return fail(ctx, json, errorCopy("SIGNIN_SERVICE_NOT_FOUND", SIGNIN.noServerWhat, SIGNIN.noServerRefusedWhy, WHY.readFix, COMMANDS.why), EXIT.failure, blamed.commit);
+        return fail(ctx, json, 
+        // 0.17.5 A3 (P7 FINAL): `mcpUrl` is null only for a refused VIBECOMMIT_MCP_URL, so a rerun fails the same way; the fix is the variable.
+        errorCopy("SIGNIN_SERVICE_NOT_FOUND", SIGNIN.noServerWhat, SIGNIN.noServerRefusedWhy, SIGNIN.noServerRefusedFix, SIGNIN.noServerRefusedCommand), EXIT.failure, blamed.commit);
     }
     const read = deps.read ?? readWithSession;
     const outcome = await read(endpoint, "blame_commit", {
@@ -749,36 +756,38 @@ export async function why(ctx, argv, deps = {}) {
         nowMs: () => ctx.now().getTime(),
         read: { fetch, timeoutMs: READ_TIMEOUT_MS },
     });
-    return render(ctx, outcome, blamed.commit, target.file, json);
+    return render(ctx, outcome, blamed.commit, target.file, json, rerun);
 }
 /** Every arm of `Read`, and every arm of `Authorized` inside one of them. */
-function render(ctx, outcome, commit, file, json) {
+function render(ctx, outcome, commit, file, json, 
+/** 0.17.5 item 4: the rerun every read failure prints, the command as typed (`rerunLine`). */
+rerun) {
     switch (outcome.kind) {
         case "not-authorized":
-            return notAuthorized(ctx, json, outcome.authorized, commit);
+            return notAuthorized(ctx, json, outcome.authorized, commit, rerun);
         case "unauthorized":
             // A 401 that survived one refresh and one retry. The bearer is dead.
             return fail(ctx, json, errorCopy("NOT_SIGNED_IN", WHY.signedOutWhat, WHY.signedOutWhy, WHY.signedOutFix, COMMANDS.signIn), EXIT.notConnected, commit);
         case "unreachable":
-            return fail(ctx, json, errorCopy("RECORD_SERVICE_UNREACHABLE", WHY.unreachableWhat, WHY.unreachableWhy, WHY.readFix, COMMANDS.why), EXIT.failure, commit);
+            return fail(ctx, json, errorCopy("RECORD_SERVICE_UNREACHABLE", WHY.unreachableWhat, WHY.unreachableWhy, WHY.readFix, rerun), EXIT.failure, commit);
         case "rpc-error":
             // ⚠ Never a bare HTTP status or a raw JSON-RPC code on screen (§13.6).
-            return fail(ctx, json, errorCopy("RECORD_SERVICE_ERROR", WHY.serverErrorWhat, WHY.serverErrorWhy, WHY.readFix, COMMANDS.why), EXIT.failure, commit);
+            return fail(ctx, json, errorCopy("RECORD_SERVICE_ERROR", WHY.serverErrorWhat, WHY.serverErrorWhy, WHY.readFix, rerun), EXIT.failure, commit);
         case "malformed":
-            return fail(ctx, json, errorCopy("RECORD_ANSWER_UNREADABLE", WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, COMMANDS.why), EXIT.failure, commit);
+            return fail(ctx, json, errorCopy("RECORD_ANSWER_UNREADABLE", WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, rerun), EXIT.failure, commit);
         case "ok": {
             // ⚠ `isError` rides the SAME envelope as a success and is a documented
             // field of a contract with an external owner. A caller that only branched
             // on the transport would read a tool failure as a record.
             if (outcome.isError) {
-                return fail(ctx, json, errorCopy("RECORD_SERVICE_ERROR", WHY.serverErrorWhat, WHY.serverErrorWhy, WHY.readFix, COMMANDS.why), EXIT.failure, commit);
+                return fail(ctx, json, errorCopy("RECORD_SERVICE_ERROR", WHY.serverErrorWhat, WHY.serverErrorWhy, WHY.readFix, rerun), EXIT.failure, commit);
             }
             // M-a answers in three shapes (src/oauth/org_answers.ts): the legacy body, a body plus `org`, and `{ org: null, results: [...] }` when several
             // organizations answer. Each organization's BODY goes through the unchanged parser; one unreadable body makes the whole answer unreadable.
             const answers = orgAnswers(outcome.document);
             const payloads = answers === null ? null : answers.map((a) => parseBlameCommitPayload(a.body));
             if (answers === null || payloads === null || payloads.some((p) => p === null)) {
-                return fail(ctx, json, errorCopy("RECORD_ANSWER_UNREADABLE", WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, COMMANDS.why), EXIT.failure, commit);
+                return fail(ctx, json, errorCopy("RECORD_ANSWER_UNREADABLE", WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, rerun), EXIT.failure, commit);
             }
             const payload = payloads[0];
             // ⛔ SKEW IS NOT MALFORMEDNESS. The server answered correctly and this

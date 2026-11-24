@@ -46,10 +46,11 @@
  *
  * @provenance vibecommit-mcp src/read/coverage.ts — the payload shape, retyped
  */
+import { isShellSafeToken, rerunLine } from "../args.js";
 import { ABSENCE, ARGS, COMMANDS, ORG_ANSWER, REPORT, SIGNIN, WHY, } from "../copy/index.js";
 import { renderVerbHelp } from "../verb_help.js";
 import { EXIT } from "../exit.js";
-import { currentBranch, gitProbe, isReachable, isShallowClone, resolveRepoSlug } from "../git.js";
+import { currentBranch, gitProbe, isReachable, isShallowClone, resolveRepoSlug, resolvesToCommit } from "../git.js";
 import { emitJson } from "../json.js";
 import { mcpUrl } from "../oauth/discovery.js";
 import { orgAnswers, orgHeadings, withOrg } from "../oauth/org_answers.js";
@@ -66,6 +67,20 @@ const BODY_INDENT = 2;
 const READ_TIMEOUT_MS = 15_000;
 /** `--since` is a calendar date and nothing else — see `parseArgs`. */
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+/**
+ * 0.17.5 A5 (P6 scope): the shape AND a real calendar day. `ISO_DATE` alone passed `2026-13-45`, which git does not refuse: it widened the
+ * window, the hazard `REPORT.sinceWhy` says the check stops. The date must round-trip through the Date constructor unchanged.
+ */
+function isCalendarDate(value) {
+    if (!ISO_DATE.test(value))
+        return false;
+    const [year, month, day] = value.split("-").map(Number);
+    // rv175-9: `setFullYear`, not the constructor, which maps years 0-99 to 1900-1999 (so `0099-01-01`, accepted by 0.17.4, was refused).
+    // Noon, so no zone's midnight change can move the day.
+    const date = new Date(2000, 0, 1, 12);
+    date.setFullYear(year, month - 1, day);
+    return date.getFullYear() === year && date.getMonth() === month - 1 && date.getDate() === day;
+}
 const isRecord = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
 function asCount(value) {
     return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
@@ -168,8 +183,8 @@ export function parseArgs(argv) {
             return { problem: "unrecognized", token: arg };
         }
     }
-    if (since !== null && !ISO_DATE.test(since))
-        return { problem: "bad-date" };
+    if (since !== null && !isCalendarDate(since))
+        return { problem: "bad-date", ref };
     return { since, ref };
 }
 /**
@@ -217,22 +232,22 @@ function absence(ctx, what, why, fixLabel, fixes) {
     return EXIT.empty;
 }
 /** `notAuthorized`'s six outcomes, the same six `why` renders. */
-function notAuthorized(ctx, json, authorized) {
+function notAuthorized(ctx, json, authorized, rerun) {
     switch (authorized.kind) {
         case "no-session":
             return fail(ctx, json, errorCopy("NOT_SIGNED_IN", WHY.signedOutWhat, WHY.signedOutWhy, WHY.signedOutFix, COMMANDS.signIn), EXIT.notConnected);
         case "expired":
             return fail(ctx, json, errorCopy("SIGNIN_ENDED", SIGNIN.expiredWhat, SIGNIN.expiredWhy, SIGNIN.expiredFix, COMMANDS.signIn), EXIT.notConnected);
         case "busy":
-            return fail(ctx, json, errorCopy("SIGNIN_BUSY", SIGNIN.busyWhat, SIGNIN.busyWhy, SIGNIN.busyFix, COMMANDS.report), EXIT.failure);
+            return fail(ctx, json, errorCopy("SIGNIN_BUSY", SIGNIN.busyWhat, SIGNIN.busyWhy, SIGNIN.busyFix, rerun), EXIT.failure);
         case "unreachable":
-            return fail(ctx, json, errorCopy("RECORD_SERVICE_UNREACHABLE", WHY.unreachableWhat, WHY.unreachableWhy, WHY.readFix, COMMANDS.report), EXIT.failure);
+            return fail(ctx, json, errorCopy("RECORD_SERVICE_UNREACHABLE", WHY.unreachableWhat, WHY.unreachableWhy, WHY.readFix, rerun), EXIT.failure);
         case "malformed":
         case "ok":
             // `ok` is unreachable by construction — `readWithSession` only wraps a
             // NON-ok outcome. Rendered rather than thrown: a crash here would be a
             // worse answer than an honest failure.
-            return fail(ctx, json, errorCopy("RECORD_ANSWER_UNREADABLE", WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, COMMANDS.report), EXIT.failure);
+            return fail(ctx, json, errorCopy("RECORD_ANSWER_UNREADABLE", WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, rerun), EXIT.failure);
     }
 }
 /**
@@ -286,8 +301,14 @@ export async function report(ctx, argv, deps = {}) {
         if (args.problem === "unrecognized") {
             return fail(ctx, json, errorCopy("UNRECOGNIZED_ARGUMENT", ARGS.unrecognizedWhat(args.token, reportVerb), `${ARGS.acceptsWhy(reportHelp)} ${ARGS.nothingRead}`, ARGS.fixLabel, ARGS.helpCommand(reportVerb)), EXIT.usage);
         }
-        return fail(ctx, json, errorCopy("REPORT_SINCE_UNREADABLE", REPORT.sinceWhat, REPORT.sinceWhy, REPORT.sinceFix, COMMANDS.report), EXIT.usage);
+        // 0.17.5 item 5d (P7 FINAL): the label asks for a YYYY-MM-DD date, so the command under it carries `--since <YYYY-MM-DD>` (it printed
+        // bare `report`, the default window), and a typed `--ref` is kept (`reportShape` when it is not shell-safe).
+        const sinceFix = args.ref === null ? COMMANDS.reportSince : isShellSafeToken(args.ref) ? COMMANDS.reportSinceRef(args.ref) : COMMANDS.reportShape;
+        return fail(ctx, json, errorCopy("REPORT_SINCE_UNREADABLE", REPORT.sinceWhat, REPORT.sinceWhy, REPORT.sinceFix, sinceFix), EXIT.usage);
     }
+    // 0.17.5 item 4 (P6 scope; P7 FINAL): every "this again" line reruns the command as typed. It printed bare `report`, which asks about
+    // the current branch over the default window. `reportShape` only when a typed token is not shell-safe.
+    const rerun = rerunLine("report", argv, COMMANDS.reportShape);
     // T16: the window. The start is the explicit date, or today minus six calendar days. Git gets `<date> 00:00`, so the date given is the
     // first day counted (a bare date would take the time of day from now, and drop that day's earlier commits).
     const since = args.since ?? defaultSince(ctx.now());
@@ -319,6 +340,16 @@ export async function report(ctx, argv, deps = {}) {
         // 0.17.4 [6b] (P7 FINAL): git could not read this ref (an unknown `--ref`, an unborn branch); HEAD need not be detached.
         return fail(ctx, json, errorCopy("REPORT_REF_UNNAMEABLE", REPORT.refWhat, REPORT.refUnreadableWhy, REPORT.refFix, COMMANDS.reportRef), EXIT.usage);
     }
+    // 0.17.5 item 1 (P6 scope; P7 FINAL): a ref `git log` reads that names no single commit (a range) is refused HERE, before any read. Every
+    // reachability probe would answer unknown, and the block printed a fetch that cannot help.
+    // rv175-P1 (P6): only git's own "no" (false) is this refusal. A git that did not answer (null) goes on: the reachability probe below asks
+    // again, and if git still cannot answer for a recorded commit, it refuses with REPORT_REACHABILITY_UNKNOWN and the typed rerun, whose
+    // words ("Git could not say whether some recorded commits are still reachable…") are true only once the recorded commits are known.
+    // Where no recorded commit asks git (an empty `captured_shas` beside held edges), `renderPayload` asks again before any share.
+    const refResolved = resolvesToCommit(projectKey, ref);
+    if (refResolved === false) {
+        return fail(ctx, json, errorCopy("REPORT_REF_UNNAMEABLE", REPORT.refWhat, REPORT.refNotOneCommitWhy, REPORT.refFix, COMMANDS.reportRef), EXIT.usage);
+    }
     const windowShas = log.split("\n").filter((line) => line.trim() !== "");
     const window = REPORT.window(since);
     if (windowShas.length === 0) {
@@ -346,11 +377,15 @@ export async function report(ctx, argv, deps = {}) {
             });
             return EXIT.empty;
         }
-        return absence(ctx, ABSENCE.reportNoCommits.what(ref, window), ABSENCE.reportNoCommits.why(ref), ABSENCE.reportNoCommits.fix, [COMMANDS.report]);
+        return absence(ctx, ABSENCE.reportNoCommits.what(ref, window), ABSENCE.reportNoCommits.why(ref), ABSENCE.reportNoCommits.fix, 
+        // 0.17.5 (P6 scope): "…run this again" over the command as typed; bare `report` is the default window, not a widened one.
+        [rerun]);
     }
     const endpoint = mcpUrl(ctx.env);
     if (endpoint === null) {
-        return fail(ctx, json, errorCopy("SIGNIN_SERVICE_NOT_FOUND", SIGNIN.noServerWhat, SIGNIN.noServerRefusedWhy, WHY.readFix, COMMANDS.report), EXIT.failure);
+        return fail(ctx, json, 
+        // 0.17.5 A3 (P7 FINAL): `mcpUrl` is null only for a refused VIBECOMMIT_MCP_URL, so a rerun fails the same way; the fix is the variable.
+        errorCopy("SIGNIN_SERVICE_NOT_FOUND", SIGNIN.noServerWhat, SIGNIN.noServerRefusedWhy, SIGNIN.noServerRefusedFix, SIGNIN.noServerRefusedCommand), EXIT.failure);
     }
     const read = deps.read ?? readWithSession;
     const outcome = await read(endpoint, "commit_coverage", 
@@ -367,34 +402,36 @@ export async function report(ctx, argv, deps = {}) {
         json,
         since,
         header: windowLine,
+        rerun,
+        refResolved: refResolved === true,
     });
 }
 /** Every arm of `Read`, and every arm of `Authorized` inside one of them. */
 function render(ctx, outcome, projectKey, ref, window, windowCommits, opts) {
     switch (outcome.kind) {
         case "not-authorized":
-            return notAuthorized(ctx, opts.json, outcome.authorized);
+            return notAuthorized(ctx, opts.json, outcome.authorized, opts.rerun);
         case "unauthorized":
             return fail(ctx, opts.json, errorCopy("NOT_SIGNED_IN", WHY.signedOutWhat, WHY.signedOutWhy, WHY.signedOutFix, COMMANDS.signIn), EXIT.notConnected);
         case "unreachable":
-            return fail(ctx, opts.json, errorCopy("RECORD_SERVICE_UNREACHABLE", WHY.unreachableWhat, WHY.unreachableWhy, WHY.readFix, COMMANDS.report), EXIT.failure);
+            return fail(ctx, opts.json, errorCopy("RECORD_SERVICE_UNREACHABLE", WHY.unreachableWhat, WHY.unreachableWhy, WHY.readFix, opts.rerun), EXIT.failure);
         case "rpc-error":
             // ⚠ Never a bare HTTP status or a raw JSON-RPC code on screen (§13.6).
-            return fail(ctx, opts.json, errorCopy("RECORD_SERVICE_ERROR", WHY.serverErrorWhat, WHY.serverErrorWhy, WHY.readFix, COMMANDS.report), EXIT.failure);
+            return fail(ctx, opts.json, errorCopy("RECORD_SERVICE_ERROR", WHY.serverErrorWhat, WHY.serverErrorWhy, WHY.readFix, opts.rerun), EXIT.failure);
         case "malformed":
-            return fail(ctx, opts.json, errorCopy("RECORD_ANSWER_UNREADABLE", WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, COMMANDS.report), EXIT.failure);
+            return fail(ctx, opts.json, errorCopy("RECORD_ANSWER_UNREADABLE", WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, opts.rerun), EXIT.failure);
         case "ok": {
             // ⚠ `isError` rides the SAME envelope as a success. A caller that only
             // branched on the transport would read a tool failure as a record.
             if (outcome.isError) {
-                return fail(ctx, opts.json, errorCopy("RECORD_SERVICE_ERROR", WHY.serverErrorWhat, WHY.serverErrorWhy, WHY.readFix, COMMANDS.report), EXIT.failure);
+                return fail(ctx, opts.json, errorCopy("RECORD_SERVICE_ERROR", WHY.serverErrorWhat, WHY.serverErrorWhy, WHY.readFix, opts.rerun), EXIT.failure);
             }
             // M-a answers in three shapes (src/oauth/org_answers.ts): the legacy body, a body plus `org`, and `{ org: null, results: [...] }` when several
             // organizations answer. Each organization's BODY goes through the unchanged parser; one unreadable body makes the whole answer unreadable.
             const answers = orgAnswers(outcome.document);
             const payloads = answers === null ? null : answers.map((a) => parseCoveragePayload(a.body));
             if (answers === null || payloads === null || payloads.some((p) => p === null)) {
-                return fail(ctx, opts.json, errorCopy("RECORD_ANSWER_UNREADABLE", WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, COMMANDS.report), EXIT.failure);
+                return fail(ctx, opts.json, errorCopy("RECORD_ANSWER_UNREADABLE", WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, opts.rerun), EXIT.failure);
             }
             if (answers.length === 1) {
                 const only = answers[0];
@@ -491,7 +528,7 @@ function renderPayload(ctx, payload, projectKey, ref, window, windowCommits, opt
             });
             return EXIT.empty;
         }
-        return absence(ctx, ABSENCE.reportNoSessions.what(String(windowCommits), window), ABSENCE.reportNoSessions.why, ABSENCE.reportNoSessions.fix, [COMMANDS.report]);
+        return absence(ctx, ABSENCE.reportNoSessions.what(String(windowCommits), window), ABSENCE.reportNoSessions.why, ABSENCE.reportNoSessions.fix, [opts.rerun]);
     }
     // ⚠ THE CLIENT HALF OF D67's SPLIT. Reachability is a question about the
     // user's clone and the server has no repository, so it is asked here.
@@ -501,11 +538,30 @@ function renderPayload(ctx, payload, projectKey, ref, window, windowCommits, opt
         // ⚠ FAILS CLOSED. An unanswerable probe is not a "no": counting it as
         // unreachable would DEFLATE the rate and present a smaller number as a
         // complete one, which is D98's class on the number that matters most.
-        if (answer === null) {
-            return fail(ctx, opts.json, errorCopy("REPORT_REACHABILITY_UNKNOWN", REPORT.unknownReachabilityWhat, REPORT.unknownReachabilityWhy, REPORT.unknownReachabilityFix, WHY.shallowFixCommand), EXIT.failure);
+        // 0.17.5 item 1 (P7 FINAL): split by cause. Every clone here is complete (the shallow refusal ran first), so `git fetch --unshallow`
+        // failed wherever it was printed. A sha not in this clone: `git fetch`, and the why says what a fetch cannot bring back (Q1.1 option
+        // (a): keep refusing; a labelled not-counted line is TODOS [267], Alexander's). git not answering: the command as typed.
+        if (answer === "absent") {
+            return fail(ctx, opts.json, {
+                code: "REPORT_REACHABILITY_UNKNOWN",
+                what: REPORT.unknownReachabilityWhat,
+                why: [REPORT.notInCloneWhy, REPORT.notInCloneUnfetchableWhy],
+                fixLabel: REPORT.notInCloneFix,
+                fixes: [REPORT.fetchCommand],
+            }, EXIT.failure);
         }
-        if (answer)
+        if (answer === null) {
+            return fail(ctx, opts.json, errorCopy("REPORT_REACHABILITY_UNKNOWN", REPORT.unknownReachabilityWhat, REPORT.unknownReachabilityWhy, REPORT.unknownReachabilityFix, opts.rerun), EXIT.failure);
+        }
+        if (answer === true)
             reachable += 1;
+    }
+    // rv175-P1 (P6, 2026-11-24): a ref git did not answer for at the top (`refResolved` false) is asked again here when no recorded commit put a
+    // question to git. Every answer the loop counted implies the ref resolved (`merge-base` exit 0, or `isReachable`'s own `resolvesToCommit`),
+    // so only an empty `captured_shas` beside held edges reaches here unverified, and the share would then be a claim over a ref git never
+    // resolved. Still no answer (or a no) refuses, fail closed; its rerun asks both again.
+    if (!opts.refResolved && payload.capturedShas.length === 0 && resolvesToCommit(projectKey, ref) !== true) {
+        return fail(ctx, opts.json, errorCopy("REPORT_REACHABILITY_UNKNOWN", REPORT.unknownReachabilityWhat, REPORT.unknownReachabilityWhy, REPORT.unknownReachabilityFix, opts.rerun), EXIT.failure);
     }
     // ⚠ ONLY EXACT SUCCESSORS JOIN THE NUMERATOR (D67). A commit that was
     // rewritten is still reachable through the successor we hold a recorded row
@@ -515,7 +571,7 @@ function renderPayload(ctx, payload, projectKey, ref, window, windowCommits, opt
         // The payload disagrees with the clone about its own totals. A rate over
         // 100% is not a number to print, and clamping it would hide the disagreement
         // behind a plausible figure.
-        return fail(ctx, opts.json, errorCopy("RECORD_ANSWER_UNREADABLE", WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, COMMANDS.report), EXIT.failure);
+        return fail(ctx, opts.json, errorCopy("RECORD_ANSWER_UNREADABLE", WHY.malformedWhat, WHY.malformedWhy, WHY.readFix, opts.rerun), EXIT.failure);
     }
     const percent = Math.round((numerator / payload.edgesHeld) * 100);
     // §13.3 — the machine surface, and THE ONE PLACE THE GRADE MIX IS READABLE AS

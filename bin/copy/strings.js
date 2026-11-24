@@ -92,7 +92,8 @@ export const HELP = {
                 ["--typed", "Use the typed prompt even on a terminal, for a screen reader."],
             ],
             exits: [
-                ["0", "Done, or nothing changed (q, Esc, an empty typed answer, or a No)."],
+                // 0.17.5 (P7 FINAL): every connect run starts with the verb-start retry, so the row makes no claim about changes.
+                ["0", "Done, or stopped at q, Esc, an empty typed answer, or a No."],
                 ["1", "Failed, cancelled with Ctrl+C, or a replacement credential was declined."],
                 ["2", "Bad arguments, or no person at a terminal to answer the consent question."],
                 ["3", "No credential could be saved, or this machine's credential is not accepted."],
@@ -371,8 +372,11 @@ export const STATUS = {
     /** Changes queued for the account that no sync has delivered yet. They go out with the next sync; only `connect`, `status`, `off` and a terminal `auth` sync. */
     /** T17 (4.17): the label is `to send`; the value is unchanged. */
     pendingLabel: "to send",
-    /** T17 (CLI UX PR-B): the refused row keeps today's label. A refused change is not "to send" (4.17 renames only the queued row). Alexander: a better word. */
-    pendingRefusedLabel: "pending",
+    /**
+     * T17 (CLI UX PR-B): a refused change is not "to send" (4.17 renames only the queued row), so this row kept today's label, `pending`, until
+     * Alexander chose a better word. capture 0.17.5: he ruled `refused` (11-23, relayed by P7: "label for change your account - refused").
+     */
+    pendingRefusedLabel: "refused",
     pendingValue: (n) => `${n} ${n === 1 ? "change" : "changes"} not yet sent to your account · sent at the next sync`,
     /**
      * VQ's ruling (ii): a queued change the server refused with 400 is kept (a consent statement is never dropped) but a retry
@@ -854,7 +858,9 @@ export const CONNECT = {
     /** T10 (plan 4.12, verbatim): the line after a faulty file's block, before connect replaces it inline. */
     replacingIt: "Replacing it.",
     /** T10 (plan 4.4a, verbatim): q/Esc on a machine whose credential file is faulty. `connect` goes through channelCommand. */
-    faultyFileQuit: (connect) => `No changes. This machine's credential file can't be used: run ${connect} and press Enter to replace it.`,
+    faultyFileQuit: (connect) => 
+    // 0.17.5 (P7 FINAL): "No changes." was false after the verb-start retry and the picker's first sync.
+    `No choice was saved. This machine's credential file can't be used: run ${connect} and press Enter to replace it.`,
     /** DRAFT copy (CLI UX PR-C): the label over `vibecommit connect --device` when sign-in by code needs a terminal. The plan names the command, not the label. */
     // DRAFT copy (CLI UX PR-C): "Run this in a terminal:"
     deviceNeedsTerminalFix: "Run this in a terminal:",
@@ -887,6 +893,8 @@ export const CONNECT = {
      * HOLD, not a failure: the offset holds and the bytes stay on disk, so exit 0 and no word about why. `warn`, never `bad`.
      */
     holdWhat: "The server is holding this repo's captures for now.",
+    // 0.17.5 rv175-2 (P7 FINAL, rv175 round): 0.17.4's line, byte-identical, NOT a 0.17.5 change. It renders only for the pinned legacy 403
+    // hold (holdLines via isHeldDelivery), which markHeld folds into one pinned entry and enforceCaps never sheds (policy.ts), so it is true.
     holdBuffered: "Nothing is lost: turns stay on this machine and upload in order once the server takes them.",
 };
 /**
@@ -1062,6 +1070,12 @@ export const SIGNIN = {
      * the rule, because this one is entirely in the user's hands to fix.
      */
     noServerRefusedWhy: "VIBECOMMIT_MCP_URL is set to an address this client will not send a sign-in to. Only https, or http on the loopback, is allowed.",
+    /**
+     * 0.17.5 A3 (P7 FINAL 2026-11-23; Alexander's veto list): `why` and `report` printed a rerun under that why, which fails the same way.
+     * The fix is the variable, in `FINALIZE.ingestUrlFix`'s words for its own variable. Only where `mcpUrl` refused the variable.
+     */
+    noServerRefusedFix: "Correct it, or remove it to use the default address:",
+    noServerRefusedCommand: "unset VIBECOMMIT_MCP_URL",
     noServerFix: "Check the service, then run:",
     // 0.17.1 (P7 ruling, 2026-11-22): `deniedWhy`, `timeoutWhy` and `unreachableWhy` are BASE sentences, and `withSignInTail`
     // (finish_mint.ts) adds the tail. 0.17.4 (P7 FINAL): the tail is `AUTH.connectTail` on every path. `auth`'s "Nothing was changed on this
@@ -1338,9 +1352,6 @@ export const BACKFILL = {
     credentialStoppedWhat: "Upload stopped: this machine's credential is no longer accepted.",
     credentialStoppedWhy: "Nothing already sent is lost, and a re-run offers the sessions not yet uploaded.",
     credentialStoppedFixLabel: "Renew it, then run backfill again:",
-    usageWhat: "That is not something `vibecommit backfill` understands.",
-    // DRAFT copy (CLI UX PR-C prc1, W9's rule): the global flags (`--no-color`, `-h`) are accepted, so "no arguments" alone is not true.
-    usageWhy: "Nothing was read and nothing was uploaded. `backfill` takes no arguments of its own.",
 };
 /**
  * `vibecommit connect` from any folder — the picker, the grant block, the hooks step and the endings (0.7.0, PR 3).
@@ -1426,17 +1437,17 @@ export const PICKER = {
     narrowWindow: (columns) => `This window is ${columns} columns wide; the arrow-key list needs 80.`,
     noArrowKeys: "This terminal can't draw the arrow-key list.",
     chooseTyped: (connect) => `Choose by typing below, or widen the window and run ${connect}.`,
-    /** q or Esc (4.4): nothing changed, and the machine is not capturing. */
-    noChangesPlain: "No changes.",
+    /** q or Esc (4.4): no choice was saved, and the machine is not capturing. 0.17.5 (P7 FINAL): "No changes." was false after the retry. */
+    noChangesPlain: "No choice was saved.",
     /** CR-PRB T12 (4.11): a name that is already on. Verbatim from the plan. */
     namedAlreadyOn: (name) => `${name} is already on.`,
     /** The enter-with-nothing lines (D5). */
     nothingGranted: (connect) => `Nothing granted. Run \`${connect}\` again any time.`,
-    noChanges: (summary) => `No changes. Capture stays on for ${summary}.`,
+    noChanges: (summary) => `No choice was saved. Capture stays on for ${summary}.`,
     /** CR-PRB T9b-2b (plan §4.4a, 4.4 table): the q/Esc line when branch (a) holds. Verbatim from the plan. */
-    quitUnfinished: (connect) => `No changes. Setup isn't finished on this machine: run ${connect} and press Enter.`,
+    quitUnfinished: (connect) => `No choice was saved. Setup isn't finished on this machine: run ${connect} and press Enter.`,
     /** CR-PRB T9b-2b (plan §4.4a): the q/Esc line when only a repair holds. Verbatim from the plan; never a bare "Capture stays on". */
-    quitRepair: (summary, connect) => `No changes. Capture stays on for ${summary}. Some hooks need an update: run ${connect} and press Enter.`,
+    quitRepair: (summary, connect) => `No choice was saved. Capture stays on for ${summary}. Some hooks need an update: run ${connect} and press Enter.`,
     /**
      * CR-PRB T9b-2b: the count line when Enter with nothing new finishes setup (2B). Verbatim from the plan.
      */
@@ -1917,7 +1928,9 @@ export const WHY = {
     unreachableWhat: "VibeCommit could not reach the record service.",
     unreachableWhy: "The request did not complete, so no answer was read. The service may be down, or this machine may have no route to it.",
     serverErrorWhat: "The record service could not answer that.",
-    serverErrorWhy: "The request reached the service and it returned a failure instead of a record. Nothing on this machine was changed.",
+    serverErrorWhy: 
+    // 0.17.5 (P7 FINAL): scoped to the record; the verb-start retry and the read lane's token refresh can change files first.
+    "The request reached the service and it returned a failure instead of a record. No record was read.",
     malformedWhat: "The record service returned an answer this version cannot read.",
     malformedWhy: "The response was not in the form this version expects, so none of it was rendered rather than part of it being guessed at.",
     readFix: "Try again, and report it if it continues:",
@@ -2077,7 +2090,18 @@ export const REPORT = {
      */
     unknownReachabilityWhat: "Coverage could not be computed for every recorded commit.",
     unknownReachabilityWhy: "Git could not say whether some recorded commits are still reachable from this ref. A share computed over the rest would be a smaller number presented as a complete one.",
-    unknownReachabilityFix: "Fetch the full history, then run this again:",
+    /**
+     * 0.17.5 item 1 (P7 FINAL 2026-11-23; Alexander's veto list): this block is now the git-failure arm only (git answered neither yes nor
+     * no for a sha that is in the clone, against a ref that names one commit). It printed "Fetch the full history" over `git fetch
+     * --unshallow`, which fails on a complete clone, and every clone that reaches this is one. The fix is the command as typed.
+     */
+    unknownReachabilityFix: "Run it again:",
+    /** 0.17.5 item 1 (P7 FINAL): a recorded commit is not in this clone (`isReachable` "absent"). The list is repository-wide, from the service. */
+    notInCloneWhy: "Some recorded commits are not in this clone, so git cannot say whether they are still reachable from this ref. A share computed over the rest would be a smaller number presented as a complete one.",
+    /** rv175-8 (P7 FINAL): names the printed command; fetch-by-sha is unverified on GitHub, so it does not claim nothing can bring it in. */
+    notInCloneUnfetchableWhy: "`git fetch` cannot bring in a commit that was never pushed, was rewritten and has since been removed, or was left only on a branch deleted before this clone fetched it.",
+    notInCloneFix: "Fetch from the remote, then run this again:",
+    fetchCommand: "git fetch",
     refWhat: "This command needs a ref it can name.",
     refWhy: 
     // 0.17.4 (P7 FINAL): scoped to the lookup; the verb-start revoke retry may have sent a revoke.
@@ -2087,6 +2111,11 @@ export const REPORT = {
      * here" was false there whenever HEAD was not detached. The what and the fix stay `refWhat` / `refFix`.
      */
     refUnreadableWhy: "Git could not read the ref's history, so no coverage was looked up.",
+    /**
+     * 0.17.5 item 1 (P7 FINAL): `git log` read the ref, but it names no single commit (a range such as `HEAD~1..HEAD`). Every probe then
+     * answered unknown, and the block said to fetch. Refused before any read, under `refWhat` and `refFix`.
+     */
+    refNotOneCommitWhy: "Coverage is relative to one commit, and git could not resolve this ref to one, so no coverage was looked up.",
     refFix: "Name the ref:",
     /**
      * The window, as the two empty states name it.
@@ -2319,7 +2348,8 @@ export const FINALIZE = {
     stillWriting: "That session's transcript changed a moment ago.",
     stillWritingFix: "Wait for the session to finish, or if it is over, run:",
     closed: (id) => `Closed session ${id}: its last turn is recorded, so commits made in it can now be recorded.`,
-    alreadyClosed: (id) => `Session ${id} had nothing left open. Nothing changed.`,
+    // 0.17.5 (P7 FINAL): "Nothing changed." was false after the verb-start retry. Keeps "Session <id> had nothing left open" (study harness).
+    alreadyClosed: (id) => `Session ${id} had nothing left open, so there was nothing to close.`,
     notAcknowledged: "The server accepted the data but did not confirm that it closed the session; it may predate this command. The last turn may still be open.",
     refused: "The server declined to close the session on this attempt.",
     retryFix: "Run it again:",
@@ -2354,9 +2384,19 @@ export const FINALIZE = {
  */
 export const REJECTED = {
     what: "This machine's credential is no longer accepted.",
-    why: "It was revoked in Settings, or it expired. Held turns upload once reconnected; nothing is lost.",
-    whyExpired: (day) => `It expired on ${day}. Held turns upload once reconnected; nothing is lost.`,
+    // 0.17.5 A9 (P7 FINAL, rv175 round; supersedes the 11-23 words). Per transcript FILE (a session's main transcript and each sub-agent
+    // stream are separate files), an UNPINNED held span is written off at a FAILED upload when it is more than 24 h old (from its first
+    // failure or that file's last success, whichever is later) or the file holds more than 512 spans (the oldest go; policy.ts enforceCaps).
+    // rv175-11: nothing is written off while a recorded 401 stop holds (post.ts deliverChunk returns "stopped" first); the 401 that BEGINS
+    // the stop is itself a failed upload and can shed spans already past either arm.
+    why: "It was revoked in Settings, or it expired. Held turns stay on this machine while it is rejected, and upload once it is reconnected. A failed upload after that drops turns held more than a day with no upload of their transcript file succeeding, and the oldest once that file holds several hundred failed uploads. `status` lists dropped turns as skipped.",
+    whyExpired: (day) => `It expired on ${day}. Held turns stay on this machine while it is rejected, and upload once it is reconnected. A failed upload after that drops turns held more than a day with no upload of their transcript file succeeding, and the oldest once that file holds several hundred failed uploads. \`status\` lists dropped turns as skipped.`,
     fixLabel: "Reconnect this machine:",
+    /**
+     * capture 0.17.5 A2 (P7 FINAL; P6: L26 allows it): a 401 for VIBECOMMIT_TOKEN. `auth` and `connect` cannot replace a credential the variable
+     * sets (connect never mints, asks, saves or revokes over it), so the fix is the variable. Over `COMMANDS.unsetToken`.
+     */
+    fixLabelEnv: "Replace it, or remove it:",
     /**
      * `R12`. The server did not answer the probe: not a verdict on the credential, so not an error.
      * TWO lines (`unconfirmedWhat`, `unconfirmedFix`) so the 80-column wrap can never split the backticked
@@ -2573,6 +2613,11 @@ export const CREDENTIAL = {
      * thing being complained about, and `credential-fix-copy.test.ts` enforces it.
      */
     wrongClassFix: "Save a fresh one for this machine:",
+    /**
+     * capture 0.17.5 item 3 (P7 FINAL): the variable's own fix. `auth` writes a file, and while VIBECOMMIT_TOKEN is set it wins over any file
+     * (credential.ts loadCredential), so `auth` could not fix it. "It" is the variable the why names. Over `COMMANDS.unsetToken`.
+     */
+    wrongClassEnvFix: "Correct it, or remove it:",
     wrongClassCommand: "vibecommit auth",
     insecureFileWhat: "The credential file is readable by other accounts on this machine.",
     insecureFileWhyLabel: "file",
@@ -2590,6 +2635,14 @@ export const CREDENTIAL = {
     // 0.17.4 (P7 FINAL): "nothing was minted or sent" was false: an unwritable folder stops the verb-start revoke retry's writes, not its POST.
     "A credential is saved there after sign-in, so the sign-in did not start. If another user on this computer owns the folder, that user or an administrator must change it.",
     unwritableFix: "Make the folder writable by you, then run the command again:",
+    // 0.17.5 item 5c (P7 FINAL 2026-11-23; Alexander's veto list). A missing ~/.vibecommit whose parent cannot be written: the block's
+    // `folder` line names that parent and comes first; the fix is a label with no command.
+    unwritableMissingWhat: "The folder that would hold the credential cannot be created.",
+    unwritableMissingWhy: "~/.vibecommit does not exist yet, and it cannot be created in the folder named above. A credential is saved there after sign-in, so the sign-in did not start. If another user on this computer owns that folder, that user or an administrator must change it.",
+    unwritableMissingFix: "Make that folder writable by you, then run the command again.",
+    /** 5c (iii): something other than a folder at ~/.vibecommit. Its fix is `notAFileFix` ("Move it aside, then run the command again."). */
+    unwritableNotAFolderWhat: "~/.vibecommit is not a folder.",
+    unwritableNotAFolderWhy: "Something other than a folder is at ~/.vibecommit. A credential is saved in that folder after sign-in, so the sign-in did not start.",
     unreadableWhat: "The credential file could not be read.",
     unreadableWhy: "It exists but does not contain a credential in the expected form.",
     /** `CR-216/U4`. Was "Replace it by reconnecting:" — see `wrongClassFix` above. */
@@ -2696,7 +2749,9 @@ export const AUTH = {
      * (D32 guard 1). `auth` is `authCommandFor(env, selfPath)`: a plugin-only machine has no `vibecommit` on PATH, so the line names
      * `node <path> auth` there (README, "Keeping a machine connected"), and handing it `vibecommit auth` would be a new wrong output.
      */
-    mintCommands: (auth) => [`printf %s "$TOKEN" | ${auth} --stdin`, auth],
+    // capture 0.17.5 item 2 (P7 FINAL): the typed form is `auth --paste`. Bare `auth` at a terminal opens a browser or code sign-in first,
+    // which mints a SECOND credential and leaves the one just made in Settings unsaved and live.
+    mintCommands: (auth) => [`printf %s "$TOKEN" | ${auth} --stdin`, `${auth} --paste`],
     wrongClassWhat: "That is not a VibeCommit ingest credential.",
     wrongClassWhy: `An ingest credential begins ${INGEST_TOKEN_PREFIX}. Nothing was written and nothing was sent.`,
     /** 0.17.2 #135 r1 R1 (P7): `wrongClassWhy` under `emptyWhyAfterSignIn`'s gate (0.17.4: the retry ran). On Alexander's veto list. */
@@ -2704,7 +2759,6 @@ export const AUTH = {
     argvWhat: "A credential must not be passed as an argument.",
     argvWhy: "Arguments are written to your shell history and are readable by other processes on this machine while the command runs. Treat the one you just typed as exposed and revoke it.",
     argvFix: "Read it from the terminal, or from a pipe:",
-    argvFixPrompt: "vibecommit auth",
     /** A pipe, so `channelCommand` cannot rewrite it: it takes the channel's `auth` (`authCommandFor`) instead. */
     argvFixStdin: (auth) => `printf %s "$TOKEN" | ${auth} --stdin`,
     // --- `CR-226`: the browser mint, and the paste it falls back to. ---
@@ -2716,6 +2770,8 @@ export const AUTH = {
     minting: (label) => `Creating this machine's credential, labelled "${label}"…`,
     /** Every mint failure shares the `what`; the `why` names which step refused. */
     mintFailedWhat: "No credential was created through the browser.",
+    /** 0.17.5 item 5a (P7 FINAL 2026-11-23; Alexander's veto list): the same `what` on the DEVICE path, where no browser signed in. */
+    mintFailedWhatDevice: "No credential was created.",
     // 0.17.1 (P7 ruling, 2026-11-22): the mint whys below are each outcome's BASE sentence, and `withMintTail` (finish_mint.ts) adds the
     // tail, `connectTail`. 0.17.2 took it onto `auth`'s browser path; 0.17.4 (P7 FINAL) onto `auth --device` too, whose "Nothing was
     // written." (`mintTailAuth`, gone) was false after the verb-start revoke retry, which can rewrite or delete pending-revoke.json.
@@ -2742,6 +2798,11 @@ export const AUTH = {
     pasteInsteadLabel: "Paste one instead. Create it here, then paste it below:",
     /** `R5`/`8A`: the mint came back unusable (the probe of the NEW credential was refused). */
     mintUnconfirmedWhy: "The service created a credential and then refused it.",
+    /**
+     * 0.17.5 (P7 FINAL 2026-11-23, P6 took it in; Alexander's veto list): that block's `what`, on both paths. "No credential was created"
+     * contradicted its own why: the service created one, and the probe of it was refused.
+     */
+    mintUnconfirmedWhat: "The new credential could not be used.",
     // --- T10 B5 (plan 4.12, DX-7): connect's recovery line per failure. Only on connect's path. ---
     /** DRAFT copy (CLI UX PR-C, DX-7). `requestMint` does not carry the server's retry time, so the plan's fallback is the line. */
     rateLimitedWait: "Wait up to an hour. A retry before then fails the same way.",
@@ -2906,6 +2967,10 @@ export const COMMANDS = {
      * so `connect` is never the fix for a fault (`credential-fix-copy.test.ts`).
      */
     auth: "vibecommit auth",
+    /** capture 0.17.5 item 2 (P7 FINAL): the paste route. Bare `auth` at a terminal signs in through a browser or a code first. Always through channelCommand. */
+    authPaste: "vibecommit auth --paste",
+    /** capture 0.17.5 item 3 and A2 (P7 FINAL): a credential set through VIBECOMMIT_TOKEN is fixed by changing or removing the variable. Not a verb. */
+    unsetToken: "unset VIBECOMMIT_TOKEN",
     /** `CR-084d`. A FLAG, not a verb — `--help`'s verb list and its golden file do not move. */
     signIn: "vibecommit connect --sign-in",
     status: "vibecommit status",
@@ -2920,6 +2985,15 @@ export const COMMANDS = {
     report: "vibecommit report",
     /** The ref form, for the detached-HEAD refusal. */
     reportRef: "vibecommit report --ref main",
+    /**
+     * 0.17.5 item 4 (P7 FINAL 2026-11-23; Alexander's veto list): report's rerun when a typed token is not shell-safe (`typedLine`), so the
+     * command as typed cannot be printed. `<YYYY-MM-DD>` matches 5d's placeholder and `REPORT.sinceFix`.
+     */
+    reportShape: "vibecommit report --since <YYYY-MM-DD> --ref <ref>",
+    /** 0.17.5 item 5d (P7 FINAL): REPORT_SINCE_UNREADABLE's fix, under "Write the date as YYYY-MM-DD:". A placeholder, never a date the CLI picks. */
+    reportSince: "vibecommit report --since <YYYY-MM-DD>",
+    /** 5d: the same, keeping a typed `--ref` (a shell-safe one; otherwise `reportShape`). */
+    reportSinceRef: (ref) => `vibecommit report --since <YYYY-MM-DD> --ref ${ref}`,
     off: "vibecommit off",
     /** The picker's screen-reader flag: a FLAG on `connect`, like `signIn`. */
     connectTyped: "vibecommit connect --typed",
@@ -2934,6 +3008,11 @@ export const COMMANDS = {
      * already print.
      */
     why: "vibecommit why src/auth/session.ts:47",
+    /**
+     * 0.17.5 item 4 (P7 FINAL 2026-11-23; Alexander's veto list): why's rerun when a typed token is not shell-safe (`typedLine`). `why` above
+     * stays the usage shape (WHY_NEEDS_FILE_AND_LINE); it is no longer printed as a rerun.
+     */
+    whyShape: "vibecommit why <file>:<line>",
     chmodCredentials: "chmod 600 ~/.vibecommit/credentials.json",
     /** 0.17.3 (D-1, P7 FINAL): the insecure pending-revoke record's own fix. */
     chmodPendingRevoke: "chmod 600 ~/.vibecommit/pending-revoke.json",

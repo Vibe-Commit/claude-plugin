@@ -45,7 +45,7 @@ import { terminalSafe } from "../printable.js";
 import { credentialProblemBlock } from "./credential_problem.js";
 import { writeLines } from "./context.js";
 import { deviceCredential } from "./device_credential.js";
-import { connectMintBlock, finishMint, savedChoicesLines, withMintTail, withSignInTail, writeAheadOf, } from "./finish_mint.js";
+import { connectMintBlock, finishMint, mintCode, savedChoicesLines, withMintTail, withSignInTail, writeAheadOf, } from "./finish_mint.js";
 import { probeCredential } from "./probe.js";
 // `finishMint` and its types moved to `finish_mint.ts` (`CR-234d`) so the device flow can share them without
 // a cycle. Re-exported here because this is where every caller and test has always found them.
@@ -68,7 +68,16 @@ function connectSignInOf(options, endpoint) {
         ...(options.connectPath.grantsWritten === true ? { savedChoices: true } : {}),
         connectHost: new URL(endpoint).host,
         onConnectPath: true,
+        typedFixes: connectPathFixes(options.connectPath),
     };
+}
+/**
+ * rv175-5 (P6): a failed browser sign-in on connect's path reruns the typed command, then that command with `--device` (plan 4.12 row 5:
+ * no browser here), once: a typed `--device` is one line. A path with no `deviceRerun` keeps `COMMANDS.connectDevice` (0.17.4's line).
+ */
+function connectPathFixes(connectPath) {
+    const device = connectPath.deviceRerun ?? COMMANDS.connectDevice;
+    return device === connectPath.rerun ? [connectPath.rerun] : [connectPath.rerun, device];
 }
 /** `connect`'s re-run line, passed to `finishMint` only when `connect` is the caller (exactOptionalPropertyTypes). */
 function rerunOf(options) {
@@ -106,7 +115,7 @@ export async function signInBeat(ctx, options) {
     }
     const endpoint = mcpUrl(ctx.env);
     if (endpoint === null) {
-        writeLines(ctx.stderr, signInError(ctx, options.retry, "SIGNIN_SERVICE_NOT_FOUND", SIGNIN.noServerWhat, SIGNIN.noServerRefusedWhy, undefined, options.savedChoices === true, null, options.onConnectPath === true, options.afterWrites ?? null));
+        writeLines(ctx.stderr, signInError(ctx, options.retry, "SIGNIN_SERVICE_NOT_FOUND", SIGNIN.noServerWhat, SIGNIN.noServerRefusedWhy, undefined, options.savedChoices === true, null, options.onConnectPath === true, options.afterWrites ?? null, options.typedFixes ?? null));
         return EXIT.failure;
     }
     const outcome = await signIn({
@@ -137,12 +146,12 @@ export async function signInBeat(ctx, options) {
     }
     if (outcome.kind === "no-browser")
         return NO_BROWSER;
-    writeLines(ctx.stderr, ["", ...signInFailure(ctx, options.retry, outcome, options.savedChoices === true, options.connectHost ?? null, options.onConnectPath === true, options.afterWrites ?? null)]);
+    writeLines(ctx.stderr, ["", ...signInFailure(ctx, options.retry, outcome, options.savedChoices === true, options.connectHost ?? null, options.onConnectPath === true, options.afterWrites ?? null, options.typedFixes ?? null)]);
     return EXIT.failure;
 }
 /** §13.6's shape for a sign-in failure. One renderer, six outcomes. `savedChoices`: connect's grants are already written (T10 DX-7). */
-function signInFailure(ctx, retry, outcome, savedChoices, connectHost, onConnectPath, afterWrites) {
-    const failure = (code, what, why, fixLabel) => signInError(ctx, retry, code, what, why, fixLabel, savedChoices, null, onConnectPath, afterWrites);
+function signInFailure(ctx, retry, outcome, savedChoices, connectHost, onConnectPath, afterWrites, typedFixes) {
+    const failure = (code, what, why, fixLabel) => signInError(ctx, retry, code, what, why, fixLabel, savedChoices, null, onConnectPath, afterWrites, typedFixes);
     // 0.17.1: a why that ended "Nothing was changed on this machine." is its base plus a tail: connect's `--sign-in` beat (D1) says no
     // sign-in was saved; every other caller, `auth` included since 0.17.4 (P7 FINAL), says no credential was saved.
     const tailed = (base) => (afterWrites !== null ? `${base} ${SIGNIN.signInNotSavedTail}` : withSignInTail(base));
@@ -150,7 +159,7 @@ function signInFailure(ctx, retry, outcome, savedChoices, connectHost, onConnect
     // once, then check the network. Every other caller keeps the block above, byte-identical.
     const unreachable = (code, what, why, fixLabel) => connectHost === null
         ? failure(code, what, why, fixLabel)
-        : signInError(ctx, retry, code, what, why, AUTH.unreachableFix, savedChoices, AUTH.unreachableTried(connectHost), onConnectPath, afterWrites);
+        : signInError(ctx, retry, code, what, why, AUTH.unreachableFix, savedChoices, AUTH.unreachableTried(connectHost), onConnectPath, afterWrites, typedFixes);
     switch (outcome.kind) {
         case "no-server":
             if (outcome.detail === "unreachable") {
@@ -170,7 +179,7 @@ function signInFailure(ctx, retry, outcome, savedChoices, connectHost, onConnect
             return failure("SIGNIN_ANSWER_UNUSABLE", SIGNIN.malformedWhat, SIGNIN.malformedWhy, SIGNIN.malformedFix);
     }
 }
-function signInError(ctx, retry, code, what, why, fixLabel = SIGNIN.noServerFix, savedChoices = false, extraWhy = null, onConnectPath = false, afterWrites = null) {
+function signInError(ctx, retry, code, what, why, fixLabel = SIGNIN.noServerFix, savedChoices = false, extraWhy = null, onConnectPath = false, afterWrites = null, typedFixes = null) {
     return renderErrorBlock({
         kind: "bad",
         code,
@@ -183,10 +192,16 @@ function signInError(ctx, retry, code, what, why, fixLabel = SIGNIN.noServerFix,
             ...(afterWrites !== null ? afterWrites() : savedChoices ? [AUTH.savedChoicesWhy] : []),
         ],
         fixLabel,
+        // rv175-5: the typed commands when the caller has them (connect's path, connect's `--sign-in` beat); otherwise the retry's constant.
+        // An array literal with the choice inside a spread, so copy-width's derived fix-reachable set still sees every constant here.
         fixes: [
-            channelCommand(ctx.env, ctx.selfPath, retry === "auth" ? COMMANDS.auth : retry === "connect" ? COMMANDS.connect : COMMANDS.signIn),
-            // Plan 4.12 row 5: connect's path also names the device flow (no browser here). Absent otherwise: byte-identical.
-            ...(onConnectPath && retry === "connect" ? [channelCommand(ctx.env, ctx.selfPath, COMMANDS.connectDevice)] : []),
+            ...(typedFixes !== null
+                ? typedFixes.map((fix) => channelCommand(ctx.env, ctx.selfPath, fix))
+                : [
+                    channelCommand(ctx.env, ctx.selfPath, retry === "auth" ? COMMANDS.auth : retry === "connect" ? COMMANDS.connect : COMMANDS.signIn),
+                    // Plan 4.12 row 5: connect's path also names the device flow (no browser here). Absent otherwise: byte-identical.
+                    ...(onConnectPath && retry === "connect" ? [channelCommand(ctx.env, ctx.selfPath, COMMANDS.connectDevice)] : []),
+                ]),
         ],
     }, ctx.colour);
 }
@@ -211,7 +226,7 @@ export async function browserCredential(ctx, retry, deps = {}, options = {}) {
     // cannot come from two different servers.
     const endpoint = mcpUrl(ctx.env);
     if (endpoint === null) {
-        writeLines(ctx.stderr, signInError(ctx, retry, "SIGNIN_SERVICE_NOT_FOUND", SIGNIN.noServerWhat, SIGNIN.noServerRefusedWhy, undefined, options.connectPath?.grantsWritten === true, null, options.connectPath !== undefined));
+        writeLines(ctx.stderr, signInError(ctx, retry, "SIGNIN_SERVICE_NOT_FOUND", SIGNIN.noServerWhat, SIGNIN.noServerRefusedWhy, undefined, options.connectPath?.grantsWritten === true, null, options.connectPath !== undefined, null, options.connectPath === undefined ? null : connectPathFixes(options.connectPath)));
         return { kind: "failed" };
     }
     const fetchImpl = deps.fetch ?? fetch;
@@ -308,7 +323,7 @@ export async function browserCredential(ctx, retry, deps = {}, options = {}) {
     }
     // T10 (B5, DX-7): connect's path names the recovery for the failures it can (rate limited, not a member, unreachable). Every other
     // caller prints today's block.
-    const connectBlock = options.connectPath === undefined ? null : connectMintBlock(outcome, options.connectPath, endpoint, ctx.now());
+    const connectBlock = options.connectPath === undefined ? null : connectMintBlock(outcome, options.connectPath, endpoint, ctx.now(), AUTH.mintFailedWhat);
     writeLines(ctx.stderr, [
         "",
         ...renderErrorBlock(
@@ -342,8 +357,8 @@ export function signInPreflight(home, options) {
 /** prc1 S1/S8: `~/.vibecommit` writable, and the credential path absent or a regular file. For every sign-in. */
 export function stateDirPreflight(home) {
     const folder = credentialFolderWritable(home);
-    if (folder.kind === "unwritable")
-        return { kind: "refused", block: folderUnwritableErrorBlock(folder.path) };
+    if (folder.kind !== "ok")
+        return { kind: "refused", block: folderUnwritableErrorBlock(folder) };
     const credential = credentialsPath(home);
     let isFile = true;
     try {
@@ -372,15 +387,22 @@ export function queuePreflight(home, fixes) {
         return { kind: "refused", block: queueFullErrorBlock(fixes.statusCommand) };
     return { kind: "ok" };
 }
-function folderUnwritableErrorBlock(path) {
-    return {
-        kind: "bad",
-        code: "CREDENTIAL_FOLDER_UNWRITABLE",
-        what: CREDENTIAL.unwritableWhat,
-        why: [`${CREDENTIAL.insecureDirWhyLabel} ${truncatePath(terminalSafe(path), 60)}`, CREDENTIAL.unwritableWhy],
-        fixLabel: CREDENTIAL.unwritableFix,
-        fixes: [COMMANDS.chmodDirectory],
-    };
+/**
+ * 0.17.5 item 5c (P7 FINAL): one code, by what was found. `~/.vibecommit` itself unwritable keeps 0.17.4's block byte-identical. A missing
+ * `~/.vibecommit` names the ancestor it would be created in, label FIRST so "the folder named above" has its referent, and its fix names no
+ * command (`chmod` and `mkdir` of the missing path both fail, and the ancestor is often not the user's). A non-folder at the path says so.
+ */
+function folderUnwritableErrorBlock(folder) {
+    const label = `${CREDENTIAL.insecureDirWhyLabel} ${truncatePath(terminalSafe(folder.path), 60)}`;
+    const base = { kind: "bad", code: "CREDENTIAL_FOLDER_UNWRITABLE" };
+    switch (folder.kind) {
+        case "unwritable":
+            return { ...base, what: CREDENTIAL.unwritableWhat, why: [label, CREDENTIAL.unwritableWhy], fixLabel: CREDENTIAL.unwritableFix, fixes: [COMMANDS.chmodDirectory] };
+        case "uncreatable":
+            return { ...base, what: CREDENTIAL.unwritableMissingWhat, why: [label, CREDENTIAL.unwritableMissingWhy], fixLabel: CREDENTIAL.unwritableMissingFix };
+        case "not-a-folder":
+            return { ...base, what: CREDENTIAL.unwritableNotAFolderWhat, why: [CREDENTIAL.unwritableNotAFolderWhy], fixLabel: CREDENTIAL.notAFileFix };
+    }
 }
 function notAFileErrorBlock(path) {
     return {
@@ -426,17 +448,6 @@ function queueFullErrorBlock(statusCommand) {
  */
 function canOpenBrowser(env, platform) {
     return platform !== "linux" || resolveOnPath(env, "xdg-open") !== null;
-}
-/**
- * The code for a failed mint. Eight reasons share `MINT_FAILED`; two are split off because the action differs (join or
- * ask the workspace owner; wait until the stated time) — VQ's Q3.
- */
-function mintCode(outcome) {
-    if (outcome.kind === "refused" && outcome.error === "not_a_member")
-        return "MINT_NOT_A_MEMBER";
-    if (outcome.kind === "refused" && outcome.error === "rate_limited")
-        return "MINT_RATE_LIMITED";
-    return "MINT_FAILED";
 }
 /** One `why` per way the mint can fail. No status codes on screen (§13.6). */
 function mintWhy(outcome) {

@@ -32,7 +32,7 @@
  * injected — a test advances a virtual clock rather than waiting out five-second intervals.
  */
 import { hostname as osHostname } from "node:os";
-import { connectDeviceCommandFor } from "../install.js";
+import { authDeviceCommandFor } from "../install.js";
 import { AUTH, DEVICE, SIGNIN } from "../copy/index.js";
 import { discover } from "../oauth/discovery.js";
 import { DEFAULT_INTERVAL_S, pollDeviceToken, SLOW_DOWN_STEP_S, startDeviceAuthorization, } from "../oauth/device.js";
@@ -40,7 +40,7 @@ import { machineLabel, mintUrl, requestMint } from "../oauth/mint.js";
 import { HTTP_TIMEOUT_MS, openBrowser as platformOpenBrowser } from "../oauth/signin.js";
 import { paint, renderErrorBlock, wrap } from "../term.js";
 import { terminalSafe } from "../printable.js";
-import { connectMintBlock, finishMint, savedChoicesLines, withMintTail, withSignInTail, writeAheadOf, } from "./finish_mint.js";
+import { connectMintBlock, finishMint, mintCode, savedChoicesLines, withMintTail, withSignInTail, writeAheadOf, } from "./finish_mint.js";
 import { writeLines } from "./context.js";
 /** Poll failures in a row (a deploy, a blip) before the wait gives up on the service. */
 const MAX_TRANSIENT = 3;
@@ -118,7 +118,9 @@ function waitingBlock(ctx, grant) {
 }
 export async function deviceCredential(ctx, input, deps = {}) {
     const fetchImpl = deps.fetch ?? fetch;
-    const rerun = connectDeviceCommandFor(ctx.env, ctx.selfPath);
+    // 0.17.5 (P6 scope): on connect's path, connect's own re-run as typed (5b: one run prints one command; it printed `connect --device`
+    // here and plain `connect` after the mint). Off it the caller is `auth`, whose re-run is `auth --device` (A4; it printed `connect --device`).
+    const rerun = input.connectPath?.rerun ?? authDeviceCommandFor(ctx.env, ctx.selfPath);
     /** 0.17.1 (P7): a device why that ended "Nothing was changed on this machine." is its base plus the tail (`withSignInTail`). */
     const tailed = (base) => withSignInTail(base);
     const discovery = await discover(input.endpoint, { fetch: fetchImpl, timeoutMs: HTTP_TIMEOUT_MS });
@@ -207,22 +209,27 @@ export async function deviceCredential(ctx, input, deps = {}) {
     }
     if (minted.kind !== "ok") {
         // T10 (B5, DX-7): connect's path names the recovery for the failures it can; every other caller keeps today's block.
-        const connectBlock = input.connectPath === undefined ? null : connectMintBlock(minted, input.connectPath, input.endpoint, ctx.now());
+        const connectBlock = input.connectPath === undefined ? null : connectMintBlock(minted, input.connectPath, input.endpoint, ctx.now(), AUTH.mintFailedWhatDevice);
         if (connectBlock !== null) {
             writeLines(ctx.stderr, ["", ...renderErrorBlock(connectBlock, ctx.colour)]);
             return { kind: "failed" };
         }
+        // 0.17.5 item 5a (P6 scope): a membership refusal is MINT_NOT_A_MEMBER with its own why and NO rerun (no retry helps), as the
+        // browser `auth` block prints it; `auth` then offers the paste fallback. Only `auth` reaches it: connect's path took connectMintBlock.
+        const notMember = minted.kind === "refused" && minted.error === "not_a_member";
         writeLines(ctx.stderr, [
             "",
-            ...errorBlock(ctx, input.connectPath, minted.kind === "refused" && minted.error === "rate_limited" ? "MINT_RATE_LIMITED" : "MINT_FAILED", AUTH.mintFailedWhat, 
+            ...errorBlock(ctx, input.connectPath, mintCode(minted), AUTH.mintFailedWhatDevice, 
             // 0.17.1 (P7): the base sentence plus the path's tail; `errorBlock` adds the saved-choices line on connect's path once grants exist.
             withMintTail(minted.kind === "unreachable"
                 ? AUTH.mintUnreachableWhy
                 : minted.kind === "refused" && minted.error === "rate_limited"
                     ? AUTH.mintRateLimitedWhy
-                    : minted.kind === "malformed"
-                        ? AUTH.mintMalformedWhy
-                        : DEVICE.redeemFailedWhy), DEVICE.retryFix, [rerun]),
+                    : notMember
+                        ? AUTH.mintNotMemberWhy
+                        : minted.kind === "malformed"
+                            ? AUTH.mintMalformedWhy
+                            : DEVICE.redeemFailedWhy), notMember ? undefined : DEVICE.retryFix, notMember ? undefined : [rerun]),
         ]);
         return { kind: "failed" };
     }
@@ -235,8 +242,8 @@ export async function deviceCredential(ctx, input, deps = {}) {
         // The approver is not necessarily the person at this terminal: the question is never skipped (A4 §3).
         confirm: "always",
         ticket: { account: polled.account, orgName: polled.orgName },
-        // T10: connect's own command on connect's path; the device's `connect --device` line everywhere else (unchanged).
-        rerun: input.connectPath?.rerun ?? rerun,
+        // T10: connect's own command on connect's path; `auth --device` everywhere else (0.17.5 A4).
+        rerun,
         ...(input.connectPath === undefined ? {} : { connectPath: input.connectPath }),
         ...writeAheadOf(input.connectPath),
         ...(input.scope === undefined ? {} : { scope: input.scope }),

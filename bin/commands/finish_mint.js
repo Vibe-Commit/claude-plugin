@@ -43,12 +43,25 @@ export function savedChoicesLines(connectPath) {
     return connectPath?.grantsWritten === true ? [AUTH.savedChoicesWhy] : [];
 }
 /**
+ * The code for a failed mint. Eight reasons share `MINT_FAILED`; two are split off because the action differs (join or
+ * ask the workspace owner; wait until the stated time) — VQ's Q3. 0.17.5 item 5a: moved here from `browser_credential.ts` so the device
+ * flow uses it too (it named a membership refusal MINT_FAILED on `auth --device`).
+ */
+export function mintCode(outcome) {
+    if (outcome.kind === "refused" && outcome.error === "not_a_member")
+        return "MINT_NOT_A_MEMBER";
+    if (outcome.kind === "refused" && outcome.error === "rate_limited")
+        return "MINT_RATE_LIMITED";
+    return "MINT_FAILED";
+}
+/**
  * T10 (B5, DX-7): `connect`'s recovery line for the mint failures that have one (rate limited, not a member, unreachable). Only
  * `connect` passes a `connectPath`. For every other caller, and for the failures this does not name, the caller prints its own block,
  * byte-identical to today's. The rate-limit line uses the server's `Retry-After` when the mint answer carries one (prc1 S9(c)), else the
- * plan's "up to an hour". The not-a-member line names no account: the server's refusal carries none.
+ * plan's "up to an hour". The not-a-member line names no account: the server's refusal carries none. `what` is the path's (0.17.5
+ * item 5a, P7 FINAL): `AUTH.mintFailedWhat` on the browser path, `AUTH.mintFailedWhatDevice` on the device path.
  */
-export function connectMintBlock(outcome, connectPath, endpoint, now) {
+export function connectMintBlock(outcome, connectPath, endpoint, now, what) {
     if (outcome.kind === "refused" && outcome.error === "rate_limited") {
         // prc1 S9(c): the server's own retry time when it sent one (a clock reading, local time), else the plan's fallback.
         const wait = outcome.retryAfterS === undefined
@@ -57,7 +70,7 @@ export function connectMintBlock(outcome, connectPath, endpoint, now) {
         return {
             kind: "bad",
             code: "MINT_RATE_LIMITED",
-            what: AUTH.mintFailedWhat,
+            what,
             // connect's path always wrote the grants and hooks first, so the tail is connect's whatever the flow.
             why: [withMintTail(AUTH.mintRateLimitedWhy), wait, ...savedChoicesLines(connectPath)],
             fixLabel: AUTH.rateLimitedAgain,
@@ -68,7 +81,7 @@ export function connectMintBlock(outcome, connectPath, endpoint, now) {
         return {
             kind: "bad",
             code: "MINT_NOT_A_MEMBER",
-            what: AUTH.mintFailedWhat,
+            what,
             why: [withMintTail(AUTH.mintNotMemberWhy), ...savedChoicesLines(connectPath)],
             fixLabel: AUTH.notMemberFix,
         };
@@ -77,7 +90,7 @@ export function connectMintBlock(outcome, connectPath, endpoint, now) {
         return {
             kind: "bad",
             code: "MINT_FAILED",
-            what: AUTH.mintFailedWhat,
+            what,
             // A 5xx is an ANSWER (the service refused), so it keeps `auth`'s refused sentence; only no answer at all is "did not answer" (T20
             // sweep, CL-C F4). The recovery line is DX-7's for both: retry once, then the network.
             why: [
@@ -160,7 +173,8 @@ export async function finishMint(ctx, input) {
             ...renderErrorBlock({
                 kind: "bad",
                 code: "MINT_FAILED",
-                what: AUTH.mintFailedWhat,
+                // 0.17.5 (P7 FINAL): the service DID create this credential; the probe of it was refused. Both paths.
+                what: AUTH.mintUnconfirmedWhat,
                 why: [withMintTail(AUTH.mintUnconfirmedWhy), ...savedChoicesLines(input.connectPath)],
             }, ctx.colour),
         ]);
