@@ -39,7 +39,7 @@ import { basename, dirname, isAbsolute } from "node:path";
 import { zstdCompressSync } from "node:zlib";
 import { grantsUnreadable, hasAnyConsent, isCaptureAllowed, isLocalSlug, normalizeSlug } from "../consent.js";
 import { endingSoon, metaFor } from "../credential_meta.js";
-import { loadCredential } from "../credential.js";
+import { envCredentialToken, loadCredential } from "../credential.js";
 import { EXIT } from "../exit.js";
 import { headRef, onceRepoSlug } from "../git.js";
 import { redactSpan, rulesForTranscript } from "../redact.js";
@@ -362,7 +362,14 @@ async function hookBody(ctx, budgetMs, hookStartedAt) {
         repoKey,
         ...(cloneKey === undefined ? {} : { cloneKey }),
         // State 1 names the channel's `connect` (the same rule as state 2's `auth`): a plugin-only machine has no `vibecommit` on PATH.
-        ...(state === "not_connected" ? { connectCommand: connectCommandFor(ctx.env, ctx.selfPath ?? "") } : {}),
+        ...(state === "not_connected"
+            ? {
+                connectCommand: connectCommandFor(ctx.env, ctx.selfPath ?? ""),
+                // capture 0.17.6 B1 (P6 ruling): exactly a `wrong-class` load from VIBECOMMIT_TOKEN. With the variable set the load never reads
+                // the file, so this is the same answer the caller's own load gave; absent and file-source loads keep today's line.
+                ...(envTokenNotIngest(ctx) ? { envWrongClass: true } : {}),
+            }
+            : {}),
         // State 10: the epoch keys its once-per-epoch claim; the count is the sentence.
         ...(account === undefined ? {} : { accountEpoch: account.epoch, unnamedOwners: account.owners, unnamedRepos: account.repos }),
         now: () => new Date(),
@@ -372,6 +379,8 @@ async function hookBody(ctx, budgetMs, hookStartedAt) {
             ? {}
             : {
                 authCommand: authCommandFor(ctx.env, ctx.selfPath ?? ""),
+                // capture 0.17.6 (A1, A2): a VIBECOMMIT_TOKEN credential's line names the variable, not `auth`.
+                credentialSource: rejected.source,
                 fingerprint: credentialFingerprint(rejected),
             }),
         ...(endsAt === undefined ? {} : { endsAt }),
@@ -572,6 +581,14 @@ function priorLivenessOf(home, key) {
  * hook's own environment so `VIBECOMMIT_TOKEN` and the ingest override reach it. Node's documented background pattern. `selfPath` is `process.argv[1]`,
  * so both channels (npm and the plugin's vendored bin) respawn themselves. Never throws, never waits.
  */
+/** capture 0.17.6 B1: VIBECOMMIT_TOKEN is set to a value that is not an ingest credential (`loadCredential` → `wrong-class`, source `env`). */
+function envTokenNotIngest(ctx) {
+    // The variable first, so a run without it reads no file here (`loadCredential` would read the saved one).
+    if (envCredentialToken(ctx.env) === null)
+        return false;
+    const load = loadCredential({ env: ctx.env, home: ctx.home });
+    return load.kind === "wrong-class" && load.source === "env";
+}
 function spawnWorker(ctx) {
     const self = ctx.selfPath;
     if (self === undefined || self === "")

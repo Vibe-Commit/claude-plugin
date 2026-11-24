@@ -19,16 +19,16 @@
   ],
   "capture": {
     "repo": "Vibe-Commit/vibecommit-capture",
-    "commit": "bcf6e431bccc663442bcb101a15f92c283f9bcc4",
+    "commit": "5622ddccec4bf5085b0b2b3c0f0c5b15d075c710",
     "npmPackage": "@vibe-commit/capture",
-    "npmVersion": "0.17.5"
+    "npmVersion": "0.17.6"
   },
   "bundle": {
     "root": "bin",
     "algorithm": "sha256",
-    "digest": "49242d0c7ea9177924ea455c8d2db894783a44627e65389f9cf9c44f9e2a3752",
+    "digest": "52ea6e279e4685a560453f9f74cfa4edd9f36c843f7b18d66333e2bee6b61fee",
     "fileCount": 124,
-    "byteCount": 2310194,
+    "byteCount": 2314761,
     "files": {
       "account_not_here.js": "2bdd8e5ffbe8b10e1eef86a3b54b273b425be6bb7454eef57a9c5b210b70f194",
       "agent_hooks.js": "a8633c48c79a8cb198a454661dbbca7a68c5909b0c225b4b67a12efc789eb27e",
@@ -62,10 +62,10 @@
       "commands/probe.js": "6629d7ec80e653cde0c1fefb9ca34cce906400e5706c8bf6de1fbdd2b03e332e",
       "commands/report.js": "ac466f7912d220eeadcbd2476f734b1b8c4ee3be99aaab6d783480befb5d37a9",
       "commands/scan.js": "75e4513ceeef15074e018d73180cc1b634d2df2e83e335596544acca9cc39810",
-      "commands/status.js": "7da017259e63f85c3e33baa548d2f96e51dc62d4b48fe4c7eea6fa4acd2208e7",
+      "commands/status.js": "0c9eb52fbf742ddaac32e57866fa593f3b182d169a11cd51e547d4db83b4f7ea",
       "commands/status_hooks.js": "35aadaea984d1e0bff96f5bc001a56612b24eb89cb1213eac9942aad14f831df",
       "commands/status_machine.js": "f30d21577842ba88e2314f357890b0674c976b2ed583973b2ec901bd41385b09",
-      "commands/sync_reason.js": "4b55754406ba2be1ca5bce45522c79f6f296c8b9de7f05aa6e1b8f434ebc50ce",
+      "commands/sync_reason.js": "d67bbb547a0fd737ed7628f1d37a92f5c80ed862bb5a4fb83b4ddb3c9011b9d9",
       "commands/upload_worker.js": "bbf33afeec1529e07691c3e43316b73aa430beb579cfab48bb0e26337bdf282f",
       "commands/why.js": "7b7895cb897b87587a01f36da723f5320844d12f3b8f35fb0e74b9b8a5059a32",
       "commit_carry.js": "03f662fa81ce6a287482a6c1c92b6fda4c6dd44ffdffc8cefea87ee227aee3da",
@@ -73,10 +73,10 @@
       "commit_pos.js": "583b14c507e126565e534d3adef9e3179f87cfdba76f33dcd3bb3f1c9fed9df4",
       "consent.js": "4a2640c814184a69d7b67d1a0be8c73a910b34ca5fc26de757124bc6250d8f25",
       "copy/claims.js": "ae8c3e502fe85712efa95815e8a0ad4bcabe5d342e5a8ef28c79beda2b8d9ea4",
-      "copy/error_codes.js": "5800ab997884f2e08e27a7b7f21b1a94d7d65296d348a859e496d232e10a8ce5",
+      "copy/error_codes.js": "c9096c31826063ed5b9cf89b0674d00c6c244df875b5b9e018694190620186a3",
       "copy/grades.js": "5fd18e685ac9c063c5431aeb0f21dd5be0ebfa2018487ae9d523f6d3914a0c4a",
       "copy/index.js": "02dd130aeef0d966563e1189532d0242f8c2bb4dfbff046faf5812ce6f780ed9",
-      "copy/strings.js": "52ffc73cb31f34cb3397a4c30e3584dc6f1ce4eb69dd56d42954a9fa00db602f",
+      "copy/strings.js": "7237d35609556ff7cf4b207727a0a65b8b9563afc05141e28a9200a8ecfdd30a",
       "copy/time.js": "01ea725f5d575d3d7833d49346d4969a70ba19cef1fa728b01001af228358133",
       "credential.js": "d207c754051c50a3b3fad232d2f4917ec04b89ce4759fbf23d28049d58fa31b7",
       "credential_meta.js": "9a115afca8406d732ed42544bda2f0ebe259de1421214f6d123e116dbea774c1",
@@ -91,7 +91,7 @@
       "grants_sync.js": "a4c39012134616372f54248157a1d2f1d6a58a77a5c2ef79f06d9d0e8f5b672e",
       "grants_verb.js": "0c22a5c21c5fdb5b766873fe93181d5b463a20fff0ba51890a97def2cc150013",
       "header_safety.js": "d43aa55e711d2969602cf131d82b5c18fe4983e83d0b152c63665b9770ff12b7",
-      "hooks/entry.js": "f68da409210bf5d9bb07bc97218359bf8286571b0c8249b275c7f08e25ec7e65",
+      "hooks/entry.js": "3b18bbed4fe0269fc573ec6a2828d608523b8c2abefb5faa7363bb734dd8e6a5",
       "hooks/fire_lock.js": "8be614a00bc68427ac61e02057a65e7bec88463c2b2ae7cc31d4c8fa23377f0d",
       "hooks/post_commit.js": "1f9d3981952f59939709594ec5fb0ed97b8c13e064c64515c27f88916d3d528a",
       "hooks/post_rewrite.js": "aea3580146adeeb68ab7407726c17e8e275770d624b7faad142c1bf461171c85",
@@ -142,7 +142,7 @@
       "spool_union.js": "851b8f6221e8057aec6415e57040b5a7c173fd86498296eb65907d9e01a2ab27",
       "state.js": "e7aa6ca9358505c9f03ad00edae059127e8197f660fafe03f3c6a2f2b466c036",
       "stdin.js": "b065709b03029180ca49ca2716bd7c89a46dab422a6862983066dd5b2d358334",
-      "system_message.js": "ff779324addedf6cfa824c65411dd1b38028106d613de213ad56b01c4eb96534",
+      "system_message.js": "f47bdb7453527b4f7a8e06d5a58a6d78a4d162e9055f76a6879e55bc16850ca7",
       "temp_roots.js": "8bb5a8cb49cf5181c3a48d678a25d07344fbe83d41582556ecace00057e48a25",
       "term.js": "d3fe201387f4e2245dcb780f246517ab414b1a97a4d81c1b081035dca4ef4471",
       "text_tail.js": "54df5b389e5f32471f846ac0bda38ca454353f95fd2b30c4e61568cdee7c81f5",
@@ -153,7 +153,7 @@
       "verb_help.js": "52d38e61546855b496d243b45c0817d3c850280a68897eef40fe151540028c39",
       "verb_start.js": "14ed68677a67ef4b6073cc34e32d9aa954c730f336bd161a4817ce8d6859ab8c",
       "verbs.js": "8188f08159a602e4a416c537416d7ce7bb1d03f7fc9ad1cf4997aa2d37358f8d",
-      "version.js": "f67eb5e5d8afcdbb9d3544f55d18820873706dc09b4bc24157e9cf4bffc589a0"
+      "version.js": "17ef4ceee20648223f28fa0dd6709c7657c650f7b94176fb4912423812f69363"
     }
   }
 }

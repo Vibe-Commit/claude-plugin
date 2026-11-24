@@ -55,7 +55,8 @@ export const ERROR_CODES = {
     PENDING_REVOKE_FULL: { summary: "This machine already has the maximum number of credentials waiting to be revoked." },
     PENDING_REVOKE_BUSY: { summary: "The record of credentials waiting to be revoked is in use by another command." },
     CREDENTIAL_REJECTED: { summary: "The server no longer accepts this machine's credential." },
-    WORKSPACE_UNCONFIRMED: { summary: "The workspace for a new credential could not be confirmed." },
+    // capture 0.17.6 (P6 ruled IN, P7 FINAL): the condition is an unanswered first check of the new credential; "workspace" is the retired word.
+    WORKSPACE_UNCONFIRMED: { summary: "A new credential could not be confirmed with the server." },
     // — signing in —
     NOT_SIGNED_IN: { summary: "This machine has never signed in." },
     SIGNIN_ENDED: { summary: "This machine's sign-in has ended." },
@@ -74,8 +75,9 @@ export const ERROR_CODES = {
     SIGNIN_RATE_LIMITED: { summary: "Too many sign-in attempts from this network." },
     AUTH_FLAGS_CONFLICT: { summary: "Two `auth` flags that cannot be combined were given." },
     CONNECT_ARGS_CONFLICT: { summary: "`connect` was given names and `--typed`, which cannot be combined." },
-    MINT_FAILED: { summary: "No credential was created through the browser." },
-    // P7 ruling (2026-11-22): "organization", not the retired "workspace".
+    // capture 0.17.6 (P6 ruled IN, P7 FINAL): sign-in by code raises it too, and the fresh-probe arm's credential was created and then refused.
+    MINT_FAILED: { summary: "No usable credential was created." },
+    // P7 ruling (2026-11-22): "organization", not the retired "workspace" (0.17.6: WORKSPACE_UNCONFIRMED's summary follows it too).
     MINT_NOT_A_MEMBER: { summary: "The signed-in account is not a member of the organization." },
     MINT_RATE_LIMITED: { summary: "Too many credential requests; the service asked to wait." },
     // — the command on PATH —
