@@ -56,6 +56,9 @@ export function noticeText(state, nodeVersion, authCommand = DEFAULT_AUTH_COMMAN
             // treats an empty text as "write nothing".
             if (date === null)
                 return "";
+            // capture 0.17.6 A2 (P7 FINAL): an env token cannot be renewed with `auth`. The line names no path, so it needs no fallback.
+            if (extras.credentialSource === "env")
+                return SYSTEM_MESSAGE.credentialEndingEnv(date);
             const line = SYSTEM_MESSAGE.credentialEnding(date, authCommand);
             return line.length <= SYSTEM_MESSAGE.credentialRejectedBudget
                 ? line
@@ -64,12 +67,19 @@ export function noticeText(state, nodeVersion, authCommand = DEFAULT_AUTH_COMMAN
         case "not_connected": {
             // The same ≤120 budget and fallback as state 2: a long plugin realpath would blow it, and a truncated command is worse
             // than the page that always works. On npm the line is 87 characters and the bytes are what they always were.
+            // capture 0.17.6 B1 (P6 ruling, P7 FINAL): `connect` cannot start capture while VIBECOMMIT_TOKEN holds a value of the wrong class.
+            if (extras.envWrongClass === true)
+                return SYSTEM_MESSAGE.notConnectedEnvWrongClass;
             const line = SYSTEM_MESSAGE.notConnected(extras.connectCommand ?? DEFAULT_CONNECT_COMMAND);
             return line.length <= SYSTEM_MESSAGE.credentialRejectedBudget ? line : SYSTEM_MESSAGE.notConnectedFallback;
         }
         case "credential_revoked": {
             // ≤120 characters (`11A`). A long plugin realpath would blow it, and a truncated command is
             // worse than no command: the fallback points at the page that always works.
+            // capture 0.17.6 A1 (P7 FINAL): a VIBECOMMIT_TOKEN credential's fix is the variable, and its line has no fallback (no path; the install
+            // page does not change a variable).
+            if (extras.credentialSource === "env")
+                return SYSTEM_MESSAGE.credentialRejectedEnv;
             const line = SYSTEM_MESSAGE.credentialRejected(authCommand);
             return line.length <= SYSTEM_MESSAGE.credentialRejectedBudget
                 ? line
@@ -181,6 +191,8 @@ export function renderNotice(ctx, state) {
     try {
         const text = noticeText(state, ctx.nodeVersion, ctx.authCommand, ctx.endsAt, {
             ...(ctx.connectCommand === undefined ? {} : { connectCommand: ctx.connectCommand }),
+            ...(ctx.credentialSource === undefined ? {} : { credentialSource: ctx.credentialSource }),
+            ...(ctx.envWrongClass === undefined ? {} : { envWrongClass: ctx.envWrongClass }),
             ...(ctx.unnamedOwners === undefined ? {} : { unnamedOwners: ctx.unnamedOwners }),
             ...(ctx.unnamedRepos === undefined ? {} : { unnamedRepos: ctx.unnamedRepos }),
         });

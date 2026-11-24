@@ -394,7 +394,9 @@ export function status(ctx, argv = [], sync = { kind: "skipped" }, route = null)
         lines.push("", ...wrap(STATUS.credentialShadowed, 2));
     }
     if (endsText !== null) {
-        lines.push("", ...wrap(STATUS.credentialEnding(endsText, authCommand), 2));
+        // capture 0.17.6 A3 (P7 FINAL): a VIBECOMMIT_TOKEN credential cannot be renewed with `auth` (it saves a file the variable overrides).
+        const envEnding = load.kind === "ok" && load.credential.source === "env";
+        lines.push("", ...wrap(envEnding ? STATUS.credentialEndingEnv(endsText) : STATUS.credentialEnding(endsText, authCommand), 2));
     }
     if (stopped !== null && fingerprint !== null) {
         lines.push("", ...rejectedCredentialBlock({

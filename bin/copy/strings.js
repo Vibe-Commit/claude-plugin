@@ -431,6 +431,8 @@ export const STATUS = {
      * after the rows, with the glyph turned `warn`. The date is absolute and in UTC.
      */
     credentialEnding: (date, authCommand) => `This machine's credential ends ${date}. Run \`${authCommand}\` to renew it.`,
+    /** capture 0.17.6 (P7 FINAL): the same line for a VIBECOMMIT_TOKEN credential, which `auth` cannot renew (it saves a file the variable overrides). */
+    credentialEndingEnv: (date) => `VIBECOMMIT_TOKEN ends ${date}. Replace its value before then.`,
     /**
      * 0.7.0. A `grants.json` that is present and unreadable denies capture for every clone that has a remote
      * (`consent.ts`'s `isCaptureAllowed`), and a hook cannot say so, so `status` does. The file name is the user's
@@ -2853,6 +2855,8 @@ export const SYSTEM_MESSAGE = {
     notConnected: (connectCommand) => `VibeCommit is installed but not connected. Run \`${connectCommand}\` to start capturing.`,
     /** State 1 when the channel's command would blow `credentialRejectedBudget` (a long plugin realpath). */
     notConnectedFallback: "VibeCommit is installed but not connected. Connect it: vibecommit.ai/install",
+    /** capture 0.17.6 B1 (P7 FINAL): state 1 when VIBECOMMIT_TOKEN holds a value that is not an ingest credential. No path, so no fallback. */
+    notConnectedEnvWrongClass: "VibeCommit can't upload: VIBECOMMIT_TOKEN is not a VibeCommit ingest credential. Correct its value, or unset it.",
     /**
      * State 2 — `11A`. House prefix kept, ONE line, and the cause is no longer named: the server's 401
      * body is opaque on purpose (it cannot say "revoked" vs "expired"), so "revoked" was a guess that
@@ -2863,6 +2867,8 @@ export const SYSTEM_MESSAGE = {
     credentialRejected: (authCommand) => `VibeCommit capture stopped: this machine's credential is no longer accepted. Run \`${authCommand}\`.`,
     /** State 2 when the channel's command would blow `CREDENTIAL_REJECTED_BUDGET` (a long plugin realpath). */
     credentialRejectedFallback: "VibeCommit capture stopped: this machine's credential is no longer accepted. Reconnect: vibecommit.ai/install",
+    /** capture 0.17.6 A1 (P7 FINAL): state 2 for a VIBECOMMIT_TOKEN credential. No path, so no fallback: the install page does not change a variable. */
+    credentialRejectedEnv: "VibeCommit capture stopped: VIBECOMMIT_TOKEN is no longer accepted. Replace its value, or unset it.",
     /** The ≤120-character budget style guide §10.1 gives a one-line state. */
     credentialRejectedBudget: 120,
     /**
@@ -2872,6 +2878,8 @@ export const SYSTEM_MESSAGE = {
      */
     credentialEnding: (date, authCommand) => `VibeCommit: this machine's credential ends ${date}. Run \`${authCommand}\` to renew it.`,
     credentialEndingFallback: (date) => `VibeCommit: this machine's credential ends ${date}. Renew it: vibecommit.ai/install`,
+    /** capture 0.17.6 A2 (P7 FINAL): state 5 for a VIBECOMMIT_TOKEN credential. No path, so no fallback. */
+    credentialEndingEnv: (date) => `VibeCommit: VIBECOMMIT_TOKEN ends ${date}. Replace its value before then.`,
     /** Templated on both versions — style guide §10.1 state 3. */
     unsupportedRuntime: (floor, running) => `VibeCommit needs Node ${floor} or newer; hooks are running on Node ${running}. Nothing is being captured.`,
     /**
