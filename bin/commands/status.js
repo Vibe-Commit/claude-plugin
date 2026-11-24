@@ -402,6 +402,7 @@ export function status(ctx, argv = [], sync = { kind: "skipped" }, route = null)
             fingerprint,
             nowMs,
             authCommand,
+            source: load.kind === "ok" ? load.credential.source : "file",
             colour: ctx.colour,
             standing: true,
         }));

@@ -49,8 +49,10 @@ export function credentialProblemBlock(load, authCommand = COMMANDS.auth) {
                 code: "STORED_CREDENTIAL_NOT_INGEST",
                 what: CREDENTIAL.wrongClassWhat,
                 why: [load.source === "env" ? CREDENTIAL.wrongClassEnvWhy : CREDENTIAL.wrongClassFileWhy],
-                fixLabel: CREDENTIAL.wrongClassFix,
-                fixes: [authCommand],
+                // capture 0.17.5 item 3 (P7 FINAL): the variable wins over any file `auth` writes, so its fix is the variable.
+                ...(load.source === "env"
+                    ? { fixLabel: CREDENTIAL.wrongClassEnvFix, fixes: [COMMANDS.unsetToken] }
+                    : { fixLabel: CREDENTIAL.wrongClassFix, fixes: [authCommand] }),
             };
         case "insecure-file": {
             // ONE code, several remedies: the folder's mode and the file's mode are different things to fix, and `chmod 600` on
@@ -150,8 +152,9 @@ export function rejectedCredentialBlock(input) {
                 ? REJECTED.whyExpired((expires ?? "").slice(0, 10))
                 : REJECTED.why,
         ],
-        fixLabel: REJECTED.fixLabel,
-        fixes: [input.authCommand],
+        ...(input.source === "env"
+            ? { fixLabel: REJECTED.fixLabelEnv, fixes: [COMMANDS.unsetToken] }
+            : { fixLabel: REJECTED.fixLabel, fixes: [input.authCommand] }),
     };
     // A standing stop `status` reports is a warning and carries no code; the verdict `connect` just got is
     // an error and does (`CREDENTIAL_REJECTED`, the same condition `finalize` and `backfill` stop on).

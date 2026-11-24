@@ -69,7 +69,8 @@ export async function connect(ctx, options = {}, deps = {}) {
             code: "SIGNIN_CODE_NEEDS_TTY",
             what: DEVICE.needsTerminalWhat,
             why: [DEVICE.needsTerminalWhy],
-            // T10 (plan 4.12): connect's own command, run in a terminal. `auth --device --stdin` is not connect's fix (A4).
+            // T10 (plan 4.12): connect's own command, run in a terminal. `auth --device --stdin` is not connect's fix (A4). 0.17.5: stays plain,
+            // a named residual (P6's (c)): this runs before `connectNamed` checks the names, so echoing them would print unchecked tokens.
             fixLabel: CONNECT.deviceNeedsTerminalFix,
             fixes: [channelCommand(ctx.env, ctx.selfPath, COMMANDS.connectDevice)],
         }, ctx.colour));
@@ -86,6 +87,8 @@ export async function connect(ctx, options = {}, deps = {}) {
                 `${RUNTIME.floorWhyPrefix} ${NODE_FLOOR_TEXT} ${RUNTIME.floorWhyMiddle} ${ctx.nodeVersion}.`,
             ],
             fixLabel: RUNTIME.floorFix,
+            // 0.17.5 (P6 ruling on 5b): stays plain `connect`, a named residual. This runs before `connectNamed` checks the names (below),
+            // so echoing them would print tokens no check has passed.
             fixes: [connectCommandFor(ctx.env, ctx.selfPath)],
         }, ctx.colour));
         return EXIT.failure;
@@ -124,7 +127,7 @@ export async function connect(ctx, options = {}, deps = {}) {
     // even when its common-dir consent survives, so it falls through to the disclosure, and only a yes below clears it.
     const slugOf = onceRepoSlug(keys.worktree);
     if (grantsUnreadable(ctx.home) && !isLocalSlug(slugOf())) {
-        writeLines(ctx.stderr, grantsUnreadableBlock(ctx));
+        writeLines(ctx.stderr, grantsUnreadableBlock(ctx, connectRerunOf(ctx, options)));
         return EXIT.failure;
     }
     if (isCaptureAllowed(ctx.home, keys, slugOf)) {
@@ -142,7 +145,7 @@ export async function connect(ctx, options = {}, deps = {}) {
         if (ctx.stdinIsTty && ctx.stdout.isTTY === true) {
             return await (await import("./connect_picker.js")).connectPicker(ctx, options, deps, { slug: slugOf(), toplevel: keys.worktree, kind: "repo" }, keys);
         }
-        return await coveredRepairs(ctx, keys, deps);
+        return await coveredRepairs(ctx, keys, deps, options);
     }
     if (!isLocalSlug(slugOf())) {
         return await (await import("./connect_picker.js")).connectPicker(ctx, options, deps, { slug: slugOf(), toplevel: keys.worktree, kind: "repo" }, keys);
@@ -173,7 +176,9 @@ export async function connect(ctx, options = {}, deps = {}) {
             why: [CONNECT.nonInteractiveWhy],
             // PR 6 item 6: names the folder the user is to run it in, cut from the LEFT to fit the line (§13.4).
             fixLabel: CONNECT.nonInteractiveFix(truncatePath(terminalSafe(tildePath(keys.worktree, ctx.home)), 46)),
-            fixes: [connectCommandFor(ctx.env, ctx.selfPath)],
+            // 0.17.5 (P6 ruling on 5b): the command as typed, as the same code's terminal-stdout refusal above prints it. No names reach this
+            // path (they returned through `connectNamed`), so the tokens are `[]`; the flags passed the shared check.
+            fixes: [connectRetryCommand(ctx.env, ctx.selfPath, [], options)],
         }, ctx.colour));
         return EXIT.usage;
     }
@@ -202,7 +207,7 @@ export async function connect(ctx, options = {}, deps = {}) {
     // nothing written — which keeps "Nothing was changed." true. The other order had already written `projects.json`.
     // A repo with no remote has no slug to exclude and is exempt from an unreadable file (`isCaptureAllowed`), so it skips this.
     if (!isLocalSlug(slugOf()) && clearExclusion(ctx.home, slugOf()) === "unreadable") {
-        writeLines(ctx.stderr, grantsUnreadableBlock(ctx));
+        writeLines(ctx.stderr, grantsUnreadableBlock(ctx, connectRerunOf(ctx, options)));
         return EXIT.failure;
     }
     grantProject(ctx.home, keys.consent, ctx.now());
@@ -281,7 +286,10 @@ function namedCommand(ctx, tokens, options) {
  * repo, (c) and (f) the agent hooks, each only where the predicate names one), then the credential probe. A sign-in that is needed
  * ((a), (e) or a 401) prints a block whose fix is `connect`, run in a terminal, and exits 3; it never names `auth` (3I). Otherwise 0.
  */
-async function coveredRepairs(ctx, keys, deps) {
+async function coveredRepairs(ctx, keys, deps, options) {
+    // 0.17.5 (P6 ruling on 5b, closing the class): every line here (the agent-hook fixes, the rejected and faulty blocks, the credential fix) reruns connect, so it is the command as typed (`connectRerunOf`); plain
+    // `connect` is byte-identical. It dropped `--no-backfill`, `--device`, `--agent` and `--no-color` (a rerun would backfill what was declined).
+    const connectCmd = connectRerunOf(ctx, options);
     let unauthorized = false;
     if (deps.account !== undefined) {
         const synced = await (await import("../grants_verb.js")).syncForVerb(ctx, false, deps.account);
@@ -305,19 +313,18 @@ async function coveredRepairs(ctx, keys, deps) {
         setupBeatStart(ctx, work);
         const commit = commitRepair ? installOneCommitHook(ctx, keys.worktree) : null;
         if (agentsToDo)
-            agentHookBeat(ctx, commit, work);
+            agentHookBeat(ctx, connectCmd, commit, work);
         else
             printSetupReport(ctx, { work, commit, rows: [], agentBlocks: [] });
     }
     else if (setup.kind === "unknown") {
         // `unknown` counts as a repair (4.4a): the full idempotent step; the installer refuses a file it could not read.
         setupBeatStart(ctx, true);
-        agentHookBeat(ctx, installOneCommitHook(ctx, keys.worktree), true);
+        agentHookBeat(ctx, connectCmd, installOneCommitHook(ctx, keys.worktree), true);
     }
-    const connectCmd = channelCommand(ctx.env, ctx.selfPath, COMMANDS.connect);
     const load = loadCredential({ env: ctx.env, home: ctx.home });
     if (unauthorized && load.kind === "ok") {
-        writeLines(ctx.stderr, rejectedCredentialBlock({ home: ctx.home, fingerprint: credentialFingerprint(load.credential), nowMs: ctx.now().getTime(), authCommand: connectCmd, colour: ctx.colour, standing: false }));
+        writeLines(ctx.stderr, rejectedCredentialBlock({ home: ctx.home, fingerprint: credentialFingerprint(load.credential), nowMs: ctx.now().getTime(), authCommand: connectCmd, source: load.credential.source, colour: ctx.colour, standing: false }));
         return EXIT.notConnected;
     }
     if (load.kind !== "ok" && load.kind !== "absent") {
@@ -332,7 +339,7 @@ async function coveredRepairs(ctx, keys, deps) {
     if (load.kind === "ok") {
         const probe = await probeCredential(ctx, load.credential, deps.fetch);
         if (probe.kind === "unauthorized") {
-            writeLines(ctx.stderr, rejectedCredentialBlock({ home: ctx.home, fingerprint: credentialFingerprint(load.credential), nowMs: ctx.now().getTime(), authCommand: connectCmd, colour: ctx.colour, standing: false }));
+            writeLines(ctx.stderr, rejectedCredentialBlock({ home: ctx.home, fingerprint: credentialFingerprint(load.credential), nowMs: ctx.now().getTime(), authCommand: connectCmd, source: load.credential.source, colour: ctx.colour, standing: false }));
             return EXIT.notConnected;
         }
     }
@@ -371,8 +378,9 @@ export function cancelled(ctx) {
 export function cancelledLines() {
     return ["", "", ...wrap(PICKER.cancelled, 2)];
 }
-export function grantsUnreadableBlock(ctx) {
-    return grantsUnreadableLines(ctx.colour, connectCommandFor(ctx.env, ctx.selfPath));
+/** 0.17.5 (P6's principle, closing 5b's class): a line this run prints to finish THIS run's work reruns connect as typed (`rerun`, `connectRerunOf`). */
+export function grantsUnreadableBlock(ctx, rerun) {
+    return grantsUnreadableLines(ctx.colour, rerun);
 }
 /** The GRANTS_UNREADABLE block (stderr), given the command the fix names. */
 export function grantsUnreadableLines(colour, connectCommand) {
@@ -403,19 +411,21 @@ pinned) {
     // request, so a sign-in that fails leaves them in place, and a hook run then returns the `not_connected` notice.
     // T8b (4.2): the one beat, the commit row and the agent rows, in one report.
     setupBeatStart(ctx, true);
-    agentHookBeat(ctx, installOneCommitHook(ctx, keys.worktree), true);
+    agentHookBeat(ctx, connectRerunOf(ctx, options), installOneCommitHook(ctx, keys.worktree), true);
     if (options.signIn === true) {
         // `G8a`: `verify` — a session file that loads but that the server refuses to renew is expired,
         // and "already signed in" over it was the bug.
         // 0.17.1 D1: the hooks are written, so a failed beat says what it left behind (`signInLeftBehind`), not "Nothing was changed".
         const code = await signInBeat(ctx, {
             retry: "sign-in",
+            // rv175-5: the `--sign-in` beat's failure reruns the command as typed (plain `connect --sign-in` is byte-identical).
+            typedFixes: [connectRerunOf(ctx, options)],
             verify: true,
             afterWrites: () => signInLeftBehind(ctx),
             ...(deps.fetch === undefined ? {} : { fetch: deps.fetch }),
         });
         if (code !== EXIT.ok) {
-            writeLines(ctx.stdout, localSetupLines(ctx));
+            writeLines(ctx.stdout, localSetupLines(ctx, connectRerunOf(ctx, options)));
             return code;
         }
     }
@@ -425,11 +435,12 @@ pinned) {
  * CR-PRB T9b-2b (4.4a): the `local:` path's ending says setup is unfinished when branch (a) holds after its sign-in failed. Empty
  * otherwise. The grant was just written, so the machine is on; `toplevels` is empty because the hooks were written before the sign-in.
  */
-function localSetupLines(ctx) {
+function localSetupLines(ctx, rerun) {
     const finding = setupState({ home: ctx.home, env: ctx.env, selfPath: ctx.selfPath, grantsOn: true, toplevels: [], syncUnauthorized: false });
     if (finding.kind !== "checked" || !finding.noCredential)
         return [];
-    return ["", ...wrap(PICKER.endingUnfinished(channelCommand(ctx.env, ctx.selfPath, COMMANDS.connect)), 2)];
+    // 0.17.5 (P6's principle, closing 5b's class): a line this run prints to finish THIS run's work reruns connect as typed (`rerun`).
+    return ["", ...wrap(PICKER.endingUnfinished(rerun), 2)];
 }
 /**
  * The disclosure block — `CR-111d`, style guide §10.2 transcribed.
@@ -495,7 +506,7 @@ export function disclosure(ctx, picker) {
 async function credentialBeat(ctx, keys, deps, options = {}, addedNow = false, pinned) {
     const got = await obtainCredential(ctx, deps, options);
     if (got.kind === "exit") {
-        writeLines(ctx.stdout, localSetupLines(ctx));
+        writeLines(ctx.stdout, localSetupLines(ctx, connectRerunOf(ctx, options)));
         return got.code;
     }
     return await captureBeat(ctx, keys, got.credential, got.unconfirmed, options, addedNow, pinned);
@@ -524,7 +535,9 @@ export async function obtainCredential(ctx, deps, options = {}, scope) {
                 home: ctx.home,
                 fingerprint: credentialFingerprint(load.credential),
                 nowMs: ctx.now().getTime(),
-                authCommand: envTokenSet(ctx) ? authCommandFor(ctx.env, ctx.selfPath) : connectCommandOf(ctx),
+                // 0.17.5 (P6 ruling on 5b, closing the class): the file's fix is connect as typed, as :790's faulty file is; the env arm keeps A2's.
+                authCommand: envTokenSet(ctx) ? authCommandFor(ctx.env, ctx.selfPath) : connectRerunOf(ctx, options),
+                source: load.credential.source,
                 colour: ctx.colour,
                 standing: false,
             }));
@@ -547,7 +560,7 @@ export async function obtainCredential(ctx, deps, options = {}, scope) {
         const minted = await deps.browser(ctx, "connect", {
             device: options.device === true,
             ...(scope === undefined ? {} : { scope }),
-            connectPath: { rerun: connectCommandOf(ctx), replacing: false, grantsWritten: grantsWritten(ctx) },
+            connectPath: { rerun: connectRerunOf(ctx, options), deviceRerun: connectRerunOf(ctx, { ...options, device: true }), replacing: false, grantsWritten: grantsWritten(ctx) },
         });
         if (minted.kind === "saved") {
             savedBlock(ctx, minted.notes ?? []);
@@ -567,7 +580,8 @@ export async function obtainCredential(ctx, deps, options = {}, scope) {
     if (load.kind !== "absent") {
         const browser = inlineBrowser(ctx, deps);
         if (envTokenSet(ctx) || browser === null || !replaceableInline(load)) {
-            writeLines(ctx.stderr, credentialProblem(load, ctx.colour, envTokenSet(ctx) ? authCommandFor(ctx.env, ctx.selfPath) : connectCommandOf(ctx)));
+            // 0.17.5 (P6 ruling on 5b): connect's re-run as typed (`connectRerunOf`; the names were checked before any credential is read).
+            writeLines(ctx.stderr, credentialProblem(load, ctx.colour, envTokenSet(ctx) ? authCommandFor(ctx.env, ctx.selfPath) : connectRerunOf(ctx, options)));
             return { kind: "exit", code: EXIT.notConnected };
         }
         const { fixLabel: _fixLabel, fixes: _fixes, ...faultWithoutFix } = credentialProblemBlock(load, connectCommandOf(ctx));
@@ -576,7 +590,7 @@ export async function obtainCredential(ctx, deps, options = {}, scope) {
         return await replaceInline(ctx, browser, options, scope);
     }
     // A machine with no credential and no inline sign-in (no terminal, or no browser): nothing was tried, so the block names connect.
-    signInFailedBlock(ctx);
+    signInFailedBlock(ctx, options);
     return { kind: "exit", code: EXIT.notConnected };
 }
 /**
@@ -608,6 +622,14 @@ function connectCommandOf(ctx) {
     return channelCommand(ctx.env, ctx.selfPath, COMMANDS.connect);
 }
 /**
+ * 0.17.5 item 5b (P6 scope): the re-run a sign-in on connect's path prints, as typed: the names and every accepted argument
+ * (`connectRetryCommand`, the CONSENT_NEEDS_TTY and names refusals' builder). It printed plain `connect`, which drops `--device` (on a
+ * desktop that takes the browser route, not the code sign-in that failed), the names and `--no-backfill`.
+ */
+export function connectRerunOf(ctx, options) {
+    return connectRetryCommand(ctx.env, ctx.selfPath, options.names ?? [], options);
+}
+/**
  * T10 (plan 4.12): the inline mint over a 401'd or faulty file. It passes connect's path, so the replace question is ALWAYS asked (`replacing`)
  * and the re-run line is connect's. `grantsWritten` is computed at the call (`grantsWritten`), and `writeAhead` records the new credential
  * for revoking the moment it is handed over (Amendment 1).
@@ -620,7 +642,13 @@ async function replaceInline(ctx, browser, options, scope) {
     const minted = await browser(ctx, "connect", {
         device: options.device === true,
         ...(scope === undefined ? {} : { scope }),
-        connectPath: { rerun: connectCommandOf(ctx), replacing: true, grantsWritten: grantsWritten(ctx), writeAhead: written.hold },
+        connectPath: {
+            rerun: connectRerunOf(ctx, options),
+            deviceRerun: connectRerunOf(ctx, { ...options, device: true }),
+            replacing: true,
+            grantsWritten: grantsWritten(ctx),
+            writeAhead: written.hold,
+        },
     });
     if (minted.kind === "saved") {
         savedBlock(ctx, minted.notes ?? []);
@@ -631,7 +659,7 @@ async function replaceInline(ctx, browser, options, scope) {
         return { kind: "exit", code: EXIT.failure };
     // Amendment 1: the write-ahead row could not be written, so the new credential was revoked in memory and nothing was saved.
     if (minted.kind === "unrecorded") {
-        printUnrecorded(ctx, written.refusal(), minted.revoked, { rerun: connectCommandOf(ctx), which: "replace" });
+        printUnrecorded(ctx, written.refusal(), minted.revoked, { rerun: connectRerunOf(ctx, options), which: "replace" });
         return { kind: "exit", code: EXIT.notConnected };
     }
     // T10 (F-A3): a failed sign-in printed its own block (the SIGNIN error, or the mint's DX-7 block). Print nothing more.
@@ -642,14 +670,17 @@ async function replaceInline(ctx, browser, options, scope) {
  * sign-in that was tried and failed, the browser's own block is the only one (F-A3). It states the saved choices only when there are some,
  * and names connect (it resumes, D-SIGNIN) and `connect --device` (no browser here). `auth` is not named.
  */
-function signInFailedBlock(ctx) {
+function signInFailedBlock(ctx, options) {
+    // 0.17.5 (P6's principle, closing 5b's class): both lines rerun this run, so connect as typed and its `--device` form, once.
+    const rerun = connectRerunOf(ctx, options);
+    const device = connectRerunOf(ctx, { ...options, device: true });
     writeLines(ctx.stderr, renderErrorBlock({
         kind: "warn",
         what: CONNECT.credentialNeededWhat,
         // Gated (F-A3): the saved-choices line only when a grant this run relies on exists; otherwise today's line.
         why: [grantsWritten(ctx) ? AUTH.savedChoicesWhy : CONNECT.credentialNeededWhy],
         fixLabel: CONNECT.signInFailedFix,
-        fixes: [COMMANDS.connect, COMMANDS.connectDevice].map((fix) => channelCommand(ctx.env, ctx.selfPath, fix)),
+        fixes: device === rerun ? [rerun] : [rerun, device],
     }, ctx.colour));
 }
 /**
@@ -940,7 +971,7 @@ export function holdTail(ctx, unconfirmed) {
  * into a file shared by every project — the one new responsibility `CR-195`
  * names — so "we configured your editor" is the shape this must not take.
  */
-export function agentHookBeat(ctx, commit = null, work = true) {
+export function agentHookBeat(ctx, rerun, commit = null, work = true) {
     const outcomes = installAgentHooks(ctx.home, ctx.env, ctx.selfPath);
     const rows = [];
     const blocks = [];
@@ -959,8 +990,9 @@ export function agentHookBeat(ctx, commit = null, work = true) {
             const path = truncatePath(terminalSafe(outcome.path), 56);
             // ⛔ EVERY FAILURE PRINTS ITS FIX (DX-13): a refusal gets the `refused` fix, a failed write gets the permissions fix.
             const fix = refused
-                ? { label: AGENT_HOOKS.refusedFixLabel, lines: [AGENT_HOOKS.refusedFix(path, connectCommandFor(ctx.env, ctx.selfPath))] }
-                : { label: AGENT_HOOKS.refusedFixLabel, lines: [AGENT_HOOKS.failedFix(connectCommandFor(ctx.env, ctx.selfPath))] };
+                // 0.17.5 (P6's principle, closing 5b's class): a line this run prints to finish THIS run's work reruns connect as typed (`rerun`): a dropped `--agent=` would also install the other agents' hooks.
+                ? { label: AGENT_HOOKS.refusedFixLabel, lines: [AGENT_HOOKS.refusedFix(path, rerun)] }
+                : { label: AGENT_HOOKS.refusedFixLabel, lines: [AGENT_HOOKS.failedFix(rerun)] };
             blocks.push([
                 "",
                 ...renderErrorBlock({

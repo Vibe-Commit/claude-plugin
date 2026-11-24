@@ -35,10 +35,11 @@
  *   than extending it).
  * - Read anywhere but the agent's own transcript root (`admitsTranscript`, the same confinement as a hook).
  */
+import { rerunLine } from "../args.js";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_AGENT_ID, admitsTranscript, transcriptRoots } from "../agents/registry.js";
-import { BACKFILL, COMMANDS, CREDENTIAL, ERRORS, FINALIZE, relativeAge } from "../copy/index.js";
+import { BACKFILL, COMMANDS, CREDENTIAL, ERRORS, FINALIZE, REJECTED, relativeAge } from "../copy/index.js";
 import { renderVerbHelp } from "../verb_help.js";
 import { grantsUnreadable, hasAnyConsent, isCaptureAllowed, normalizeSlug, unreadableGrantsDeny } from "../consent.js";
 import { authCommandFor, channelCommand, connectCommandFor } from "../install.js";
@@ -376,6 +377,11 @@ async function finalizeBody(ctx, argv, releases) {
         return EXIT.failure;
     };
     /** U5b: a recorded firing could not be replayed, so NOTHING is sealed: the firings after it still owe their pending lines. */
+    // capture 0.17.5 A2 (P7 FINAL; P6: L26 allows it): a rejected VIBECOMMIT_TOKEN is fixed by the variable, never by `auth` (whose file the
+    // variable shadows). `envCredentialToken` is the predicate `loadCredential` itself chooses the variable by.
+    const rejectedFix = () => envCredentialToken(ctx.env) !== null
+        ? { fixLabel: REJECTED.fixLabelEnv, fixes: [COMMANDS.unsetToken] }
+        : { fixLabel: FINALIZE.credentialStoppedFix, fixes: [authCommandFor(ctx.env, ctx.selfPath)] };
     const replayStoppedBlock = (step) => {
         if (step.kind === "fatal" && step.why === "rejected") {
             writeLines(ctx.stderr, renderErrorBlock({
@@ -383,8 +389,7 @@ async function finalizeBody(ctx, argv, releases) {
                 code: "CREDENTIAL_REJECTED",
                 what: FINALIZE.credentialStopped,
                 why: [],
-                fixLabel: FINALIZE.credentialStoppedFix,
-                fixes: [authCommandFor(ctx.env, ctx.selfPath)],
+                ...rejectedFix(),
             }, ctx.colour));
             return EXIT.failure;
         }
@@ -435,13 +440,17 @@ async function finalizeBody(ctx, argv, releases) {
                 return EXIT.notConnected;
             }
             if (grantsUnreadable(ctx.home) && unreadableGrantsDeny(normalizeSlug(slugOf()))) {
+                const finalizeVerb = "finalize"; // an identifier, not a literal, at the writer (`copy-inline-literals`)
                 writeLines(ctx.stderr, renderErrorBlock({
                     kind: "bad",
                     code: "GRANTS_UNREADABLE",
                     what: FINALIZE.grantsUnreadableWhat,
                     why: [FINALIZE.grantsUnreadableWhy],
                     fixLabel: BACKFILL.grantsUnreadableFixLabel,
-                    fixes: [channelCommand(ctx.env, ctx.selfPath, COMMANDS.finalize)],
+                    // 0.17.5 item 5e (P6 scope): the command as typed, its target and `--force` included (`rerunLine`). Plain `finalize` picks
+                    // its own session, so after `--session S` it could close a different one. `--session <id>` when a typed token is not shell-safe
+                    // (the session id is not checked yet here).
+                    fixes: [channelCommand(ctx.env, ctx.selfPath, rerunLine(finalizeVerb, argv, FINALIZE.commandSessionAny))],
                 }, ctx.colour));
                 return EXIT.notConnected;
             }
@@ -684,8 +693,7 @@ async function finalizeBody(ctx, argv, releases) {
             code: "CREDENTIAL_REJECTED",
             what: FINALIZE.credentialStopped,
             why: [],
-            fixLabel: FINALIZE.credentialStoppedFix,
-            fixes: [authCommandFor(ctx.env, ctx.selfPath)],
+            ...rejectedFix(),
         }, ctx.colour));
         return EXIT.failure;
     }

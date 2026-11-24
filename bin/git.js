@@ -313,6 +313,33 @@ export function gitProbe(dir, args) {
     }
 }
 /**
+ * 0.17.5 item 1 / Q1.4 (P6 scope): git's exit status, where the status IS the answer: 0, 1, or null for anything else (another exit
+ * code, a spawn error, a signal, the spawn budget or the five-second bound). `gitProbe` folds 1 and a timeout into one null, so a
+ * `merge-base` that timed out read as "not an ancestor" and deflated the rate.
+ */
+export function gitStatus(dir, args) {
+    const timeout = spawnTimeoutMs(GIT_TIMEOUT_MS);
+    if (timeout === null)
+        return null;
+    try {
+        execFileSync("git", ["-C", dir, ...args], { stdio: ["ignore", "ignore", "ignore"], timeout });
+        return 0;
+    }
+    catch (error) {
+        const failed = error;
+        return failed.status === 1 && (failed.signal ?? null) === null ? 1 : null;
+    }
+}
+/**
+ * 0.17.5 item 1: does `ref` name exactly one commit? A range (`HEAD~1..HEAD`) passes `git log` and fails this. rv175-P1 (P6): three
+ * answers, through `gitStatus`: true, false (git said no: exit 1, measured for a range on git 2.39.5), or null (git did not answer: a
+ * timeout, an error), so a git failure is not reported as a ref that names no single commit.
+ */
+export function resolvesToCommit(dir, ref) {
+    const status = gitStatus(dir, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]);
+    return status === 0 ? true : status === 1 ? false : null;
+}
+/**
  * Is this a shallow clone?
  *
  * ⚠ **LOAD-BEARING RATHER THAN DEFENSIVE** (D67's posture), and it is the same
@@ -346,8 +373,12 @@ export function isShallowClone(dir) {
  * caller is handed `null` for "unknown" and must decide, and `report` refuses.
  */
 export function isReachable(dir, sha, ref) {
-    // `--quiet` so the exit code is the whole answer and nothing reaches stdout.
-    if (gitProbe(dir, ["merge-base", "--is-ancestor", sha, ref]) !== null)
+    // 0.17.5 item 1 + Q1.4 (P6 scope): three answers the caller tells apart. `"absent"`: the sha is not in this clone (the list is
+    // repository-wide, so this is the ordinary case; the caller's fix is `git fetch`). `false`: ONLY when `merge-base` itself exited 1 for a
+    // sha that is here, against a ref that names one commit. `null`: git did not answer (a timeout, an error), so the caller refuses.
+    // Measured (git 2.39.5): `merge-base --is-ancestor` exits 0 / 1, and 128 for an absent sha or a range; `cat-file -e <sha>` exits 0 / 1.
+    const ancestor = gitStatus(dir, ["merge-base", "--is-ancestor", sha, ref]);
+    if (ancestor === 0)
         return true;
     // ⚠ A REFUSAL AND A NEGATIVE ARE DIFFERENT ANSWERS. If `ref` does not resolve,
     // or the sha is not in this clone at all, the question was never asked — so
@@ -358,9 +389,14 @@ export function isReachable(dir, sha, ref) {
     // `/(?:from|import)\s*\(?\s*"([^"]+)"/`, so ordinary prose can read as an
     // import specifier escaping the package. `why.ts` carries the same warning.
     // This comment cost one red run to learn, in the direction that is safe.
-    if (gitProbe(dir, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]) === null)
+    if (resolvesToCommit(dir, ref) !== true)
         return null;
-    return gitProbe(dir, ["cat-file", "-e", `${sha}^{commit}`]) === null ? null : false;
+    const present = gitStatus(dir, ["cat-file", "-e", sha]);
+    if (present === 1)
+        return "absent";
+    if (present === null)
+        return null;
+    return ancestor === 1 ? false : null;
 }
 /**
  * The `git patch-id` of one commit — the CLIENT-ASSERTED half of a successor

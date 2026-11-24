@@ -169,25 +169,46 @@ export function readFault(error, path) {
         return { kind: "unreadable", path, cause: "not-a-file" };
     return { kind: "unreadable", path, cause: "read-failed", code };
 }
-/**
- * T10 (B4, plan 4.12 and ENG-15): is `~/.vibecommit` writable? `finishMint` saves AFTER the server has created the credential, so an
- * unwritable folder would leave a live credential that was never saved. This is checked before any mint or browser open. A folder that does not exist yet is checked at its nearest existing ancestor, which is
- * where it will be created.
- */
 export function credentialFolderWritable(home) {
-    let target = rootDir(home);
+    const root = rootDir(home);
+    // rv175-7 (P6; 5c (iii)'s block, P7 confirmed): something at the path that `existsSync` does not see, but `lstat` does, is a link to
+    // nothing. The walk below would take it as absent and pass a writable HOME, then `mkdir` and the save both fail with ENOENT: on `auth`,
+    // which writes no row ahead of the mint, after the credential was created (measured at 16c20ea: one mint, then ENOENT out of finishMint).
+    if (!existsSync(root)) {
+        let linked = false;
+        try {
+            linked = lstatSync(root).isSymbolicLink();
+        }
+        catch {
+            // ENOENT: nothing there at all, the ordinary first sign-in.
+        }
+        if (linked)
+            return { kind: "not-a-folder", path: root };
+    }
+    let target = root;
     while (!existsSync(target)) {
         const parent = dirname(target);
         if (parent === target)
             break;
         target = parent;
     }
+    if (target === root) {
+        let folder = true;
+        try {
+            folder = statSync(root).isDirectory();
+        }
+        catch {
+            // Gone between the two calls: the access check below refuses it as unwritable, as before.
+        }
+        if (!folder)
+            return { kind: "not-a-folder", path: root };
+    }
     try {
         accessSync(target, fsConstants.W_OK | fsConstants.X_OK);
         return { kind: "ok" };
     }
     catch {
-        return { kind: "unwritable", path: rootDir(home) };
+        return target === root ? { kind: "unwritable", path: root } : { kind: "uncreatable", path: target };
     }
 }
 /**

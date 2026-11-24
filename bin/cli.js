@@ -29,7 +29,7 @@ import { homedir } from "node:os";
 import { createInterface } from "node:readline/promises";
 import { Writable } from "node:stream";
 import { DIALECTS, resolveAgentId } from "./agents/registry.js";
-import { checkArgs, isCheckedVerb, isShellSafeToken, orList, redactCredential } from "./args.js";
+import { checkArgs, isCheckedVerb, orList, redactCredential, typedLine } from "./args.js";
 import { auth } from "./commands/auth.js";
 import { browserCredential } from "./commands/browser_credential.js";
 import { updateNudge } from "./update_nudge.js";
@@ -41,7 +41,7 @@ import { backfill, backfillForConnect } from "./commands/backfill.js";
 import { scan } from "./commands/scan.js";
 import { why } from "./commands/why.js";
 import { defaultTempRoots } from "./temp_roots.js";
-import { ARGS, AUTH, HELP, INTERNAL, USAGE } from "./copy/index.js";
+import { ARGS, AUTH, COMMANDS, HELP, INTERNAL, USAGE } from "./copy/index.js";
 import { INGEST_TOKEN_PREFIX } from "./credential.js";
 import { EXIT } from "./exit.js";
 import { authCommandFor, channelCommand, installChannel } from "./install.js";
@@ -205,7 +205,7 @@ function credentialRefusal(argv) {
         what: AUTH.argvWhat,
         why: [AUTH.argvWhy],
         fixLabel: AUTH.argvFix,
-        fixes: [channelCommand(process.env, self, AUTH.argvFixPrompt), AUTH.argvFixStdin(authCommandFor(process.env, self))],
+        fixes: [channelCommand(process.env, self, COMMANDS.authPaste), AUTH.argvFixStdin(authCommandFor(process.env, self))],
     });
 }
 /**
@@ -219,8 +219,7 @@ function correctedLine(verb, index, suggestion, argv, agentIds) {
     const args = argv.slice(1).map((token, i) => (i === index ? suggestion : token));
     if (checkArgs(verb, args, agentIds) !== null)
         return null;
-    const tokens = ["vibecommit", verb, ...args];
-    return tokens.every(isShellSafeToken) ? tokens.join(" ") : null;
+    return typedLine(verb, args);
 }
 /**
  * T22a, D-ARGS, DX-2: the refusal block for the shared check. The `what` names the token (cut at 40, `--flag=…` without its value).

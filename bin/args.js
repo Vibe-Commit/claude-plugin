@@ -117,7 +117,27 @@ export function redactCredential(text) {
  */
 const SHELL_SAFE_TOKEN = /^[A-Za-z0-9._/:=@+,-]+$/;
 export function isShellSafeToken(token) {
-    return SHELL_SAFE_TOKEN.test(token);
+    // 0.17.5 rv175-6: a leading `=` is not safe: zsh's EQUALS option (on by default) expands `=cmd` to that command's path.
+    // 0.17.5 rv175-1: a token holding the credential prefix is never printed in a command. Raw it would echo a credential, and redacted
+    // (`vcik_…`) it is not a command anyone can run, so the caller's fallback prints instead.
+    return SHELL_SAFE_TOKEN.test(token) && !token.startsWith("=") && !token.includes(INGEST_TOKEN_PREFIX);
+}
+/**
+ * 0.17.5 item 4 (P6 scope): `vibecommit <verb> <args…>` when every token is shell-safe, else null. The ONE predicate a printed command
+ * uses: `cli.ts` `correctedLine` (did-you-mean, lifted from it) and the rerun lines of `why`, `report` and `finalize`, so they cannot drift.
+ */
+export function typedLine(verb, args) {
+    const tokens = ["vibecommit", verb, ...args];
+    return tokens.every(isShellSafeToken) ? tokens.join(" ") : null;
+}
+/**
+ * A rerun line: the command as typed (`typedLine`), with any credential-shaped token redacted as `cli.ts` does for its corrected line
+ * (`main()` refuses those before any verb runs, so this costs nothing), or `fallback` when a token is not shell-safe.
+ */
+export function rerunLine(verb, args, fallback) {
+    // `typedLine` refuses a token holding the prefix (rv175-1), so the redaction can never fire here; it stays as `cli.ts` keeps its own.
+    const line = typedLine(verb, args);
+    return line === null ? fallback : redactCredential(line);
 }
 /** The text a refusal names: the token with any credential redacted, cut at `SHOWN_LENGTH`, and for `--flag=value` only `--flag=…`. */
 export function shownToken(token) {

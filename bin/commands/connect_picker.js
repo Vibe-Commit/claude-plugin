@@ -35,7 +35,7 @@ import { paint, renderErrorBlock, tildePath, truncatePath, wrap } from "../term.
 import { terminalSafe } from "../printable.js";
 import { signInBeat } from "./browser_credential.js";
 import { accountChange, accountNoteLines, changeOps, commitG, joiningMachine, lastAccountState, mintForG, settleG, splitAccountExclusions, } from "./connect_account.js";
-import { agentHookBeat, printSetupReport, setupBeatStart, askOrCancel, cancelledLines, disclosure, grantsUnreadableLines, holdLines, holdTail, obtainCredential, pinTestTranscript, sendTestCapture, tail, signInLeftBehind, } from "./connect.js";
+import { agentHookBeat, printSetupReport, setupBeatStart, askOrCancel, cancelledLines, disclosure, grantsUnreadableLines, holdLines, holdTail, obtainCredential, pinTestTranscript, sendTestCapture, tail, connectRerunOf, signInLeftBehind, } from "./connect.js";
 import { writeLines } from "./context.js";
 import { connectRetryCommand } from "./connect_retry.js";
 import { replaceableInline } from "./credential_problem.js";
@@ -62,7 +62,7 @@ names = null) {
         return await connectPickerRun(ctx, options, deps, here, keys, g, names);
     }
     finally {
-        await settleG(ctx, deps, g);
+        await settleG(ctx, deps, g, connectRerunOf(ctx, options));
     }
 }
 /**
@@ -220,8 +220,11 @@ async function connectPickerRun(ctx, options, deps, here, keys, g, names) {
             return out.then.tail === "holdTail" ? holdTail(ctx, out.then.unconfirmed) : tail(ctx, out.then.unconfirmed);
         return settle(out);
     };
+    // 0.17.5 (P6's principle, closing 5b's class): a line this run prints to finish THIS run's work reruns connect as typed (`rerun`):
+    // the grants-unreadable and no-terminal endings, the endings that print a command, the g lines, the hook fixes, the 401 sync line.
+    const rerun = connectRerunOf(ctx, options);
     if (grantsUnreadable(ctx.home))
-        return end(connectEnding({ kind: "grantsUnreadable", colour: ctx.colour, connectCommand: connectCommandFor(ctx.env, ctx.selfPath) }));
+        return end(connectEnding({ kind: "grantsUnreadable", colour: ctx.colour, connectCommand: rerun }));
     // ENG-31 (CR-PRB T13b): a terminal stdin with a PIPED stdout refuses before the disclosure, the scan and any question (plan 4.5). The
     // typed prompt is no longer the fallback for it. A piped stdin, whatever stdout is, keeps the stdin refusal below, as before.
     if (ctx.stdinIsTty && ctx.stdout.isTTY !== true) {
@@ -238,7 +241,7 @@ async function connectPickerRun(ctx, options, deps, here, keys, g, names) {
             colour: ctx.colour,
             disclosure: disclosure(ctx, true),
             repoPath: here !== null && here.kind === "repo" ? truncatePath(terminalSafe(tildePath(here.toplevel, ctx.home)), 46) : null,
-            connectCommand: connectCommandFor(ctx.env, ctx.selfPath),
+            connectCommand: rerun,
         }));
     }
     // D17: one static beat line, overwritten once with `done` on a terminal. `ctx.colour` is false with no terminal and under
@@ -308,7 +311,7 @@ async function connectPickerRun(ctx, options, deps, here, keys, g, names) {
     if (names === null) {
         const choice = checklistChoice(ctx, options, model);
         if (choice.kind === "typed" && choice.why !== null)
-            writeLines(ctx.stdout, switchLines(ctx, choice.why));
+            writeLines(ctx.stdout, switchLines(ctx, choice.why, rerun));
     }
     let pick = names !== null ? pickFromNames(ctx, model, names) : await choose(ctx, options, deps, model, offerAccount, shown, finishes);
     /** The grant block's heading and the repos `g` named, when the list is the account's own. */
@@ -327,7 +330,7 @@ async function connectPickerRun(ctx, options, deps, here, keys, g, names) {
             // that ends with nothing granted revokes it (`settleG`).
             writeLines(ctx.stdout, [
                 "",
-                ...wrap(minted.snapshot === null ? PICKER.gUnavailable(connectCommandFor(ctx.env, ctx.selfPath)) : PICKER.gEmpty, 2),
+                ...wrap(minted.snapshot === null ? PICKER.gUnavailable(rerun) : PICKER.gEmpty, 2),
                 "",
             ]);
             pick = await choose(ctx, options, deps, model, false, shown, finishes);
@@ -349,7 +352,7 @@ async function connectPickerRun(ctx, options, deps, here, keys, g, names) {
             summary: on.kind === "on" ? machineSummary(on) : null,
             holdsCredential: g.credential !== null,
             setup: setupNote(setup),
-            connectCommand: connectCommandFor(ctx.env, ctx.selfPath),
+            connectCommand: rerun,
             faultyFile,
         }));
     }
@@ -366,7 +369,7 @@ async function connectPickerRun(ctx, options, deps, here, keys, g, names) {
         return end(connectEnding({
             kind: "nothingChosen",
             summary: on.kind === "on" ? machineSummary(on) : null,
-            connectCommand: connectCommandFor(ctx.env, ctx.selfPath),
+            connectCommand: rerun,
             holdsCredential: g.credential !== null,
         }));
     }
@@ -411,7 +414,7 @@ async function connectPickerRun(ctx, options, deps, here, keys, g, names) {
                     kind: "declined",
                     holdsCredential: g.credential !== null,
                     setupUnfinished: setupNote(setup) === "unfinished",
-                    connectCommand: connectCommandFor(ctx.env, ctx.selfPath),
+                    connectCommand: rerun,
                 }));
             }
             // ⛔ 3E (plan 4.8): a No still writes the STOPS, and writes none of the adds. A stop is a decision the person made, and it is
@@ -422,14 +425,14 @@ async function connectPickerRun(ctx, options, deps, here, keys, g, names) {
             catch (error) {
                 if (!(error instanceof GrantsUnreadableError))
                     throw error;
-                return end(connectEnding({ kind: "grantsUnreadable", colour: ctx.colour, connectCommand: connectCommandFor(ctx.env, ctx.selfPath) }));
+                return end(connectEnding({ kind: "grantsUnreadable", colour: ctx.colour, connectCommand: rerun }));
             }
             const out = stoppedOnEnding({
                 kind: "stoppedOnNo",
                 names: stopNames(change, folderLabels(model)),
                 holdsCredential: g.credential !== null,
                 setupUnfinished: setupNote(setup) === "unfinished",
-                connectCommand: connectCommandFor(ctx.env, ctx.selfPath),
+                connectCommand: rerun,
             });
             print(out);
             if (queueOps && credentialAtStart)
@@ -445,7 +448,7 @@ async function connectPickerRun(ctx, options, deps, here, keys, g, names) {
             if (!(error instanceof GrantsUnreadableError))
                 throw error;
             // Raced with an edit of `grants.json` since the check above. Nothing was written. (No `g.end`: the `finally` revokes a held one.)
-            return end(connectEnding({ kind: "grantsUnreadable", colour: ctx.colour, connectCommand: connectCommandFor(ctx.env, ctx.selfPath) }));
+            return end(connectEnding({ kind: "grantsUnreadable", colour: ctx.colour, connectCommand: rerun }));
         }
         if (!hasAdditions(change)) {
             const stoppedFolders = (change.stopFolders ?? []).length > 0;
@@ -456,7 +459,7 @@ async function connectPickerRun(ctx, options, deps, here, keys, g, names) {
                 stoppedRepos,
                 holdsCredential: g.credential !== null,
                 setupUnfinished: setupNote(setup) === "unfinished",
-                connectCommand: connectCommandFor(ctx.env, ctx.selfPath),
+                connectCommand: rerun,
             });
             print(out);
             // Removals reach the account too; nothing more to say about it.
@@ -491,9 +494,9 @@ async function connectPickerRun(ctx, options, deps, here, keys, g, names) {
         const agentsToDo = setup.agents.length > 0 || setup.noAgentHooks;
         const work = repairs.length > 0 || agentsToDo;
         setupBeatStart(ctx, work);
-        const commit = repairs.length > 0 ? installCommitHooksForReport(ctx, repairs) : null;
+        const commit = repairs.length > 0 ? installCommitHooksForReport(ctx, repairs, rerun) : null;
         if (agentsToDo)
-            working = agentHookBeat(ctx, commit, work);
+            working = agentHookBeat(ctx, rerun, commit, work);
         else
             printSetupReport(ctx, { work, commit, rows: [], agentBlocks: [] });
     }
@@ -501,14 +504,16 @@ async function connectPickerRun(ctx, options, deps, here, keys, g, names) {
         // T8b (4.2): the one beat and the one report, for the clones this run offers and the agents on this machine.
         const work = clones.length > 0 || agentHookVerdicts(ctx.home, ctx.env, ctx.selfPath).length > 0;
         setupBeatStart(ctx, work);
-        const commit = clones.length > 0 ? installCommitHooksForReport(ctx, clones) : null;
-        working = agentHookBeat(ctx, commit, work);
+        const commit = clones.length > 0 ? installCommitHooksForReport(ctx, clones, rerun) : null;
+        working = agentHookBeat(ctx, rerun, commit, work);
     }
     if (options.signIn === true) {
         // 0.17.1 D1: the grants and hooks are written, so a failed beat says what it left behind (`signInLeftBehind`): the signInFailed ending
         // prints nothing after the block, so the block is the only place the user learns that this run's writes stand.
         const code = await signInBeat(ctx, {
             retry: "sign-in",
+            // rv175-5: the `--sign-in` beat's failure reruns the command as typed (plain `connect --sign-in` is byte-identical).
+            typedFixes: [connectRerunOf(ctx, options)],
             verify: true,
             afterWrites: () => signInLeftBehind(ctx),
             ...(deps.fetch === undefined ? {} : { fetch: deps.fetch }),
@@ -566,7 +571,7 @@ async function connectPickerRun(ctx, options, deps, here, keys, g, names) {
     // T8b (ENG-2, 4.13): when the joining question added clones, a second, shorter report with only the commit-hooks row.
     if (joinedClones.length > 0) {
         setupBeatStart(ctx, true);
-        printSetupReport(ctx, { work: true, commit: installCommitHooksForReport(ctx, joinedClones), rows: [], agentBlocks: [] });
+        printSetupReport(ctx, { work: true, commit: installCommitHooksForReport(ctx, joinedClones, rerun), rows: [], agentBlocks: [] });
     }
     // ⛔ IN A REPO, THE TEST CAPTURE RUNS BEFORE "Capture is on" (VQ item 7, adopting VT). 0.6.0's payoff was evidence — this
     // session, recorded, with a link. So: hooks (L11), then the probe inside ONE hook budget (the same call the `local:` path
@@ -591,7 +596,7 @@ async function connectPickerRun(ctx, options, deps, here, keys, g, names) {
     // "Capture is on for  on this machine.". A check withheld because consent was withdrawn while sign-in waited prints no block.
     // ⛔ Codex rvprb3 F3 (P6 ruling): the account-sync notes print whether or not the block does. Inside the block they sit where they always
     // did (byte-identical output); with no block they print alone at the same point. One copy of the note lines, built once here.
-    const untold = accountNoteLines(ctx, accountSync);
+    const untold = accountNoteLines(ctx, accountSync, rerun);
     if (machineCapture(ctx.home).kind === "on") {
         // ⛔ #6: a joined repo's clone (its hooks were just installed above) counts: "no clone of it is here yet" would be false.
         // ⛔ Codex rvprb3 F5: "No clone of it is here yet" only when no clone here exists. A clone here that this change adds and the deny lists refuse
@@ -754,11 +759,12 @@ function checklistChoice(ctx, options, model) {
     return { kind: "checklist" };
 }
 /** The two muted lines that explain the switch (4.5), wrapped at the window's known width. */
-function switchLines(ctx, why) {
+function switchLines(ctx, why, rerun) {
     // The arrow-key list needs 80 (DESIGN.md §13.4); a `dumb` terminal wraps at the same 80-column rule.
     const width = why.kind === "narrow" ? why.columns : 80;
     const first = why.kind === "narrow" ? PICKER.narrowWindow(why.columns) : PICKER.noArrowKeys;
-    const second = PICKER.chooseTyped(connectCommandFor(ctx.env, ctx.selfPath));
+    // 0.17.5 (P6's principle, closing 5b's class): a line this run prints to finish THIS run's work reruns connect as typed (`rerun`).
+    const second = PICKER.chooseTyped(rerun);
     return [...wrap(first, 2, 2, width), ...wrap(second, 2, 2, width)].map((line) => paint(ctx.colour, "muted", line));
 }
 async function choose(ctx, options, deps, model, 
@@ -773,7 +779,9 @@ finishes) {
         const result = await runChecklist(model, {
             colour: ctx.colour,
             nowMs,
-            typedCommand: channelCommand(ctx.env, ctx.selfPath, COMMANDS.connectTyped),
+            // 0.17.5 (P6's principle, closing 5b's class): "Screen reader? Run:" reruns this run typed, so connect as typed plus `--typed`;
+            // plain `connect` is byte-identical (`vibecommit connect --typed`).
+            typedCommand: connectRerunOf(ctx, { ...options, typed: true }),
             offerAccount,
             enterFinishesSetup: finishes,
             headerPrinted: shown.header,
@@ -1082,7 +1090,7 @@ function exceptionRow(ctx, path, reason) {
  * The hooks step's install (T8b, 4.2), with no output: each clone's commit hook, and the exceptions the setup report prints under its
  * table (`hooksPath` and a failed write, each with its own fix, see `commitExceptionLines`). Never changes the exit code.
  */
-function installCommitHooksForReport(ctx, clones) {
+function installCommitHooksForReport(ctx, clones, rerun) {
     let added = 0;
     let chained = 0;
     const skipped = [];
@@ -1098,13 +1106,15 @@ function installCommitHooksForReport(ctx, clones) {
                 chained += 1;
         }
     }
-    return { report: { clones: added, chained }, blocks: skipped.length === 0 ? [] : [commitExceptionLines(ctx, skipped)], notes: [] };
+    return { report: { clones: added, chained }, blocks: skipped.length === 0 ? [] : [commitExceptionLines(ctx, skipped, rerun)], notes: [] };
 }
 /**
  * The exceptions block under the setup report's table: only the clones where hooks were not added, each with its path and reason. Each
  * exception gets its own fix and no other's: `core.hooksPath` the shipped unset/chain pair, a failed write `vibecommit connect`.
  */
-function commitExceptionLines(ctx, skipped) {
+function commitExceptionLines(ctx, skipped, 
+/** connect as typed (`connectRerunOf`): the failed write's "try again". */
+rerun) {
     const hooksPathHit = skipped.some((s) => s.hooksPath);
     const failedHit = skipped.some((s) => !s.hooksPath);
     return [
@@ -1116,7 +1126,7 @@ function commitExceptionLines(ctx, skipped) {
             ? [COMMIT_HOOK.hooksPathFixUnset, COMMIT_HOOK.hooksPathFixManual(channelCommand(ctx.env, ctx.selfPath, COMMANDS.postCommit))].map((fix) => `    ${paint(ctx.colour, "accent", fix)}`)
             : []),
         ...(failedHit
-            ? [...wrap(PICKER.hooksFailedFixLabel, 2), `    ${paint(ctx.colour, "accent", connectCommandFor(ctx.env, ctx.selfPath))}`]
+            ? [...wrap(PICKER.hooksFailedFixLabel, 2), `    ${paint(ctx.colour, "accent", rerun)}`]
             : []),
     ];
 }
