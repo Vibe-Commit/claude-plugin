@@ -10,7 +10,7 @@ function workspaceQuestion(scope) {
  */
 import { isAffirmative } from "../consent.js";
 import { authCommandFor } from "../install.js";
-import { CONNECT, REPLACE, RETIRE, AUTH, SIGNIN } from "../copy/index.js";
+import { CONNECT, REPLACE, RETIRE, AUTH } from "../copy/index.js";
 import { loadedFingerprints, metaFor, recordCredentialMeta } from "../credential_meta.js";
 import { saveCredential } from "../credential.js";
 import { REVOKE_TIMEOUT_MS, retireCredential, selfRevokeCredential, selfRevokeOutcome } from "../oauth/retire.js";
@@ -20,30 +20,20 @@ import { paint, labelled, renderErrorBlock, truncateMiddle, wrap, WRAP_COLUMNS, 
 import { writeLines } from "./context.js";
 import { probeCredential } from "./probe.js";
 /**
- * 0.17.2 (P7 ruling, 2026-11-23): whether this run may have written something before its mint. connect's path wrote the grants and
- * hooks first. `auth`'s BROWSER path may have written `session.json` in its first sign-in step: a new sign-in saves it, and so does a
- * refresh of a stale stored one (src/oauth/signin.ts), and `mintWithSession` may refresh and save again after a 401. Only the device
- * flow off connect's path (`auth --device`) writes nothing before its mint.
+ * 0.17.1 (P7 ruling, 2026-11-22): a mint failure's why is its outcome's base sentence plus a tail. 0.17.4 (P7 FINAL): the tail is "No
+ * credential was saved." on every path. 0.17.2 still gave `auth --device` "Nothing was written.", which the verb-start revoke retry
+ * (cli.ts) falsifies: it can rewrite or delete pending-revoke.json before any verb runs. One base sentence per outcome; no duplicated keys.
  */
-export function mayHaveWrittenBeforeMint(connectPath, via) {
-    return connectPath !== undefined || via === "browser";
+export function withMintTail(base) {
+    return `${base} ${AUTH.connectTail}`;
 }
 /**
- * 0.17.1 (P7 ruling, 2026-11-22), widened in 0.17.2: a mint failure's why is its outcome's base sentence plus a tail. Where something
- * may have been written before the mint (`mayHaveWrittenBeforeMint`: connect's path, and `auth`'s browser path) the tail is "No credential
- * was saved."; only `auth --device` keeps "Nothing was written.", which is true there. One base sentence per outcome; no duplicated keys.
+ * 0.17.1 (P7 ruling, 2026-11-22): the same shape for a failed sign-in (`signInError`) and a failed device sign-in. 0.17.4 (P7 FINAL): the
+ * tail is "No credential was saved." on every path; `auth`'s "Nothing was changed on this machine." was false after the verb-start revoke
+ * retry. A `null` base (DEVICE's denied and refused) is the tail alone. connect's `--sign-in` beat keeps its own tail (browser_credential.ts).
  */
-export function withMintTail(base, mayHaveWritten) {
-    return `${base} ${mayHaveWritten ? AUTH.connectTail : AUTH.mintTailAuth}`;
-}
-/**
- * 0.17.1 (P7 ruling, 2026-11-22): the same shape for a failed sign-in (`signInError`) and a failed device sign-in. Off connect's path the
- * tail is "Nothing was changed on this machine." (`SIGNIN.unchangedTail`), byte-identical to 0.17.0; on it the grants and hooks were
- * written before the sign-in, so the tail is "No credential was saved." A `null` base (DEVICE's denied and refused) is the tail alone.
- */
-export function withSignInTail(base, onConnectPath) {
-    const tail = onConnectPath ? AUTH.connectTail : SIGNIN.unchangedTail;
-    return base === null ? tail : `${base} ${tail}`;
+export function withSignInTail(base) {
+    return base === null ? AUTH.connectTail : `${base} ${AUTH.connectTail}`;
 }
 /**
  * 0.17.1 (P7 ruling): the saved-choices line a failed sign-in or mint on connect's path adds, with the SAME gate as `signInError`'s
@@ -69,7 +59,7 @@ export function connectMintBlock(outcome, connectPath, endpoint, now) {
             code: "MINT_RATE_LIMITED",
             what: AUTH.mintFailedWhat,
             // connect's path always wrote the grants and hooks first, so the tail is connect's whatever the flow.
-            why: [withMintTail(AUTH.mintRateLimitedWhy, true), wait, ...savedChoicesLines(connectPath)],
+            why: [withMintTail(AUTH.mintRateLimitedWhy), wait, ...savedChoicesLines(connectPath)],
             fixLabel: AUTH.rateLimitedAgain,
             fixes: [connectPath.rerun],
         };
@@ -79,7 +69,7 @@ export function connectMintBlock(outcome, connectPath, endpoint, now) {
             kind: "bad",
             code: "MINT_NOT_A_MEMBER",
             what: AUTH.mintFailedWhat,
-            why: [withMintTail(AUTH.mintNotMemberWhy, true), ...savedChoicesLines(connectPath)],
+            why: [withMintTail(AUTH.mintNotMemberWhy), ...savedChoicesLines(connectPath)],
             fixLabel: AUTH.notMemberFix,
         };
     }
@@ -91,7 +81,7 @@ export function connectMintBlock(outcome, connectPath, endpoint, now) {
             // A 5xx is an ANSWER (the service refused), so it keeps `auth`'s refused sentence; only no answer at all is "did not answer" (T20
             // sweep, CL-C F4). The recovery line is DX-7's for both: retry once, then the network.
             why: [
-                withMintTail(outcome.kind === "unreachable" ? AUTH.mintUnreachableWhy : AUTH.mintRefusedWhy, true),
+                withMintTail(outcome.kind === "unreachable" ? AUTH.mintUnreachableWhy : AUTH.mintRefusedWhy),
                 AUTH.unreachableTried(terminalSafe(new URL(endpoint).host)),
                 ...savedChoicesLines(connectPath),
             ],
@@ -171,7 +161,7 @@ export async function finishMint(ctx, input) {
                 kind: "bad",
                 code: "MINT_FAILED",
                 what: AUTH.mintFailedWhat,
-                why: [withMintTail(AUTH.mintUnconfirmedWhy, mayHaveWrittenBeforeMint(input.connectPath, input.via)), ...savedChoicesLines(input.connectPath)],
+                why: [withMintTail(AUTH.mintUnconfirmedWhy), ...savedChoicesLines(input.connectPath)],
             }, ctx.colour),
         ]);
         return { kind: "failed" };
@@ -212,13 +202,9 @@ export async function finishMint(ctx, input) {
                 code: "WORKSPACE_UNCONFIRMED",
                 what: REPLACE.unconfirmableWhat,
                 // 0.17.1 D2 (P7): on connect's path the grants and hooks were written first, so "Nothing was saved" was false there; then the
-                // saved-choices line under the same gate. `auth` and `auth --device` keep 0.17.0's words, byte-identical.
-                why: input.connectPath === undefined
-                    ? [revoked.kind === "retired" ? REPLACE.unconfirmableWhyRevoked : REPLACE.unconfirmableWhyOrphan]
-                    : [
-                        revoked.kind === "retired" ? REPLACE.unconfirmableWhyRevokedConnect : REPLACE.unconfirmableWhyOrphanConnect,
-                        ...savedChoicesLines(input.connectPath),
-                    ],
+                // saved-choices line under the same gate (empty off connect's path). 0.17.4 (P7 FINAL): the same words on `auth --device` and the
+                // device fallback, where the verb-start revoke retry may have rewritten or deleted pending-revoke.json.
+                why: [revoked.kind === "retired" ? REPLACE.unconfirmableWhyRevokedConnect : REPLACE.unconfirmableWhyOrphanConnect, ...savedChoicesLines(input.connectPath)],
                 fixLabel: REPLACE.unconfirmableFix,
                 fixes: [input.rerun ?? authCommandFor(ctx.env, ctx.selfPath)],
             }, ctx.colour),
@@ -261,15 +247,12 @@ export async function finishMint(ctx, input) {
             // grants were written gets the same true line as a No (T20 sweep, CL-C F5). 0.17.1 r1 R1 (P7): on connect's path with NO grant, the
             // hooks may still have been written in this run, so the line says no CREDENTIAL was saved. `auth` keeps 0.17.0's two lines.
             // 0.17.2 (P7): `auth`'s browser path may have written session.json before this question too, so it takes the same two lines.
+            // 0.17.4 (P7 FINAL): so does `auth --device`: the verb-start revoke retry may have rewritten or deleted pending-revoke.json.
             const line = input.connectPath?.grantsWritten === true
                 ? REPLACE.declinedSavedChoices(input.connectPath.rerun)
-                : mayHaveWrittenBeforeMint(input.connectPath, input.via)
-                    ? answer === null
-                        ? REPLACE.cancelledConnect
-                        : REPLACE.declinedConnect
-                    : answer === null
-                        ? REPLACE.cancelled
-                        : REPLACE.declined;
+                : answer === null
+                    ? REPLACE.cancelledConnect
+                    : REPLACE.declinedConnect;
             writeLines(ctx.stdout, [
                 "",
                 ...wrap(line, 2),

@@ -838,7 +838,9 @@ export const CONNECT = {
      * BEFORE asking rather than take a yes it cannot honour.
      */
     grantsUnreadableWhat: "Capture can't be turned on: ~/.vibecommit/grants.json can't be read.",
-    grantsUnreadableWhy: "Capture is stopped on this machine for every repository that has a remote until the file is readable. Nothing was changed.",
+    // 0.17.4 (P7 FINAL): "Nothing was changed." was false after the verb-start revoke retry (cli.ts), which can rewrite or delete
+    // pending-revoke.json and send a revoke. "It" is grants.json: `updateGrants` never overwrites an unreadable one.
+    grantsUnreadableWhy: "Capture is stopped on this machine for every repository that has a remote until the file is readable. Nothing was written to it.",
     grantsUnreadableFixLabel: "Fix the file or move it aside, then run:",
     /**
      * The browser sign-in beat (PKCE loopback → minted ingest credential) is the
@@ -1061,11 +1063,10 @@ export const SIGNIN = {
      */
     noServerRefusedWhy: "VIBECOMMIT_MCP_URL is set to an address this client will not send a sign-in to. Only https, or http on the loopback, is allowed.",
     noServerFix: "Check the service, then run:",
-    // 0.17.1 (P7 ruling, 2026-11-22): `deniedWhy`, `timeoutWhy` and `unreachableWhy` are BASE sentences. The path adds its tail
-    // (`withSignInTail`, finish_mint.ts): `auth`'s is `unchangedTail`, byte-identical to 0.17.0; on connect's path the grants and hooks were
-    // written before the sign-in, so "Nothing was changed on this machine." was false there, and the tail is `AUTH.connectTail`.
-    /** The tail on a failed sign-in or device sign-in off connect's path: nothing was written before it. */
-    unchangedTail: "Nothing was changed on this machine.",
+    // 0.17.1 (P7 ruling, 2026-11-22): `deniedWhy`, `timeoutWhy` and `unreachableWhy` are BASE sentences, and `withSignInTail`
+    // (finish_mint.ts) adds the tail. 0.17.4 (P7 FINAL): the tail is `AUTH.connectTail` on every path. `auth`'s "Nothing was changed on this
+    // machine." was false after the verb-start revoke retry, which can change pending-revoke.json, so `unchangedTail` is gone. connect's
+    // `--sign-in` beat keeps `signInNotSavedTail`.
     deniedWhat: "Sign-in was declined.",
     deniedWhy: "The sign-in screen returned without granting access.",
     deniedFix: "To try again, run:",
@@ -1322,7 +1323,8 @@ export const BACKFILL = {
     interrupted: (backfill) => `Stopped. A re-run of ${backfill} sends what is left.`,
     /** Exit 3. */
     notConnectedWhat: "This machine isn't connected.",
-    notConnectedWhy: "`backfill` uploads with this machine's credential, and there isn't one. Nothing was read.",
+    /** 0.17.4 (P7 FINAL): scoped to the verb's own work; the verb-start revoke retry may have read and changed pending-revoke.json. */
+    notConnectedWhy: "`backfill` uploads with this machine's credential, and there isn't one. No session was read.",
     notConnectedFixLabel: "Connect first:",
     /** `grants.json` is present and unreadable: every repo with a remote is denied, so there is nothing honest to offer. */
     grantsUnreadableWhat: "Backfill can't run: ~/.vibecommit/grants.json can't be read.",
@@ -1445,7 +1447,8 @@ export const PICKER = {
      */
     // DRAFT copy (CLI UX PR-B):
     endingUnfinished: (connect) => `Setup isn't finished on this machine: run ${connect} and press Enter.`,
-    cancelled: "Cancelled. Nothing was changed.",
+    /** 0.17.4 (P7 FINAL): true after the verb-start revoke retry, and after the picker's own first sync wrote before the Ctrl+C. */
+    cancelled: "Cancelled. No choice was saved.",
     /** The grant block (D7 · 3A). */
     chose: "You chose:",
     labelOwners: "owners",
@@ -1641,8 +1644,11 @@ export const OFF = {
     unrecognizedArgWhat: "That is not something `vibecommit off` understands.",
     /** 4.15 / DX-10 (T15): the why line for a refused name, verbatim from the plan. Not on owner/, which has its own why. */
     unrecognizedArgWhy: "`off` takes at most one repository, as owner/repo.",
-    /** Every `off` refusal says it changed nothing: a refused argument never revokes (TODOS[184]). */
-    nothingChanged: "Nothing was changed.",
+    /**
+     * Every `off` refusal says it turned nothing off: a refused argument never removes a grant (TODOS[184]). 0.17.4 (P7 FINAL): it was
+     * "Nothing was changed.", which the verb-start revoke retry (cli.ts) can falsify: it runs first and can revoke a credential.
+     */
+    nothingChanged: "Nothing was turned off.",
     /** 4.15 Owners (T15): `off owner/` names a whole owner, which is removed in the picker. The `what` line names the token (DX-2). DRAFT copy. */
     ownerWhat: (token) => `\`${token}\` is a whole owner; \`off\` turns off one repository.`,
     ownerFixLabel: "To stop a whole owner, untick it in the picker:",
@@ -1862,7 +1868,9 @@ export const WHY = {
     fileWithoutTurn: "1 more file in this commit has no linked turn.",
     // --- Usage. §13.7: a bad argument is exit 2, never exit 1. ---
     usageWhat: "This command needs a file and a line number.",
-    usageWhy: "`why` answers for one line, so it cannot run without one. Nothing was read and nothing was sent.",
+    usageWhy: 
+    // 0.17.4 (P7 FINAL): scoped to the lookup; the verb-start revoke retry may have read pending-revoke.json and sent a revoke.
+    "`why` answers for one line, so it cannot run without one. Nothing was looked up.",
     usageFix: "Name the file and the line:",
     /**
      * `--json` — the REFUSAL COPY THAT STOOD HERE IS GONE, and its removal is the
@@ -2071,7 +2079,14 @@ export const REPORT = {
     unknownReachabilityWhy: "Git could not say whether some recorded commits are still reachable from this ref. A share computed over the rest would be a smaller number presented as a complete one.",
     unknownReachabilityFix: "Fetch the full history, then run this again:",
     refWhat: "This command needs a ref it can name.",
-    refWhy: "Coverage is relative to a ref, so the answer is meaningless without one, and HEAD is detached here. Nothing was read and nothing was sent.",
+    refWhy: 
+    // 0.17.4 (P7 FINAL): scoped to the lookup; the verb-start revoke retry may have sent a revoke.
+    "Coverage is relative to a ref, so the answer is meaningless without one, and HEAD is detached here. No coverage was looked up.",
+    /**
+     * 0.17.4 [6b] (P7 FINAL, P6 ruled in): `git log` failed on the ref (an unknown `--ref`, an unborn branch). `refWhy`'s "HEAD is detached
+     * here" was false there whenever HEAD was not detached. The what and the fix stay `refWhat` / `refFix`.
+     */
+    refUnreadableWhy: "Git could not read the ref's history, so no coverage was looked up.",
     refFix: "Name the ref:",
     /**
      * The window, as the two empty states name it.
@@ -2085,9 +2100,6 @@ export const REPORT = {
     /** T16 (plan 4.16): the first line of the coverage screen. The default names its length; an explicit `--since` does not. */
     windowLineDefault: (since) => `Commits since ${since} (the last 7 days):`,
     windowLineExplicit: (since) => `Commits since ${since}:`,
-    usageWhat: "This command needs a start date.",
-    usageWhy: "The window bounds which commits are counted, so the answer is not defined without one. Nothing was read and nothing was sent.",
-    usageFix: "Name the date the window starts:",
     sinceWhat: "That start date could not be read.",
     sinceWhy: "The window must be a calendar date, written as YYYY-MM-DD. A date git cannot read would silently widen the window.",
     sinceFix: "Write the date as YYYY-MM-DD:",
@@ -2257,6 +2269,18 @@ export const ABSENCE = {
  * know were bound: `closed` says the last turn is recorded, not that any commit matched it.
  */
 export const FINALIZE = {
+    // 0.17.4 (P6 ruling; P7 FINAL 2026-11-23, Alexander's veto list): this repo's consent cannot be read because grants.json can't be. The
+    // label is BACKFILL.grantsUnreadableFixLabel (shared text). "Nothing was closed." and not "Nothing was sent.": the verb-start retry may
+    // already have sent a revoke (cli.ts), and closing is finalize's own outcome.
+    grantsUnreadableWhat: "Finalize can't run: ~/.vibecommit/grants.json can't be read.",
+    grantsUnreadableWhy: "Capture is stopped on this machine for every repository that has a remote until the file is readable. Nothing was closed.",
+    // 0.17.4 r1 rv174-2 (P7 FINAL cli-ux-0174-rv174-words.md; P6's code CREDENTIAL_FOLDER_UNREADABLE; Alexander's veto list): the folder
+    // step when VIBECOMMIT_TOKEN is the credential in use. The 0.17.3 folder blocks say the credential was not read, which is false there:
+    // the env credential was read. The real fault is the consent, which lives in ~/.vibecommit. The fixes reuse the 0.17.3 texts.
+    stateFolderWhat: "Finalize can't run: ~/.vibecommit can't be read.",
+    stateFolderClosedWhy: "Permission to open the folder was refused, so this repository's consent could not be read. Nothing was closed. If another user on this computer owns the folder, that user or an administrator must change it.",
+    stateFolderUncheckedWhy: "The folder could not be checked, so this repository's consent could not be read. Nothing was closed.",
+    stateFolderNotAFolderWhy: "Something other than a folder is at that path, so this repository's consent could not be read. Nothing was closed.",
     // PR 7 (Q7): where the remedy is a command it sits in the §13.6 fix block, not inside the `what` line. The `what` lines
     // below lost exactly the clause that moved; the fix commands are the ones the old sentence named.
     needTarget: "Say which session to close.",
@@ -2304,11 +2328,12 @@ export const FINALIZE = {
     credentialStoppedFix: "Replace it:",
     /**
      * PR 7 (Q2, VQ's wording): the ingest address in the environment (`VIBECOMMIT_INGEST_URL`) is one this client refuses to
-     * send to, so retrying cannot help. Shared by `finalize` and `backfill`, so the `why` says only "Nothing was sent": it must
-     * not claim a session was or was not closed. The VALUE is never echoed (a URL can carry a secret).
+     * send to, so retrying cannot help. Shared by `finalize` and `backfill` (and connect's backfill step), so the `why` says only that no
+     * session was sent: it must not claim a session was or was not closed. The VALUE is never echoed (a URL can carry a secret). 0.17.4 (P7
+     * FINAL): it said "Nothing was sent.", but the verb-start revoke retry posts to each row's own origin, which this refusal does not stop.
      */
     ingestUrlWhat: "The address VibeCommit sends sessions to can't be used.",
-    ingestUrlWhy: "VIBECOMMIT_INGEST_URL must be an https address, or an http address on this machine, and it isn't. Nothing was sent.",
+    ingestUrlWhy: "VIBECOMMIT_INGEST_URL must be an https address, or an http address on this machine, and it isn't. No session was sent.",
     ingestUrlFix: "Correct it, or remove it to use the default address:",
     ingestUrlCommand: "unset VIBECOMMIT_INGEST_URL",
     /**
@@ -2373,13 +2398,11 @@ export const REPLACE = {
     questionRepos: "Upload transcripts from the repos above to VibeCommit?",
     /** The `replaces` row on a cross-organization re-auth. It names NO organization (T41c, §4.7): credentials always land in Personal. */
     replacesValue: "the credential saved on this machine",
-    declined: "Nothing was saved. The approval is discarded.",
-    /** Ctrl+C at the question (the prompt was aborted): the same outcome as N, said as what it was. */
-    cancelled: "Cancelled. Nothing was saved.",
-    // 0.17.1 r1 R1 (P7 ruling, 2026-11-22): `declined` and `cancelled` on connect's path with NO grant held. The hooks may have been written
-    // in this run (the faulty-file Enter path), so "Nothing was saved" was false there. With a grant held, `declinedSavedChoices` stays for
-    // both. 0.17.2 (P7 ruling, 2026-11-23): `auth`'s BROWSER path uses these two as well (its sign-in may have written session.json);
-    // `auth --device` keeps the two above, byte-identical. The keys keep their names.
+    // A No, and Ctrl+C (the prompt was aborted: the same outcome as N, said as what it was), with NO grant held. With a grant held,
+    // `declinedSavedChoices` stays for both. 0.17.1 r1 R1 (P7) took them onto connect's path, where hooks may have been written in this run,
+    // and 0.17.2 onto `auth`'s browser path (session.json). 0.17.4 (P7 FINAL): every path, `auth --device` included: the verb-start revoke
+    // retry can rewrite or delete pending-revoke.json, so 0.17.0's "Nothing was saved." (`declined`, `cancelled`) is gone. The keys keep
+    // their names, so the register's rows stay bound to their words.
     declinedConnect: "No credential was saved. The approval is discarded.",
     cancelledConnect: "Cancelled. No credential was saved.",
     /**
@@ -2393,10 +2416,9 @@ export const REPLACE = {
     // L12 (rv-capstep): names no workspace (credentials land in Personal, T41c). The gate that picks this screen stays keyed on `shown.orgName == null`
     // (finish_mint.ts), which still means "nothing to show the person"; only the words changed. WORKSPACE_UNCONFIRMED is a machine code and is unchanged.
     unconfirmableWhat: "The new credential could not be confirmed with the server.",
-    unconfirmableWhyRevoked: "Nothing was saved, and the credential just created was revoked.",
-    unconfirmableWhyOrphan: "Nothing was saved. The credential just created is unused; revoke it in Settings if you want it gone.",
-    // 0.17.1 D2 (P7 ruling, 2026-11-22): the same two on connect's path, where the grants and hooks were written before the sign-in, so
-    // "Nothing was saved" was false there. `auth` and `auth --device` keep the two above, byte-identical.
+    // 0.17.1 D2 (P7 ruling, 2026-11-22): connect's path, where the grants and hooks were written before the sign-in. 0.17.4 (P7 FINAL): every
+    // path, `auth --device` and the device fallback included: 0.17.0's "Nothing was saved, …" (`unconfirmableWhyRevoked`, `…Orphan`) was
+    // false after the verb-start revoke retry, which can rewrite or delete pending-revoke.json.
     unconfirmableWhyRevokedConnect: "No credential was saved, and the credential just created was revoked.",
     unconfirmableWhyOrphanConnect: "No credential was saved. The credential just created is unused; revoke it in Settings if you want it gone.",
     unconfirmableFix: "Run the command again:",
@@ -2433,17 +2455,19 @@ export const DEVICE = {
     /** The remote-phishing mitigation: whoever enters the code picks the account this machine uploads to. */
     shareWarning: "Don't share it: whoever enters it chooses the account this machine uploads to.",
     waiting: "Waiting for approval…  (Ctrl+C to cancel)",
-    // 0.17.1 (P7 ruling, 2026-11-22): the device whys below that ended "Nothing was changed on this machine." are BASE sentences, and the
-    // path adds its tail (`withSignInTail`): `SIGNIN.unchangedTail` off connect's path (byte-identical to 0.17.0), `AUTH.connectTail` on it.
-    // The denied and refused whys were the tail alone, so they have no base: the why is the path's tail.
+    // 0.17.1 (P7 ruling, 2026-11-22): the device whys below that ended "Nothing was changed on this machine." are BASE sentences, and
+    // `withSignInTail` adds the tail, `AUTH.connectTail` on every path since 0.17.4 (P7 FINAL). The denied and refused whys were the tail
+    // alone, so they have no base: the why is the tail.
     /** Ctrl+C. §13.7: exit 1. Not a failure block — nothing went wrong. A base: the line is this plus the path's tail. */
     cancelled: "Cancelled.",
     deniedWhat: "The request was denied in the browser.",
     deniedFix: "If this was you, run it again:",
     /** 16C, brief A7: one block for the poll's `access_denied` (gate) and the mint's 403 `code_signin_off`. */
     gateOffWhat: "Code sign-in is off for this account.",
-    gateOffWhy: "Nothing was approved, and nothing was changed on this machine.",
-    /** 0.17.1 (P7 ruling): `gateOffWhy` on connect's path, where the grants and hooks were written before the sign-in. */
+    /**
+     * 0.17.1 (P7 ruling): connect's path, where the grants and hooks were written before the sign-in. 0.17.4 (P7 FINAL): every path; 0.17.0's
+     * `gateOffWhy` ("…and nothing was changed on this machine.") was false on `auth --device` after the verb-start revoke retry.
+     */
     gateOffWhyConnect: "Nothing was approved, and no credential was saved.",
     gateOffFix: "Turn on \"Allow approving machines with a code\" in Settings → Machines, then run it again:",
     expiredWhat: "The code expired before it was approved.",
@@ -2562,7 +2586,9 @@ export const CREDENTIAL = {
     // DRAFT copy (CLI UX PR-C, T10 B4): the folder cannot be written. The fix is the folder's own chmod, as the insecure block's is.
     unwritableWhat: "The folder that holds the credential cannot be written to.",
     // P7 ruling (2026-11-22): "user on this computer", not "account", which reads as the VibeCommit or GitHub account.
-    unwritableWhy: "A credential is saved there after sign-in, so nothing was minted or sent. If another user on this computer owns the folder, that user or an administrator must change it.",
+    unwritableWhy: 
+    // 0.17.4 (P7 FINAL): "nothing was minted or sent" was false: an unwritable folder stops the verb-start revoke retry's writes, not its POST.
+    "A credential is saved there after sign-in, so the sign-in did not start. If another user on this computer owns the folder, that user or an administrator must change it.",
     unwritableFix: "Make the folder writable by you, then run the command again:",
     unreadableWhat: "The credential file could not be read.",
     unreadableWhy: "It exists but does not contain a credential in the expected form.",
@@ -2654,9 +2680,9 @@ export const AUTH = {
     emptyWhat: "No credential was given.",
     emptyWhy: "Nothing was read, so nothing was written.",
     /**
-     * 0.17.2 #135 r1 R1 (P7, 2026-11-23): `emptyWhy` after a failure on the browser sign-in's LOOPBACK branch (`afterLoopback`), whose
-     * first step may have written `session.json`. A device-flow failure, a refusal before any sign-in, `--paste` and `--stdin` keep
-     * `emptyWhy`. On Alexander's veto list with 0.17.2's other lines.
+     * 0.17.2 #135 r1 R1 (P7): the after-sign-in words. 0.17.4 (P7 FINAL, P6's gate): every paste the verb-start revoke retry ran before (at a
+     * terminal: `--paste`, and the paste after ANY browser or device failure), chosen by the CLI's own skip decision (`verbStartRetryRuns`,
+     * verb_start.ts). Piped and `--stdin` `auth` runs no retry and keeps `emptyWhy`, byte-identical. On Alexander's veto list.
      */
     emptyWhyAfterSignIn: "Nothing was read, so no credential was saved.",
     /**
@@ -2673,7 +2699,7 @@ export const AUTH = {
     mintCommands: (auth) => [`printf %s "$TOKEN" | ${auth} --stdin`, auth],
     wrongClassWhat: "That is not a VibeCommit ingest credential.",
     wrongClassWhy: `An ingest credential begins ${INGEST_TOKEN_PREFIX}. Nothing was written and nothing was sent.`,
-    /** 0.17.2 #135 r1 R1 (P7): `wrongClassWhy` under `emptyWhyAfterSignIn`'s gate. On Alexander's veto list. */
+    /** 0.17.2 #135 r1 R1 (P7): `wrongClassWhy` under `emptyWhyAfterSignIn`'s gate (0.17.4: the retry ran). On Alexander's veto list. */
     wrongClassWhyAfterSignIn: `An ingest credential begins ${INGEST_TOKEN_PREFIX}. No credential was saved, and the pasted text was not sent.`,
     argvWhat: "A credential must not be passed as an argument.",
     argvWhy: "Arguments are written to your shell history and are readable by other processes on this machine while the command runs. Treat the one you just typed as exposed and revoke it.",
@@ -2690,9 +2716,9 @@ export const AUTH = {
     minting: (label) => `Creating this machine's credential, labelled "${label}"…`,
     /** Every mint failure shares the `what`; the `why` names which step refused. */
     mintFailedWhat: "No credential was created through the browser.",
-    // 0.17.1 (P7 ruling, 2026-11-22), widened in 0.17.2 (2026-11-23): the mint whys below are each outcome's BASE sentence. The path adds
-    // its tail (`withMintTail`, finish_mint.ts). Where something may have been written before the mint (connect's path: the grants and
-    // hooks; `auth`'s browser path: session.json) the tail is `connectTail`; only `auth --device` keeps `mintTailAuth`, true there.
+    // 0.17.1 (P7 ruling, 2026-11-22): the mint whys below are each outcome's BASE sentence, and `withMintTail` (finish_mint.ts) adds the
+    // tail, `connectTail`. 0.17.2 took it onto `auth`'s browser path; 0.17.4 (P7 FINAL) onto `auth --device` too, whose "Nothing was
+    // written." (`mintTailAuth`, gone) was false after the verb-start revoke retry, which can rewrite or delete pending-revoke.json.
     /** `not-authorized`, or a 401 that survived one refresh. */
     mintSessionWhy: "The sign-in on this machine could not be used to create one. It may have ended or been revoked.",
     // P7 ruling (2026-11-22): "organization", not the retired "workspace" (0.15.0, T41a/T41c).
@@ -2701,13 +2727,12 @@ export const AUTH = {
     mintRefusedWhy: "The service refused the request.",
     mintUnreachableWhy: "The service did not answer.",
     mintMalformedWhy: "The service answered in a form this version cannot use.",
-    /** 0.17.2: the tail on `auth --device`'s mint failures only: the device flow writes nothing before its mint (`mayHaveWrittenBeforeMint`). */
-    mintTailAuth: "Nothing was written.",
     /**
      * 0.17.1 (P7 ruling, 2026-11-22): the tail every failed sign-in, device sign-in or mint on connect's path ends with. The grants and
      * hooks were written before the sign-in, so "Nothing was written." and "Nothing was changed on this machine." were false there.
      * 0.17.2 (P7 ruling, 2026-11-23): `auth`'s BROWSER path uses it too, for its mint whys and the retry after an `expired` mint: its first
-     * sign-in step may have written `session.json` (a new sign-in, or a refresh). The key keeps its name; renaming it would churn the register.
+     * sign-in step may have written `session.json` (a new sign-in, or a refresh). 0.17.4 (P7 FINAL): EVERY failed sign-in, device sign-in
+     * and mint ends with it, on every path. The key keeps its name; renaming it would churn the register.
      */
     connectTail: "No credential was saved.",
     /**

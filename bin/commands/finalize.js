@@ -38,11 +38,11 @@
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_AGENT_ID, admitsTranscript, transcriptRoots } from "../agents/registry.js";
-import { BACKFILL, COMMANDS, ERRORS, FINALIZE, relativeAge } from "../copy/index.js";
+import { BACKFILL, COMMANDS, CREDENTIAL, ERRORS, FINALIZE, relativeAge } from "../copy/index.js";
 import { renderVerbHelp } from "../verb_help.js";
-import { hasAnyConsent, isCaptureAllowed } from "../consent.js";
+import { grantsUnreadable, hasAnyConsent, isCaptureAllowed, normalizeSlug, unreadableGrantsDeny } from "../consent.js";
 import { authCommandFor, channelCommand, connectCommandFor } from "../install.js";
-import { loadCredential } from "../credential.js";
+import { envCredentialToken, loadCredential, readSecretFile } from "../credential.js";
 import { EXIT } from "../exit.js";
 import { onceRepoSlug, onceStrictRepoSlug } from "../git.js";
 import { confinementRoots, fileSize, sendTimeoutMs, wait } from "../hooks/entry.js";
@@ -52,7 +52,7 @@ import { identityDigest } from "../identity.js";
 import { REQUEST_TIMEOUT_MS, replayAllUnderLock } from "../replay.js";
 import { FOLDER_REPOSITORY_FORBIDDEN } from "../policy.js";
 import { LockLostError, dialectIsolates, resolveTargets, stopKeyOf, stopTarget } from "../session_targets.js";
-import { repoSessionsDir, sessionStatePath } from "../paths.js";
+import { credentialsPath, repoSessionsDir, sessionStatePath } from "../paths.js";
 import { ingestUrl } from "../post.js";
 import { resolveProjectKeys } from "../project.js";
 import { loadSessionState, openTailForRepo, stuckForRepo } from "../state.js";
@@ -235,6 +235,30 @@ export async function resolveSessionTargets(env, sessionId, transcriptPath, know
         heartbeat,
     };
 }
+/**
+ * 0.17.4 (P6 ruling): the credential faults that mean `~/.vibecommit` ITSELF could not be read: closed, unchecked, or not a folder (ENOTDIR
+ * from the file's lstat after the folder's stat succeeded). Exactly these: a fault of the FILE (refused, not a file, form, any other read
+ * error) does not explain why the consent read failed.
+ */
+export function folderFault(load) {
+    return load.cause === "folder-closed" || load.cause === "folder-unchecked" || (load.cause === "read-failed" && load.code === "ENOTDIR");
+}
+/**
+ * 0.17.4 r1 rv174-2 (P7 FINAL; P6's code): a folder fault while VIBECOMMIT_TOKEN is the credential in use. The fault is this repository's
+ * consent (grants.json, projects.json and the folder grants all live in ~/.vibecommit); the fixes are 0.17.3's for the same cause.
+ */
+function stateFolderBlock(folder) {
+    const base = { kind: "bad", code: "CREDENTIAL_FOLDER_UNREADABLE", what: FINALIZE.stateFolderWhat };
+    switch (folder.cause) {
+        case "folder-closed":
+            return { ...base, why: [FINALIZE.stateFolderClosedWhy], fixLabel: CREDENTIAL.folderClosedFix, fixes: [COMMANDS.chmodDirectory] };
+        case "folder-unchecked":
+            return { ...base, why: [FINALIZE.stateFolderUncheckedWhy], fixLabel: CREDENTIAL.folderUncheckedFix };
+        default:
+            // read-failed ENOTDIR (folderFault's third case): something other than a folder is at ~/.vibecommit.
+            return { ...base, why: [FINALIZE.stateFolderNotAFolderWhy], fixLabel: CREDENTIAL.notAFileFix };
+    }
+}
 export async function finalize(ctx, argv) {
     const releases = [];
     try {
@@ -395,6 +419,32 @@ async function finalizeBody(ctx, argv, releases) {
         if (refused !== null)
             return refused;
         if (anyFolder.kind !== "ready") {
+            // 0.17.4 (P6 ruling): when this repo's consent could not be READ, "not connected" is false. First the folder: if reading the
+            // credential file says `~/.vibecommit` itself is closed, unchecked or not a folder, every read in it failed, consent's included, so
+            // its block (the same call as below, the same fix) names the real fault. Then an unreadable grants.json that denies this repo by
+            // isCaptureAllowed's own rule. Otherwise the consent was readable, and NOT_CONNECTED is true.
+            // r1 rv174-2 (P6): the folder is classified by reading the FILE (`readSecretFile`), never through `loadCredential`, which returns
+            // VIBECOMMIT_TOKEN without touching the folder: an env token must not hide a folder every consent read failed in.
+            const folder = readSecretFile(ctx.home, credentialsPath(ctx.home));
+            if (folder.kind === "unreadable" && folderFault(folder)) {
+                // With VIBECOMMIT_TOKEN in use (item 1's shared helper: a blank one counts as unset) the credential WAS read, so the 0.17.3 folder
+                // blocks ("…so the credential was not read.") are false; the fault is the consent (P7 FINAL, rv174-2). Without it, 0.17.3's blocks.
+                writeLines(ctx.stderr, envCredentialToken(ctx.env) !== null
+                    ? renderErrorBlock(stateFolderBlock(folder), ctx.colour)
+                    : credentialProblem(folder, ctx.colour, authCommandFor(ctx.env, ctx.selfPath)));
+                return EXIT.notConnected;
+            }
+            if (grantsUnreadable(ctx.home) && unreadableGrantsDeny(normalizeSlug(slugOf()))) {
+                writeLines(ctx.stderr, renderErrorBlock({
+                    kind: "bad",
+                    code: "GRANTS_UNREADABLE",
+                    what: FINALIZE.grantsUnreadableWhat,
+                    why: [FINALIZE.grantsUnreadableWhy],
+                    fixLabel: BACKFILL.grantsUnreadableFixLabel,
+                    fixes: [channelCommand(ctx.env, ctx.selfPath, COMMANDS.finalize)],
+                }, ctx.colour));
+                return EXIT.notConnected;
+            }
             // "This repository is not allowed to be captured": the repo's own consent, not the machine's credential.
             writeLines(ctx.stderr, renderErrorBlock({
                 kind: "bad",
