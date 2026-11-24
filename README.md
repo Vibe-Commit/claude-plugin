@@ -37,7 +37,7 @@ and until then a session shows *"VibeCommit is installed but not connected."* Th
   Run `vibecommit connect` from any folder and choose what to capture: whole owners, including repositories you clone later, or single repositories. On a machine with no credential it opens your browser to sign in and saves the credential for you; there is nothing to copy or paste.
 - **Run the bundled client.** Without npm, run the plugin's own client with Node:
   `node <the plugin's bin/index.js> connect`. The path is inside Claude Code's plugin directory; when
-  anything needs reconnecting, the message names the exact command for your install.
+  anything needs reconnecting, the message names the exact command for your install (when that would make the line too long, it points to `vibecommit.ai/install` instead).
 
 If capture later stops with *"this machine's credential is no longer accepted"*, the credential was revoked or expired. Run the command the message gives (`vibecommit auth`, or the `node … auth` form; with `VIBECOMMIT_TOKEN` set, it says to change or remove the variable). Turns held in the meantime upload once you reconnect. A failed upload after that drops turns held more than 24 hours with no upload of their transcript file succeeding, and the oldest once that file has more than 512 held uploads; `status` lists them as skipped.
 
